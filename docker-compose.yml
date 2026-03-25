@@ -1,0 +1,79 @@
+services:
+  # === LibreChat (with Python for MCP tools) ===
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.librechat
+    ports:
+      - "${PORT:-3080}:${PORT:-3080}"
+    depends_on:
+      mongodb:
+        condition: service_started
+      meilisearch:
+        condition: service_started
+      pii-proxy:
+        condition: service_healthy
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - HOST=0.0.0.0
+      - MONGO_URI=mongodb://mongodb:27017/LibreChat
+      - MEILI_HOST=http://meilisearch:7700
+      - NO_INDEX=true
+      - WORKSPACE_ROOT=/workspace
+    volumes:
+      - ./librechat.yaml:/app/librechat.yaml
+      - ./mcp-tools:/app/mcp-tools
+      - ./workspace:/workspace
+      - librechat-images:/app/client/public/images
+      - librechat-logs:/app/api/logs
+
+  # === MongoDB ===
+  mongodb:
+    image: mongo:7.0
+    restart: always
+    volumes:
+      - mongo-data:/data/db
+    command: mongod --noauth
+
+  # === MeiliSearch ===
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    restart: always
+    environment:
+      - MEILI_MASTER_KEY=${MEILI_MASTER_KEY:-changeme}
+      - MEILI_NO_ANALYTICS=true
+    volumes:
+      - meili-data:/meili_data
+
+  # === Veilguard PII Gateway (FastAPI + Presidio) ===
+  pii-proxy:
+    build: ./pii-proxy
+    ports:
+      - "4000:4000"
+    env_file:
+      - .env
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - ANTHROPIC_API_URL=${ANTHROPIC_API_URL:-https://api.anthropic.com}
+      - OPENAI_API_URL=${OPENAI_API_URL:-https://api.openai.com}
+      - GEMINI_API_URL=${GEMINI_API_URL:-https://generativelanguage.googleapis.com}
+      - PII_PROXY_PORT=4000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MIN_SCORE=${MIN_SCORE:-0.7}
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  mongo-data:
+  meili-data:
+  librechat-images:
+  librechat-logs:

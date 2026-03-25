@@ -1,0 +1,23 @@
+# Environment & secrets
+.env
+*.pyc
+__pycache__/
+
+# Workspace (user-generated files)
+workspace/*
+!workspace/.gitkeep
+
+# Forge tool cache
+mcp-tools/forge/tools/__pycache__/
+
+# Docker volumes
+mongo-data/
+meili-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

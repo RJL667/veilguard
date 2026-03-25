@@ -1,0 +1,102 @@
+version: 1.2.1
+
+cache: true
+
+endpoints:
+  custom:
+    - name: "Gemini"
+      apiKey: "${GOOGLE_API_KEY}"
+      baseURL: "http://pii-proxy:4000/gemini/v1beta/openai"
+      models:
+        default:
+          - "gemini-2.5-flash"
+          - "gemini-2.5-pro"
+          - "gemini-3-pro-preview"
+          - "gemini-3-flash-preview"
+        fetch: false
+      titleConvo: true
+      titleModel: "gemini-2.5-flash"
+      modelDisplayLabel: "Gemini"
+      promptPrefix: |
+        You are Veilguard, a Phishield AI assistant with powerful tools.
+
+        TOOL STRATEGY:
+        - For simple, fast tasks (read a file, list a directory, quick question): use tools directly and return the result.
+        - For complex or slow tasks (create reports, analyze large data, research topics, multi-step work): use the `background` tool with appropriate wait_seconds. This spawns a sub-agent that works while you can report back to the user.
+        - For multiple independent tasks: use `start_parallel_tasks` to run them concurrently, then `wait_for_tasks` to collect results.
+        - For tasks needing quality: use `review_loop` which has a worker + critic cycle.
+        - For specialized analysis: use `spawn_agent` with a role (analyst, threat, writer, coder, researcher).
+
+        BACKGROUND DECISION RULES:
+        - If a task will take >10 seconds or requires deep thinking → background it
+        - If the user asks for multiple things → parallelize with start_parallel_tasks
+        - If the user asks for a report, document, or analysis → background it
+        - If the user asks to "check on" something → use check_task or list_tasks
+        - Always tell the user what you're doing: "I'm running this in the background, will check in ~15s"
+
+        AVAILABLE TOOL SERVERS:
+        - filesystem: read/write files, search, grep, parse CSV/JSON
+        - code-exec: run Python/bash in the container
+        - web: Google search, browse URLs
+        - documents: create/read PDF, DOCX, XLSX, PPTX
+        - image: describe/resize/convert images, create charts
+        - host-exec: run CMD, PowerShell, Docker, Git on the Windows host
+        - sub-agents: spawn background workers, parallel agents, review loops
+
+  # Disable all built-in endpoints (only using Gemini via custom)
+  anthropic:
+    disabled: true
+  openAI:
+    disabled: true
+  google:
+    disabled: true
+  assistants:
+    disabled: true
+
+mcpSettings:
+  allowedDomains:
+    - "host.docker.internal"
+    - "localhost"
+
+mcpServers:
+  filesystem:
+    type: stdio
+    command: python
+    args:
+      - "/app/mcp-tools/filesystem/server.py"
+
+  code-exec:
+    type: stdio
+    command: python
+    args:
+      - "/app/mcp-tools/code-exec/server.py"
+
+  web:
+    type: stdio
+    command: python
+    args:
+      - "/app/mcp-tools/web/server.py"
+
+  documents:
+    type: stdio
+    command: python
+    args:
+      - "/app/mcp-tools/documents/server.py"
+
+  image:
+    type: stdio
+    command: python
+    args:
+      - "/app/mcp-tools/image/server.py"
+
+  host-exec:
+    type: sse
+    url: "http://host.docker.internal:8808/sse"
+
+  sub-agents:
+    type: sse
+    url: "http://host.docker.internal:8809/sse"
+
+  forge:
+    type: sse
+    url: "http://host.docker.internal:8810/sse"

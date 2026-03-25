@@ -1,0 +1,13 @@
+{
+  "check_spf": {
+    "name": "check_spf",
+    "description": "Checks if a domain has an SPF record.",
+    "args": {
+      "domain": "string"
+    },
+    "created_at": 1774480490.7211657,
+    "updated_at": 1774480490.7211657,
+    "run_count": 2,
+    "last_error": null
+  }
+}

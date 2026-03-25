@@ -1,0 +1,24 @@
+# Extends the stock LibreChat image with Python + MCP tool dependencies
+FROM ghcr.io/danny-avila/librechat-dev:latest
+
+USER root
+
+# Install Python + system deps for MCP tool servers (Alpine-based image)
+RUN apk add --no-cache python3 py3-pip \
+    jpeg-dev zlib-dev freetype-dev \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+# Install MCP tool dependencies
+COPY mcp-tools/filesystem/requirements.txt /tmp/fs-reqs.txt
+COPY mcp-tools/code-exec/requirements.txt /tmp/exec-reqs.txt
+COPY mcp-tools/web/requirements.txt /tmp/web-reqs.txt
+COPY mcp-tools/documents/requirements.txt /tmp/doc-reqs.txt
+COPY mcp-tools/image/requirements.txt /tmp/img-reqs.txt
+RUN pip install --no-cache-dir --break-system-packages \
+    -r /tmp/fs-reqs.txt \
+    -r /tmp/exec-reqs.txt \
+    -r /tmp/web-reqs.txt \
+    -r /tmp/doc-reqs.txt \
+    -r /tmp/img-reqs.txt
+
+USER node
