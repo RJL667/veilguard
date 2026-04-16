@@ -25,7 +25,7 @@ PII_ENTITIES = [
 ]
 
 # JSON keys containing user-authored content to scan
-USER_CONTENT_KEYS = {"text", "content", "query", "prompt", "input", "message", "value"}
+USER_CONTENT_KEYS = {"text", "content", "query", "prompt", "input", "message", "value", "system"}
 
 # JSON keys to skip (metadata, not user content)
 SKIP_KEYS = {
@@ -33,6 +33,7 @@ SKIP_KEYS = {
     "created", "usage", "index", "finish_reason", "stream",
     "max_tokens", "temperature", "top_p", "anthropic_version",
     "name", "source", "media_type", "cache_control", "tool_use_id",
+    "signature", "thinking",  # Anthropic thinking blocks — signature invalidated if content changes
 }
 
 
@@ -62,6 +63,12 @@ class PIIRedactor:
                 language="en",
                 score_threshold=self.min_score,
             )
+            if not results:
+                return text
+
+            # Filter out false positives: our own REF_ tokens should never be re-redacted
+            results = [r for r in results if not text[r.start:r.end].startswith("REF_")]
+
             if not results:
                 return text
 

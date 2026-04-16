@@ -37,11 +37,22 @@ class PIISessionStore:
             return self._store[conversation_id]
 
     def add_mapping(self, conversation_id: str, entity_type: str, original: str) -> str:
-        """Add a PII mapping and return the token. Reuses existing token for same value."""
+        """Add a PII mapping and return the token. Reuses existing token for same value.
+
+        Case-insensitive for PERSON entities: "sarah" and "Sarah" get the same token.
+        The original casing of the FIRST occurrence is preserved for rehydration.
+        """
         session = self.get_or_create(conversation_id)
-        # If we've seen this exact value before, reuse its token
-        if original in session["reverse"]:
-            return session["reverse"][original]
+
+        # Case-insensitive lookup for person names
+        lookup_key = original
+        if entity_type == "PERSON":
+            lookup_key = original.lower()
+
+        # If we've seen this value before (case-insensitive for names), reuse its token
+        if lookup_key in session["reverse"]:
+            return session["reverse"][lookup_key]
+
         # Generate new token
         counter = session["counters"].get(entity_type, 0) + 1
         session["counters"][entity_type] = counter
@@ -49,7 +60,7 @@ class PIISessionStore:
         short_type = entity_type.replace("_ADDRESS", "").replace("_NUMBER", "").replace("SA_", "")
         token = f"REF_{short_type}_{counter}"
         session["mapping"][token] = original
-        session["reverse"][original] = token
+        session["reverse"][lookup_key] = token
         return token
 
     def rehydrate(self, conversation_id: str, text: str) -> str:
