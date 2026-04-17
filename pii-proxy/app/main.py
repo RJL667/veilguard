@@ -211,6 +211,124 @@ def _is_anthropic_format(remaining_path: str) -> bool:
     return "v1/messages" in remaining_path
 
 
+# ── Anthropic prompt caching ─────────────────────────────────────────────────
+# Anthropic supports `cache_control: {"type": "ephemeral"}` on any content
+# block. The API caches all tokens up to the last block carrying the marker.
+# On a subsequent call with a byte-identical prefix, `cache_read_input_tokens`
+# in the response usage reports a hit (5–10× cheaper than reprocessing).
+#
+# Minimum cacheable segment is ~1024 tokens (~4000 chars). Up to 4 markers
+# allowed. Any byte change in the cached prefix invalidates it.
+
+_MIN_CACHE_CHARS = 4000
+
+
+def _split_for_cache(prompt: str, marker: str | None = None) -> tuple[str | None, str]:
+    """Split a prompt at a boundary marker for KV-cache reuse.
+
+    Returns (prefix, tail) when the marker exists and the prefix is long
+    enough to be worth caching; (None, prompt) otherwise — caller should
+    send the prompt as a plain string in that case.
+
+    The prefix ends just before the marker; the tail starts at the marker.
+    """
+    if not marker or not isinstance(prompt, str):
+        return (None, prompt)
+    idx = prompt.find(marker)
+    if idx == -1 or idx < _MIN_CACHE_CHARS:
+        return (None, prompt)
+    return (prompt[:idx], prompt[idx:])
+
+
+def _apply_anthropic_cache(data: dict) -> int:
+    """Add cache_control markers to the Anthropic request body.
+
+    Caches the system message (stable prefix containing TCMM memory +
+    Veilguard prompt) and, when the conversation history is long, the
+    penultimate message block. Leaves the latest user turn uncached.
+
+    Returns the number of cache_control markers added.
+    """
+    markers = 0
+
+    # 1. System message — the biggest stable chunk.
+    system = data.get("system")
+    if isinstance(system, str) and len(system) >= _MIN_CACHE_CHARS:
+        data["system"] = [{
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }]
+        markers += 1
+    elif isinstance(system, list) and system:
+        # Already structured. Mark the last text block if the total is long enough.
+        total_len = sum(
+            len(b.get("text", "")) for b in system
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+        if total_len >= _MIN_CACHE_CHARS:
+            for blk in reversed(system):
+                if isinstance(blk, dict) and blk.get("type") == "text":
+                    blk.setdefault("cache_control", {"type": "ephemeral"})
+                    markers += 1
+                    break
+
+    # 2. Conversation history — cache everything up to (but not including)
+    #    the last user message. Only worth it if there are 3+ prior turns.
+    messages = data.get("messages") or []
+    if isinstance(messages, list) and len(messages) >= 4 and markers < 4:
+        # Find the final user message; cache the message just before it.
+        last_user_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], dict) and messages[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx >= 2:
+            target = messages[last_user_idx - 1]
+            if isinstance(target, dict):
+                content = target.get("content")
+                # Normalise string → list so we can attach cache_control
+                if isinstance(content, str):
+                    if len(content) >= 200:  # tiny content isn't worth it
+                        target["content"] = [{
+                            "type": "text",
+                            "text": content,
+                            "cache_control": {"type": "ephemeral"},
+                        }]
+                        markers += 1
+                elif isinstance(content, list) and content:
+                    total_len = sum(
+                        len(b.get("text", "")) for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                    if total_len >= 200:
+                        for blk in reversed(content):
+                            if isinstance(blk, dict) and blk.get("type") == "text":
+                                blk.setdefault("cache_control", {"type": "ephemeral"})
+                                markers += 1
+                                break
+
+    return markers
+
+
+def _log_cache_metrics(usage: dict, context: str = ""):
+    """Log Anthropic cache hit/miss from response usage field.
+
+    `cache_creation_input_tokens`: tokens written to the cache (miss on first call).
+    `cache_read_input_tokens`: tokens served from cache (hit on subsequent calls).
+    """
+    if not isinstance(usage, dict):
+        return
+    create = usage.get("cache_creation_input_tokens", 0) or 0
+    read = usage.get("cache_read_input_tokens", 0) or 0
+    inp = usage.get("input_tokens", 0) or 0
+    out = usage.get("output_tokens", 0) or 0
+    ctx = f" {context}" if context else ""
+    logger.info(
+        f"  [CACHE]{ctx} create={create} read={read} input={inp} output={out}"
+    )
+
+
 import re as _re
 
 _HEATMAP_RE = _re.compile(
@@ -439,6 +557,11 @@ async def gateway(request: Request, path: str):
                     existing_system = data.get("system", "")
                     data["system"] = f"{veilguard_prompt}\n{existing_system}".strip()
 
+                    # Apply prompt caching markers (system + conversation history)
+                    _cache_markers = _apply_anthropic_cache(data)
+                    if _cache_markers:
+                        logger.info(f"  [CACHE] applied {_cache_markers} cache_control marker(s)")
+
                 # Redact PII
                 redacted = redactor.redact_json(data, pii_session_id)
                 body = json.dumps(redacted, ensure_ascii=False).encode("utf-8")
@@ -520,6 +643,7 @@ async def gateway(request: Request, path: str):
                 all_content_text = "" # combined text from all deltas (for TCMM)
                 sse_buf = ""
                 _rehydration_count = 0
+                _cache_usage = {}     # accumulated cache/token usage from message_start + message_delta
 
                 try:
                     async for chunk in response.aiter_bytes():
@@ -536,14 +660,25 @@ async def gateway(request: Request, path: str):
                             event_str, sse_buf = sse_buf.split("\n\n", 1)
                             all_events.append(event_str + "\n\n")
 
-                            # Track content text for TCMM
+                            # Track content text for TCMM + capture cache usage
                             for line in event_str.split("\n"):
                                 line = line.strip()
                                 if line.startswith("data: "):
                                     try:
                                         evt = json.loads(line[6:])
-                                        if evt.get("type") == "content_block_delta" and evt.get("delta", {}).get("type") == "text_delta":
+                                        etype = evt.get("type")
+                                        if etype == "content_block_delta" and evt.get("delta", {}).get("type") == "text_delta":
                                             all_content_text += evt["delta"]["text"]
+                                        elif etype == "message_start":
+                                            # Contains input_tokens + cache_creation/read_input_tokens
+                                            u = (evt.get("message") or {}).get("usage") or {}
+                                            for k, v in u.items():
+                                                _cache_usage[k] = v
+                                        elif etype == "message_delta":
+                                            # Contains final output_tokens
+                                            u = evt.get("usage") or {}
+                                            for k, v in u.items():
+                                                _cache_usage[k] = v
                                     except (json.JSONDecodeError, ValueError):
                                         pass
 
@@ -562,6 +697,11 @@ async def gateway(request: Request, path: str):
                                     all_content_text += evt["delta"]["text"]
                             except (json.JSONDecodeError, ValueError):
                                 pass
+
+                # Log cache hit/miss metrics (collected from message_start + message_delta)
+                if _cache_usage:
+                    _log_cache_metrics(_cache_usage,
+                                       context=f"conv={conversation_id[:8] if conversation_id else '?'} stream=true")
 
                 # Strip heatmap from the COMBINED content text
                 clean_content = _strip_heatmap_from_text(all_content_text)
@@ -864,6 +1004,9 @@ async def gateway(request: Request, path: str):
                         # Anthropic format: {"content": [{"type": "text", "text": "..."}]}
                         blocks = resp_json.get("content", [])
                         raw_content = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+                        # Log cache hit/miss metrics
+                        _log_cache_metrics(resp_json.get("usage", {}),
+                                           context=f"conv={conversation_id[:8] if conversation_id else '?'} stream=false")
                     else:
                         # OpenAI format: {"choices": [{"message": {"content": "..."}}]}
                         choices = resp_json.get("choices", [])
