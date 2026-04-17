@@ -661,16 +661,49 @@ async def gateway(request: Request, path: str):
                     )
 
                     existing_system = data.get("system", "")
-                    # Combine existing + TCMM memory into a single volatile tail.
-                    volatile_tail = existing_system.strip() if existing_system else ""
+                    tcmm_memory = existing_system.strip() if existing_system else ""
 
-                    # Emit as structured content when we have a non-trivial tail,
-                    # otherwise send the preamble alone as a plain string.
+                    # TCMM renders memory as:
+                    #   <L0 header + instructions>
+                    #   <L1 live blocks — stable, cacheable>
+                    #   --- END LIVE MEMORY ---    ← cache boundary
+                    #   <L2 shadow blocks — volatile>
+                    #   <L3 answer contract — volatile>
+                    #
+                    # We extend the cacheable region by including the Veilguard
+                    # preamble + L0 + L1 (up to and including the END-LIVE-MEMORY
+                    # line) in the FIRST content block with cache_control. Everything
+                    # below the boundary goes in a second block with no cache_control.
+                    _LIVE_BOUNDARY = "--- END LIVE MEMORY ---"
+                    if tcmm_memory:
+                        idx = tcmm_memory.find(_LIVE_BOUNDARY)
+                        if idx >= 0:
+                            # Split so the marker line goes in the cached region.
+                            nl = tcmm_memory.find("\n", idx)
+                            split_at = nl if nl >= 0 else idx + len(_LIVE_BOUNDARY)
+                            cacheable_mem = tcmm_memory[:split_at]
+                            volatile_tail = tcmm_memory[split_at:]
+                        else:
+                            # Older TCMM without Phase-6 marker — entire memory
+                            # goes in the cached block (as before).
+                            cacheable_mem = tcmm_memory
+                            volatile_tail = ""
+                    else:
+                        cacheable_mem = ""
+                        volatile_tail = ""
+
+                    # Assemble the system field.
+                    # Content block 1: preamble + L0+L1 memory, cache_control=ephemeral
+                    # Content block 2: L2 shadow + L3 contract, no cache
+                    cached_head = veilguard_static_preamble
+                    if cacheable_mem:
+                        cached_head = f"{cached_head}\n\n{cacheable_mem}"
+
                     if volatile_tail:
                         data["system"] = [
                             {
                                 "type": "text",
-                                "text": veilguard_static_preamble,
+                                "text": cached_head,
                                 "cache_control": {"type": "ephemeral"},
                             },
                             {
@@ -679,14 +712,25 @@ async def gateway(request: Request, path: str):
                             },
                         ]
                     else:
-                        data["system"] = veilguard_static_preamble
+                        # No volatile tail — still mark the head for cache.
+                        data["system"] = [
+                            {
+                                "type": "text",
+                                "text": cached_head,
+                                "cache_control": {"type": "ephemeral"},
+                            },
+                        ]
 
-                    # _apply_anthropic_cache now mostly confirms the marker;
-                    # it still handles the conversation-history cache point
-                    # for long multi-turn messages[] arrays.
-                    _cache_markers = _apply_anthropic_cache(data)
-                    if _cache_markers:
-                        logger.info(f"  [CACHE] applied {_cache_markers} cache_control marker(s)")
+                    logger.info(
+                        f"  [CACHE] split at --- END LIVE MEMORY --- "
+                        f"(cached={len(cached_head)}B volatile={len(volatile_tail)}B)"
+                    )
+
+                    # Still run _apply_anthropic_cache for the conversation-history
+                    # path (caches the second-to-last message in long multi-turn
+                    # messages[] arrays). It skips the system field now that we've
+                    # already structured it.
+                    _apply_anthropic_cache(data)
 
                 # Redact PII
                 redacted = redactor.redact_json(data, pii_session_id)
