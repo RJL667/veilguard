@@ -121,29 +121,145 @@ async def rehydrate_endpoint(request: Request):
 # ── TCMM Integration Helpers ─────────────────────────────────────────────────
 
 def _extract_last_user_message(messages: list) -> str:
-    """Extract the latest user message from OpenAI or Anthropic format messages array."""
+    """Extract the latest user-authored text from an OpenAI/Anthropic messages[] array.
+
+    Skips tool_result wrappers. On Anthropic the last role=user message in a
+    tool-followup turn contains ONLY tool_result blocks — that's a model
+    echo, not a user turn, so we walk further back.
+    """
     if not messages:
         return ""
     for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            # Anthropic format: content can be a list of blocks
-            if isinstance(content, list):
-                return " ".join(
-                    p.get("text", "") for p in content
-                    if isinstance(p, dict) and p.get("type") == "text"
-                ).strip()
-            return str(content).strip()
+        role = msg.get("role")
+        if role != "user":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            # A user-role message is only a real user turn if it contains
+            # at least one text/image block and no tool_result.
+            has_tool_result = any(
+                isinstance(p, dict) and p.get("type") == "tool_result"
+                for p in content
+            )
+            if has_tool_result:
+                continue  # keep looking further back for a real user turn
+            text = " ".join(
+                p.get("text", "") for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            ).strip()
+            if text:
+                return text
     return ""
 
 
-async def _tcmm_pre_request(user_message: str, conversation_id: str, user_id: str = "") -> str | None:
-    """Call TCMM service to get enriched prompt. Returns None on failure."""
+def classify_message_origin(msg: dict) -> str:
+    """Classify a single messages[] entry by its *real* origin.
+
+    The Anthropic/OpenAI schema already tags tool traffic structurally;
+    this helper just reads the envelope and returns one of:
+
+      "user"           — human-authored text (role=user, no tool_result)
+      "user_image"     — role=user message containing an image block
+      "tool_result"    — role=user message whose content is tool output
+                         (model-facing echo, NOT a real user turn)
+      "assistant_text" — role=assistant text-only reply
+      "tool_use"       — role=assistant containing a tool invocation
+      "tool"           — OpenAI's role=tool (function-call response)
+      "system"         — role=system (rare in messages[])
+      "unknown"
+
+    Use this to decide whether a message should be ingested into TCMM
+    memory (ingest user/assistant_text, skip tool_result/tool_use/tool).
+    """
+    if not isinstance(msg, dict):
+        return "unknown"
+    role = msg.get("role")
+    content = msg.get("content")
+
+    # OpenAI function-calling: explicit role="tool"
+    if role == "tool":
+        return "tool"
+    # OpenAI assistant with tool_calls[]
+    if role == "assistant" and isinstance(msg.get("tool_calls"), list) and msg["tool_calls"]:
+        return "tool_use"
+
+    if role == "system":
+        return "system"
+
+    # Anthropic-style content blocks
+    if isinstance(content, list):
+        types = {
+            blk.get("type") for blk in content
+            if isinstance(blk, dict)
+        }
+        if role == "user":
+            if "tool_result" in types:
+                return "tool_result"
+            if "image" in types:
+                return "user_image"
+            return "user"
+        if role == "assistant":
+            if "tool_use" in types:
+                return "tool_use"
+            return "assistant_text"
+
+    # Plain-string content
+    if isinstance(content, str):
+        if role == "user":
+            return "user"
+        if role == "assistant":
+            return "assistant_text"
+
+    return "unknown"
+
+
+def _is_tool_followup(messages: list) -> bool:
+    """True when this request's latest turn is a tool-result being returned
+    to the model for continuation — i.e. not a human turn. Used to skip
+    TCMM ingestion on these purely mechanical hand-offs.
+
+    Two signals:
+      1. The last message itself is classified as tool_result or tool.
+      2. The last message is role=user containing tool_result AND the
+         prior assistant message held a tool_use (tool_use → tool_result
+         round trip).
+    """
+    if not messages:
+        return False
+    last_origin = classify_message_origin(messages[-1])
+    if last_origin in ("tool_result", "tool"):
+        return True
+    if len(messages) >= 2:
+        prev_origin = classify_message_origin(messages[-2])
+        if prev_origin == "tool_use" and last_origin == "tool_result":
+            return True
+    return False
+
+
+async def _tcmm_pre_request(
+    user_message: str,
+    conversation_id: str,
+    user_id: str = "",
+    origin: str = "user",
+) -> str | None:
+    """Call TCMM service to get enriched prompt. Returns None on failure.
+
+    `origin` is the classified origin of the last user-role message —
+    "user" for text, "user_image" for image attachments. TCMM stamps the
+    stored block with this tag so role is recoverable from the archive.
+    """
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{TCMM_URL}/pre_request",
-                json={"user_message": user_message, "conversation_id": conversation_id, "user_id": user_id},
+                json={
+                    "user_message": user_message,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "origin": origin,
+                },
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -169,13 +285,28 @@ async def _tcmm_pre_request(user_message: str, conversation_id: str, user_id: st
     return None
 
 
-async def _tcmm_post_response(raw_output: str, conversation_id: str, user_id: str = "") -> str | None:
-    """Call TCMM service to process response. Returns clean answer or None on failure."""
+async def _tcmm_post_response(
+    raw_output: str,
+    conversation_id: str,
+    user_id: str = "",
+    origin: str = "assistant_text",
+) -> str | None:
+    """Call TCMM service to process response. Returns clean answer or None on failure.
+
+    `origin` defaults to "assistant_text". Set to "tool_use" when the
+    assistant's reply is itself a tool invocation (unusual — we usually
+    catch that on the next turn via _extract_tool_pair).
+    """
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{TCMM_URL}/post_response",
-                json={"raw_output": raw_output, "conversation_id": conversation_id, "user_id": user_id},
+                json={
+                    "raw_output": raw_output,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "origin": origin,
+                },
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -191,6 +322,190 @@ async def _tcmm_post_response(raw_output: str, conversation_id: str, user_id: st
     except Exception as e:
         logger.warning(f"  [TCMM] post_response error: {e}")
     return None
+
+
+async def _tcmm_ingest_turn(
+    items: list,
+    conversation_id: str,
+    user_id: str = "",
+) -> int:
+    """Persist auxiliary turn items (tool_use / tool_result) into TCMM.
+
+    The tool round-trip isn't a primary user/assistant turn, so pre_request
+    doesn't ingest it and post_response only sees the final text answer.
+    Without this call the archive would have no record that a tool was
+    invoked or what it returned. Returns the number of blocks TCMM added.
+    """
+    if not items:
+        return 0
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                f"{TCMM_URL}/ingest_turn",
+                json={
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                    "items": items,
+                },
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                added = data.get("added", 0)
+                logger.info(
+                    f"  [TCMM] ingest_turn OK — "
+                    f"added={added}/{data.get('requested', len(items))} "
+                    f"origins={[(i or {}).get('origin') for i in items]}"
+                )
+                return added
+            logger.warning(f"  [TCMM] ingest_turn HTTP {resp.status_code}")
+    except httpx.ConnectError:
+        logger.warning("  [TCMM] service unreachable — tool round-trip not persisted")
+    except Exception as e:
+        logger.warning(f"  [TCMM] ingest_turn error: {e}")
+    return 0
+
+
+def _canonical_param_hash(tool_input) -> str:
+    """Hash the canonical-JSON form of a tool call's input parameters.
+
+    Same params → same hash, regardless of key order or whitespace.
+    Used as a stable identifier so multiple invocations of
+    `read_file({"path":"/etc/passwd"})` share a key and can be compared
+    — two identical calls returning different results is a signal
+    (state drift, flaky tool, broken result).
+
+    12 hex chars = ~48 bits of entropy — collision risk is negligible
+    at the scale of a conversation's tool calls.
+    """
+    try:
+        canon = json.dumps(
+            tool_input if tool_input is not None else {},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        )
+    except Exception:
+        canon = str(tool_input)
+    import hashlib
+    return hashlib.sha1(canon.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _extract_tool_pair(messages: list) -> list:
+    """Extract the tool_use + tool_result pair from a tool-followup turn.
+
+    A tool round-trip looks like:
+        messages[-2] = {role: assistant, content: [..., {type: tool_use, id, name, input}]}
+        messages[-1] = {role: user,      content: [{type: tool_result, tool_use_id, content}]}
+
+    Both need to be persisted in TCMM so the archive has a faithful
+    record of what the model invoked and what it got back.
+
+    Pairing key is `(tool_name, param_hash)` — two different invocations
+    of the *same* tool with the *same* input share this key, so the
+    adapter's find_tool_invocations() scan can compare their results.
+    tool_use_id is kept as a secondary tiebreaker for exact per-call
+    matching within the same pair of messages.
+
+    Each item returned:
+        {text, origin, tool_name, tool_use_id, param_hash}.
+    Safe on malformed messages — returns [] if the expected shape
+    isn't there.
+    """
+    items: list = []
+    if not messages or len(messages) < 2:
+        return items
+
+    # tool_use_id → (tool_name, param_hash) lookup from the assistant
+    # turn. tool_result doesn't carry name/input, only the id, so we
+    # reuse what we saw on the matching tool_use block.
+    tu_id_to_meta: dict[str, tuple] = {}
+
+    # --- messages[-2]: assistant with tool_use (maybe also text) ---
+    asst = messages[-2]
+    if isinstance(asst, dict) and asst.get("role") == "assistant":
+        content = asst.get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                btype = blk.get("type")
+                if btype == "tool_use":
+                    name = blk.get("name", "unknown")
+                    tuid = blk.get("id", "")
+                    inp = blk.get("input", {})
+                    phash = _canonical_param_hash(inp)
+                    if tuid:
+                        # Carry raw input too so tool_result can inherit
+                        # it without re-parsing (result envelope doesn't
+                        # carry params).
+                        tu_id_to_meta[tuid] = (name, phash, inp)
+                    try:
+                        inp_str = json.dumps(inp, ensure_ascii=False)[:2000]
+                    except Exception:
+                        inp_str = str(inp)[:2000]
+                    text = f"TOOL CALL {name}({inp_str})"
+                    items.append({
+                        "text": text,
+                        "origin": "tool_use",
+                        "tool_name": name,
+                        "tool_use_id": tuid,
+                        "param_hash": phash,
+                        # Raw structured input — stored on the archive
+                        # entry so later analytics can aggregate by
+                        # actual param values (not just the hash).
+                        "params": inp,
+                    })
+                # Text blocks alongside tool_use are already ingested
+                # via post_response on the prior turn — skip them here.
+
+    # --- messages[-1]: user with tool_result ---
+    usr = messages[-1]
+    if isinstance(usr, dict) and usr.get("role") == "user":
+        content = usr.get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if not isinstance(blk, dict) or blk.get("type") != "tool_result":
+                    continue
+                tuid = blk.get("tool_use_id", "")
+                # Reuse (name, param_hash, params) from the matching
+                # tool_use in this turn. Falls back to "unknown" /
+                # empty hash if we can't see the matching call —
+                # orphan scan will still catch this as a "result with
+                # no call".
+                tname, phash, tparams = tu_id_to_meta.get(
+                    tuid, ("unknown", "", None)
+                )
+                raw = blk.get("content", "")
+                # tool_result content can be a string OR a list of blocks
+                # (Anthropic allows nested text / image results). Flatten
+                # to a single string for ingestion.
+                if isinstance(raw, list):
+                    parts: list[str] = []
+                    for sub in raw:
+                        if isinstance(sub, dict):
+                            if sub.get("type") == "text":
+                                parts.append(sub.get("text", ""))
+                            elif sub.get("type") == "image":
+                                parts.append("[image omitted]")
+                        elif isinstance(sub, str):
+                            parts.append(sub)
+                    raw_str = "\n".join(p for p in parts if p)
+                else:
+                    raw_str = str(raw) if raw is not None else ""
+                text = f"TOOL RESULT [{tuid}]: {raw_str}" if tuid else f"TOOL RESULT: {raw_str}"
+                items.append({
+                    "text": text,
+                    "origin": "tool_result",
+                    "tool_name": tname,
+                    "tool_use_id": tuid,
+                    "param_hash": phash,
+                    # Raw structured result content (string or list of
+                    # Anthropic sub-blocks) + the params that produced
+                    # it. Lets analytics compare "same command, same
+                    # params, different result" without text parsing.
+                    "params": tparams,
+                    "result": raw if raw is not None else "",
+                })
+
+    return items
 
 
 def _is_chat_completion(remaining_path: str, method: str) -> bool:
@@ -488,40 +803,46 @@ async def gateway(request: Request, path: str):
                 tcmm_active = False
                 if TCMM_ENABLED and _is_chat_completion(remaining_path, request.method):
                     messages = data.get("messages", [])
-                    # Detect if THIS request is a tool result follow-up
-                    # Only check the LAST message — not the full history
-                    # (History may contain old tool_use from previous turns)
-                    is_tool_followup = False
-                    if messages:
-                        last_msg = messages[-1]
-                        # OpenAI: last message role="tool"
-                        if last_msg.get("role") == "tool":
-                            is_tool_followup = True
-                        # Anthropic: last message contains tool_result blocks
-                        last_content = last_msg.get("content", [])
-                        if isinstance(last_content, list):
-                            for block in last_content:
-                                if isinstance(block, dict) and block.get("type") == "tool_result":
-                                    is_tool_followup = True
-                                    break
-                        # Also: second-to-last is assistant with tool_use (awaiting result)
-                        if len(messages) >= 2:
-                            prev_msg = messages[-2]
-                            if prev_msg.get("role") == "assistant":
-                                prev_content = prev_msg.get("content", [])
-                                if isinstance(prev_content, list):
-                                    for block in prev_content:
-                                        if isinstance(block, dict) and block.get("type") == "tool_use":
-                                            is_tool_followup = True
-                                            break
+                    # Tool-followup detection reads the envelope via
+                    # classify_message_origin — no LibreChat-side declaration
+                    # needed. See classify_message_origin for the schema map.
+                    is_tool_followup = _is_tool_followup(messages)
 
                     if is_tool_followup:
-                        # Tool result follow-up — pass through untouched
-                        logger.info(f"  [TCMM] Skipping — tool result follow-up")
+                        # Tool round-trip turn. The user hasn't authored
+                        # anything new, so we skip recall / prompt rebuild
+                        # (that would churn the cache for no gain), but we
+                        # DO persist the tool_use + tool_result pair into
+                        # TCMM so the archive has a faithful record of
+                        # what the model invoked and what it got back.
+                        tool_items = _extract_tool_pair(messages)
+                        if tool_items:
+                            await _tcmm_ingest_turn(
+                                tool_items,
+                                conversation_id,
+                                user_id=tcmm_user_id,
+                            )
+                        else:
+                            logger.info("  [TCMM] tool-followup with no extractable tool blocks — passthrough")
                     else:
                         user_msg = _extract_last_user_message(messages)
                         if user_msg:
-                            tcmm_context = await _tcmm_pre_request(user_msg, conversation_id, user_id=tcmm_user_id)
+                            # Classify the LAST user-role message so the
+                            # ingested block records whether it was plain
+                            # text or carried an image attachment.
+                            user_origin = "user"
+                            for _m in reversed(messages):
+                                if isinstance(_m, dict) and _m.get("role") == "user":
+                                    _o = classify_message_origin(_m)
+                                    if _o in ("user", "user_image"):
+                                        user_origin = _o
+                                        break
+                            tcmm_context = await _tcmm_pre_request(
+                                user_msg,
+                                conversation_id,
+                                user_id=tcmm_user_id,
+                                origin=user_origin,
+                            )
                             if tcmm_context:
                                 # Inject TCMM context RAW (with real PII).
                                 # redact_json below handles the ENTIRE payload in one pass,
@@ -736,6 +1057,32 @@ async def gateway(request: Request, path: str):
                 redacted = redactor.redact_json(data, pii_session_id)
                 body = json.dumps(redacted, ensure_ascii=False).encode("utf-8")
                 headers["content-length"] = str(len(body))
+
+                # Origin-aware diagnostic: count each message's classified origin
+                # so we can see the tool/user/assistant mix per request in logs.
+                # Opt-in full-body dump via VEILGUARD_TOOL_DUMP=1 for tool-bearing
+                # requests (used to forensically inspect the Anthropic envelope).
+                try:
+                    _origin_counts = {}
+                    _has_tool = False
+                    for _m in redacted.get("messages", []):
+                        _o = classify_message_origin(_m)
+                        _origin_counts[_o] = _origin_counts.get(_o, 0) + 1
+                        if _o in ("tool_use", "tool_result", "tool"):
+                            _has_tool = True
+                    if _origin_counts:
+                        _mix = " ".join(f"{k}={v}" for k, v in sorted(_origin_counts.items()))
+                        logger.info(f"  [ORIGIN] {_mix}")
+                    if _has_tool and os.environ.get("VEILGUARD_TOOL_DUMP") == "1":
+                        _dump_dir = "/app/logs/tool_dumps"
+                        os.makedirs(_dump_dir, exist_ok=True)
+                        _ts = __import__("time").time()
+                        _fname = f"{_dump_dir}/{_ts:.3f}_full_body.json"
+                        with open(_fname, "wb") as _fp:
+                            _fp.write(body)
+                        logger.info(f"  [TOOL-DUMP] {_fname} ({len(body)} bytes)")
+                except Exception:
+                    pass
 
                 # Wire-level hash of the system field (post-redaction, pre-send).
                 # Two consecutive turns with the same sys_sha share a cache key.

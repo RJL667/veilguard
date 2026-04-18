@@ -306,12 +306,34 @@ class PreRequestBody(BaseModel):
     conversation_id: str = ""
     user_id: str = ""
     recall_only: bool = False  # When True: recall from existing session, don't ingest query
+    # Origin tag from the PII proxy's classify_message_origin().
+    # Passed through to TCMM so the stored block records the source role
+    # ("user" | "user_image" | "tool_result" | "tool"). Default is "user"
+    # to preserve backward compatibility with callers that don't set it.
+    origin: str = "user"
 
 
 class PostResponseBody(BaseModel):
     raw_output: str
     conversation_id: str = ""
     user_id: str = ""
+    # Origin tag for the assistant-side block. Usually "assistant_text";
+    # set to "tool_use" when the assistant reply is a tool invocation.
+    origin: str = "assistant_text"
+
+
+class IngestTurnBody(BaseModel):
+    """Auxiliary ingestion (tool_use / tool_result / mid-turn blocks).
+
+    Called by the PII proxy when it sees a tool round-trip — both sides
+    of the hand-off need to be persisted in the archive, even though they
+    are not primary user↔assistant turns. `items` is a small list of
+    {text, origin} objects; see the PII proxy's classify_message_origin
+    for the recognised origin values.
+    """
+    conversation_id: str = ""
+    user_id: str = ""
+    items: list = []
 
 
 import asyncio
@@ -385,7 +407,11 @@ async def pre_request(body: PreRequestBody):
             sess = pool.get_stats(body.conversation_id)
 
             start = time.time()
-            prompt = instance.pre_request(body.user_message, session_id=body.conversation_id)
+            prompt = instance.pre_request(
+                body.user_message,
+                session_id=body.conversation_id,
+                origin=body.origin or "user",
+            )
             elapsed = time.time() - start
 
             status = instance.get_status()
@@ -506,7 +532,11 @@ async def post_response(body: PostResponseBody):
             sess = pool.get_stats(body.conversation_id)
 
             start = time.time()
-            answer = instance.post_response(body.raw_output, session_id=body.conversation_id)
+            answer = instance.post_response(
+                body.raw_output,
+                session_id=body.conversation_id,
+                origin=body.origin or "assistant_text",
+            )
             elapsed = time.time() - start
 
             status = instance.get_status()
@@ -559,6 +589,154 @@ async def post_response(body: PostResponseBody):
         except Exception as e:
             logger.error(f"[POST] Error: {e}", exc_info=True)
             return {"error": str(e), "answer": body.raw_output}
+
+
+@app.get("/tool_invocations")
+async def tool_invocations(conversation_id: str = "", user_id: str = ""):
+    """Group this session's tool_use / tool_result blocks by
+    (tool_name, param_hash) — the identity of the *command* itself.
+
+    This lets you spot:
+      - the same command invoked multiple times (does it return the
+        same thing each time, or has state drifted?)
+      - tool_use blocks with no matching tool_result (call dropped)
+      - tool_result blocks with no matching tool_use (envelope damage)
+
+    Response shape:
+        {
+          "invocations": [
+            {
+              "tool_name", "param_hash",
+              "calls": [{"tool_use_id", "use_block_id", "result_block_id"}, …],
+              "has_orphan": bool,
+            }, …
+          ],
+          "orphan_uses":    [{tool_name, param_hash, tool_use_id, block_id}],
+          "orphan_results": [{tool_name, param_hash, tool_use_id, block_id}],
+        }
+
+    The proxy tags each tool block's `source` field as
+        tool_use:<session>:<tool_name>:<param_hash>:<tool_use_id>
+        tool_result:<session>:<tool_name>:<param_hash>:<tool_use_id>
+    so the scan works without any schema changes.
+    """
+    if _shared_nlp is None:
+        return {"error": "TCMM not initialized"}
+
+    if not conversation_id:
+        return {"error": "conversation_id required"}
+
+    with pool._lock:
+        sid = pool._normalize_id(conversation_id)
+        instance = pool._instances.get(sid)
+    if instance is None:
+        return {
+            "error": f"no session {sid}",
+            "invocations": [],
+            "orphan_uses": [],
+            "orphan_results": [],
+        }
+
+    try:
+        return instance.find_tool_invocations(session_id=conversation_id)
+    except Exception as e:
+        logger.error(f"[TOOL-INVOCATIONS] Error: {e}", exc_info=True)
+        return {"error": str(e)}
+
+
+# Back-compat alias — old clients may still be hitting /tool_pairs.
+@app.get("/tool_pairs")
+async def tool_pairs(conversation_id: str = "", user_id: str = ""):
+    return await tool_invocations(conversation_id=conversation_id, user_id=user_id)
+
+
+@app.get("/tool_invocations/{tool_name}")
+async def tool_invocations_by_name(
+    tool_name: str,
+    conversation_id: str = "",
+    user_id: str = "",
+    param_hash: str = "",
+):
+    """Same as /tool_invocations but filtered to a single tool (and
+    optionally a single param_hash — the exact command shape).
+
+    Examples:
+        /tool_invocations/read_file?conversation_id=abc
+            → every call to read_file in that conversation, grouped
+              by their param_hash (one group per distinct argument
+              shape).
+        /tool_invocations/read_file?conversation_id=abc&param_hash=c3b72e6607ba
+            → only the specific command read_file({"path":"/etc/passwd"})
+              (or whatever hashed to c3b72e6607ba) — handy for
+              comparing multiple results of the same call.
+    """
+    if _shared_nlp is None:
+        return {"error": "TCMM not initialized"}
+    if not conversation_id:
+        return {"error": "conversation_id required"}
+
+    with pool._lock:
+        sid = pool._normalize_id(conversation_id)
+        instance = pool._instances.get(sid)
+    if instance is None:
+        return {
+            "error": f"no session {sid}",
+            "tool_name": tool_name,
+            "param_hash": param_hash,
+            "invocations": [],
+            "orphan_uses": [],
+            "orphan_results": [],
+        }
+
+    try:
+        result = instance.find_tool_invocations(
+            session_id=conversation_id,
+            tool_name=tool_name,
+            param_hash=param_hash,
+        )
+        # Echo the filter back so the caller can confirm what was applied.
+        result["tool_name"] = tool_name
+        if param_hash:
+            result["param_hash"] = param_hash
+        return result
+    except Exception as e:
+        logger.error(f"[TOOL-INVOCATIONS/{tool_name}] Error: {e}", exc_info=True)
+        return {"error": str(e), "tool_name": tool_name}
+
+
+@app.post("/ingest_turn")
+async def ingest_turn(body: IngestTurnBody):
+    """Ingest auxiliary turn items (tool_use / tool_result / etc.) into
+    the per-session TCMM archive.
+
+    The PII proxy calls this on tool-round-trip turns so the assistant's
+    tool_use and the user-role tool_result are both recorded — they are
+    NOT primary user/assistant turns, so they don't belong in
+    pre_request / post_response. No recall, no prompt build, no step
+    advance; pure ingestion.
+
+    Returns: {"added": N, "requested": M}
+    """
+    if _shared_nlp is None:
+        return {"error": "TCMM not initialized", "added": 0}
+
+    items = body.items or []
+    if not items:
+        return {"added": 0, "requested": 0}
+
+    async with _tcmm_lock:
+        try:
+            instance = pool.get(body.conversation_id, user_id=body.user_id)
+            added = instance.ingest_turn(items, session_id=body.conversation_id)
+            sid = pool._normalize_id(body.conversation_id)
+            logger.info(
+                f"[INGEST-TURN] session={sid} added={added}/{len(items)} "
+                f"origins={[ (i or {}).get('origin') for i in items ]}"
+            )
+            return {"added": added, "requested": len(items), "session_id": sid}
+        except Exception as e:
+            logger.error(f"[INGEST-TURN] Error: {e}", exc_info=True)
+            return {"error": str(e), "added": 0}
 
 
 # ── Session Management Endpoints ─────────────────────────────────────────────
