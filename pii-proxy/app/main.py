@@ -250,8 +250,15 @@ async def _tcmm_pre_request(
     "user" for text, "user_image" for image attachments. TCMM stamps the
     stored block with this tag so role is recoverable from the archive.
     """
+    # Timeout was 30s — Vertex-backed recall can legitimately take 60-90s
+    # on a cold user (multiple embedding calls + Gemini Flash classifier +
+    # fusion on 10+ candidates). When it timed out the proxy fell through
+    # silently, the LLM got no memory, and the user saw "no memory blocks"
+    # even though TCMM was computing the context perfectly in the
+    # background. 180s gives headroom for the worst-case recall path;
+    # typical is still <5s once the embedding cache warms.
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             resp = await client.post(
                 f"{TCMM_URL}/pre_request",
                 json={
@@ -280,8 +287,10 @@ async def _tcmm_pre_request(
                 logger.warning(f"  [TCMM] pre_request HTTP {resp.status_code}")
     except httpx.ConnectError:
         logger.warning("  [TCMM] service unreachable — falling through without memory")
+    except httpx.ReadTimeout:
+        logger.warning("  [TCMM] pre_request timed out — falling through without memory (bump TCMM_PRE_TIMEOUT if this persists)")
     except Exception as e:
-        logger.warning(f"  [TCMM] pre_request error: {e}")
+        logger.warning(f"  [TCMM] pre_request error: {type(e).__name__}: {e}")
     return None
 
 
@@ -298,7 +307,7 @@ async def _tcmm_post_response(
     catch that on the next turn via _extract_tool_pair).
     """
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{TCMM_URL}/post_response",
                 json={
@@ -339,7 +348,7 @@ async def _tcmm_ingest_turn(
     if not items:
         return 0
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 f"{TCMM_URL}/ingest_turn",
                 json={
