@@ -824,6 +824,15 @@ async def gateway(request: Request, path: str):
                             )
                         else:
                             logger.info("  [TCMM] tool-followup with no extractable tool blocks — passthrough")
+                        # Activate TCMM for the downstream stream-end
+                        # handler so the assistant's final prose response
+                        # (the synthesis / report after tool execution)
+                        # gets ingested via _tcmm_post_response. Without
+                        # this, tool_use / tool_result pairs are recorded
+                        # but the model's actual answer is lost — the
+                        # archive ends at the TOOL RESULT row with no
+                        # follow-through on the reasoning that used it.
+                        tcmm_active = True
                     else:
                         user_msg = _extract_last_user_message(messages)
                         if user_msg:
