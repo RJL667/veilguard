@@ -81,6 +81,17 @@ async def call_llm(
 
     call_start = time.time()
 
+    # Inherit parent conversation id so sub-agent LLM calls land in the
+    # SAME TCMM namespace as the parent chat instead of each spawning
+    # a fresh `new-<userid>-XXX` namespace. Without this, every
+    # spawn_agent / spawn_agentic / coordinate call fragments memory:
+    # tool calls + results get scattered across unrelated namespaces,
+    # temporal chains are broken, and the semantic linker has nothing
+    # to link across. The x-conversation-id middleware in server.py
+    # captured this into state.active_conversation_id — we just have
+    # to forward it.
+    active_cid = getattr(state, "active_conversation_id", "") or ""
+
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             if fmt == "anthropic":
@@ -96,6 +107,8 @@ async def call_llm(
                     "system": effective_prompt,
                     "messages": [{"role": "user", "content": user_message}],
                 }
+                if active_cid:
+                    payload["metadata"] = {"conversation_id": active_cid}
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
                     _track_error(backend_name, role)
@@ -117,6 +130,8 @@ async def call_llm(
                     "temperature": temperature,
                     "max_tokens": 4096,
                 }
+                if active_cid:
+                    payload["metadata"] = {"conversation_id": active_cid}
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
                     _track_error(backend_name, role)
@@ -177,6 +192,9 @@ async def call_llm_with_tools(
     if not api_key:
         return [{"type": "text", "text": f"Error: No API key for {backend}"}], "error"
 
+    # Inherit parent conversation id — see call_llm() above for rationale.
+    active_cid = getattr(state, "active_conversation_id", "") or ""
+
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
             if fmt == "anthropic":
@@ -192,6 +210,8 @@ async def call_llm_with_tools(
                     "messages": messages,
                     "tools": tools,
                 }
+                if active_cid:
+                    payload["metadata"] = {"conversation_id": active_cid}
                 resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code != 200:
                     return [{"type": "text", "text": f"API error {resp.status_code}: {resp.text[:300]}"}], "error"
@@ -228,6 +248,8 @@ async def call_llm_with_tools(
                     "tools": oai_tools if oai_tools else None,
                     "max_tokens": 4096,
                 }
+                if active_cid:
+                    payload["metadata"] = {"conversation_id": active_cid}
                 resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code != 200:
                     return [{"type": "text", "text": f"API error {resp.status_code}: {resp.text[:300]}"}], "error"
