@@ -2,6 +2,37 @@ version: 1.2.1
 
 cache: true
 
+# Role-level permissions. LibreChat re-seeds default roles on every
+# api restart, so any direct MongoDB edits get overwritten. These
+# settings are the source of truth and get applied to USER and ADMIN
+# roles on startup. Every new user registered inherits the USER role
+# with these permissions.
+interface:
+  modelSelect: true
+  parameters: true
+  sidePanel: true
+  presets: true
+  prompts: true
+  bookmarks: true
+  multiConvo: true
+  agents: true
+  webSearch: true
+  fileSearch: true
+  runCode: true
+  temporaryChat: true
+  temporaryChatRetention: 24
+  mcpServers:
+    placeholder: "Configure your MCP servers..."
+
+# Explicit role permissions (override LibreChat defaults so the
+# agent / MCP tool stack stays accessible for every user in this
+# tenant).
+registration:
+  socialLogins: []
+  allowedDomains:
+    - "avalear.com"
+    - "phishield.com"
+
 endpoints:
   custom:
     - name: "Gemini"
@@ -105,6 +136,23 @@ endpoints:
     disabled: true
   assistants:
     disabled: true
+
+  # Agents endpoint: LibreChat's built-in tool-using runtime. This is
+  # what exposes MCP server tools in the UI — without it, the tool
+  # picker is empty even when MCP servers are healthy on the backend.
+  # Users select "Agents" from the endpoint dropdown to get tools,
+  # memory, and multi-step orchestration via our sub-agents/forge/
+  # documents/image MCP servers.
+  agents:
+    disableBuilder: false
+    capabilities:
+      - "execute_code"
+      - "file_search"
+      - "actions"
+      - "tools"
+      - "artifacts"
+      - "ocr"
+      - "chain"
 
 mcpSettings:
   allowedDomains:
