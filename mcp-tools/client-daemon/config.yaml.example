@@ -1,0 +1,8 @@
+# Veilguard Client Daemon Configuration
+server: ws://localhost:8809/ws/client     # Cloud server WebSocket URL (use wss:// for production)
+token: ""                                 # Auth token from cloud server
+client_id: my-workstation                 # Friendly name for this client
+project_root: "."                         # Root directory for file operations
+timeout: 60                               # Max seconds per tool execution
+reconnect_delay: 5                        # Initial reconnect delay (seconds)
+max_reconnect_delay: 300                  # Max reconnect delay (seconds)

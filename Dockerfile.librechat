@@ -21,4 +21,11 @@ RUN pip install --no-cache-dir --break-system-packages \
     -r /tmp/doc-reqs.txt \
     -r /tmp/img-reqs.txt
 
+# Patch: Add conversationId to Anthropic API requests
+# This is a two-part patch on the compiled JS:
+# 1. In metadata: add conversation_id field
+# 2. In modelOptions: add conversationId from req.body
+COPY patch-api.sh /tmp/patch-api.sh
+RUN chmod +x /tmp/patch-api.sh && sh /tmp/patch-api.sh
+
 USER node

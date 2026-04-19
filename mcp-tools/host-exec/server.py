@@ -25,6 +25,33 @@ mcp = FastMCP(
 WORK_DIR = os.environ.get("HOST_WORK_DIR", str(Path(__file__).parent.parent.parent))
 TIMEOUT = int(os.environ.get("HOST_EXEC_TIMEOUT", "60"))
 
+# ── Command Safety Validation ────────────────────────────────────────────────
+import re as _re
+
+_DANGEROUS_PATTERNS = [
+    (r"rm\s+-rf\s+/", "Recursive delete from root"),
+    (r"format\s+[a-z]:", "Format disk drive"),
+    (r"del\s+/[sfq].*\\windows", "Delete Windows system files"),
+    (r"rmdir\s+/s\s+/q\s+[a-z]:\\$", "Remove entire drive"),
+    (r"reg\s+delete\s+hklm", "Delete system registry keys"),
+    (r"net\s+user\s+.*\s+/delete", "Delete user account"),
+    (r"cipher\s+/w:", "Secure wipe disk"),
+    (r"shutdown\s+/[srf]", "Shutdown/restart system"),
+    (r"bcdedit", "Modify boot configuration"),
+    (r"diskpart", "Disk partition tool"),
+    (r"schtasks\s+/delete\s+/tn\s+\\", "Delete system scheduled tasks"),
+    (r"wmic\s+os\s+.*delete", "WMI destructive operation"),
+]
+_DANGEROUS_RE = [(_re.compile(p, _re.IGNORECASE), desc) for p, desc in _DANGEROUS_PATTERNS]
+
+
+def _validate_command(cmd: str) -> tuple[bool, str]:
+    """Check command against dangerous patterns. Returns (safe, reason)."""
+    for pattern, desc in _DANGEROUS_RE:
+        if pattern.search(cmd):
+            return False, f"BLOCKED: {desc} — pattern matched in: {cmd[:100]}"
+    return True, ""
+
 
 def _run(args: list[str], timeout: int = TIMEOUT, cwd: str = WORK_DIR, shell: bool = False) -> str:
     """Run a subprocess and return formatted output."""
@@ -66,6 +93,9 @@ def run_cmd(command: str, timeout: int = 60, working_dir: str = "") -> str:
         timeout: Max seconds to wait (default 60)
         working_dir: Working directory. Empty = veilguard project root.
     """
+    safe, reason = _validate_command(command)
+    if not safe:
+        return f"Error: {reason}"
     cwd = working_dir if working_dir else WORK_DIR
     return _run(["cmd", "/c", command], timeout=timeout, cwd=cwd)
 
@@ -79,6 +109,9 @@ def run_powershell(script: str, timeout: int = 60, working_dir: str = "") -> str
         timeout: Max seconds to wait (default 60)
         working_dir: Working directory. Empty = veilguard project root.
     """
+    safe, reason = _validate_command(script)
+    if not safe:
+        return f"Error: {reason}"
     cwd = working_dir if working_dir else WORK_DIR
     return _run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
@@ -96,8 +129,14 @@ def run_docker(command: str, timeout: int = 120) -> str:
                  Examples: "ps", "compose logs api --tail 20", "compose restart api"
         timeout: Max seconds to wait (default 120)
     """
+    safe, reason = _validate_command(f"docker {command}")
+    if not safe:
+        return f"Error: {reason}"
     args = ["docker"] + command.split()
     return _run(args, timeout=timeout, cwd=WORK_DIR)
+
+
+_GIT_DANGEROUS = _re.compile(r"(push\s+--force|reset\s+--hard|clean\s+-[fd])", _re.IGNORECASE)
 
 
 @mcp.tool()
@@ -109,9 +148,23 @@ def run_git(command: str, working_dir: str = "") -> str:
                  Examples: "status", "diff", "log --oneline -10", "add -A", "commit -m 'message'"
         working_dir: Repository path. Empty = veilguard project root.
     """
+    if _GIT_DANGEROUS.search(command):
+        return f"Error: BLOCKED — destructive git operation: {command[:50]}"
     cwd = working_dir if working_dir else WORK_DIR
     args = ["git"] + command.split()
     return _run(args, timeout=30, cwd=cwd)
+
+
+def _safe_resolve(path: str) -> tuple[Path, str]:
+    """Resolve path and check for traversal attacks. Returns (resolved_path, error_or_empty)."""
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(WORK_DIR) / p
+    resolved = p.resolve()
+    work_resolved = Path(WORK_DIR).resolve()
+    if not str(resolved).startswith(str(work_resolved)):
+        return resolved, f"Error: Path traversal denied — {path} resolves outside project root"
+    return resolved, ""
 
 
 @mcp.tool()
@@ -121,9 +174,9 @@ def host_file_read(path: str) -> str:
     Args:
         path: Absolute or relative path on the host (e.g. "C:\\Users\\rudol\\file.txt" or ".env")
     """
-    p = Path(path)
-    if not p.is_absolute():
-        p = Path(WORK_DIR) / p
+    p, err = _safe_resolve(path)
+    if err:
+        return err
 
     if not p.exists():
         return f"Error: File not found: {p}"
@@ -147,9 +200,9 @@ def host_file_write(path: str, content: str) -> str:
         path: Absolute or relative path on the host
         content: Content to write
     """
-    p = Path(path)
-    if not p.is_absolute():
-        p = Path(WORK_DIR) / p
+    p, err = _safe_resolve(path)
+    if err:
+        return err
 
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -183,10 +236,48 @@ if __name__ == "__main__":
                     read, write, mcp._mcp_server.create_initialization_options()
                 )
 
+        # Webhook auth token — set via WEBHOOK_TOKEN env var or defaults to random
+        import secrets as _secrets
+        _WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", _secrets.token_hex(16))
+        if not os.environ.get("WEBHOOK_TOKEN"):
+            print(f"  Webhook token (auto-generated): {_WEBHOOK_TOKEN}")
+
+        async def handle_webhook(request):
+            """External webhook endpoint — forwards to sub-agents trigger.
+            Requires Authorization: Bearer <WEBHOOK_TOKEN> header."""
+            from starlette.responses import JSONResponse
+
+            # Auth check
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer ") or auth[7:] != _WEBHOOK_TOKEN:
+                return JSONResponse({"error": "Unauthorized — set Authorization: Bearer <token>"}, status_code=401)
+
+            import httpx as _httpx
+            name = request.path_params.get("name", "")
+            # Validate name — alphanumeric and hyphens only
+            if not _re.match(r'^[\w\-]+$', name):
+                return JSONResponse({"error": "Invalid trigger name"}, status_code=400)
+
+            body = {}
+            try:
+                body = await request.json()
+            except Exception:
+                pass
+
+            # Forward to sub-agents server
+            sub_agents_url = f"http://localhost:8809/trigger/{name}"
+            try:
+                async with _httpx.AsyncClient(timeout=30) as client:
+                    resp = await client.post(sub_agents_url, json=body)
+                    return JSONResponse(resp.json(), status_code=resp.status_code)
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=502)
+
         app = Starlette(
             routes=[
                 Route("/sse", endpoint=handle_sse),
                 Mount("/messages/", app=sse.handle_post_message),
+                Route("/webhook/{name}", endpoint=handle_webhook, methods=["POST"]),
             ],
         )
 

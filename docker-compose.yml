@@ -28,6 +28,8 @@ services:
       - ./workspace:/workspace
       - librechat-images:/app/client/public/images
       - librechat-logs:/app/api/logs
+      # Custom Veilguard frontend (built from librechat-src fork)
+      - ./librechat-src/client/dist:/app/client/dist
 
   # === MongoDB ===
   mongodb:
@@ -52,6 +54,9 @@ services:
     build: ./pii-proxy
     ports:
       - "4000:4000"
+    volumes:
+      - ./pii-proxy/app:/app/app
+      - ./logs:/app/logs
     env_file:
       - .env
     environment:
@@ -64,6 +69,8 @@ services:
       - PII_PROXY_PORT=4000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MIN_SCORE=${MIN_SCORE:-0.7}
+      - TCMM_ENABLED=${TCMM_ENABLED:-false}
+      - TCMM_URL=${TCMM_URL:-http://host.docker.internal:8811}
     restart: always
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health')"]

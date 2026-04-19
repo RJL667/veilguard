@@ -14,8 +14,9 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("web", instructions="Web tools for searching Google, browsing URLs, and fetching pages.")
 
-# Optional: Google Custom Search API credentials
+# Google API keys
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GOOGLE_CSE_KEY = os.environ.get("GOOGLE_CSE_KEY", "")
 GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "")
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -28,10 +29,7 @@ h2t.body_width = 0
 
 @mcp.tool()
 async def google_search(query: str, num_results: int = 10) -> str:
-    """Search Google and return results.
-
-    If Google API credentials are configured, uses the Custom Search JSON API.
-    Otherwise, falls back to scraping DuckDuckGo HTML.
+    """Search Google using Gemini grounding and return results.
 
     Args:
         query: Search query
@@ -39,69 +37,85 @@ async def google_search(query: str, num_results: int = 10) -> str:
     """
     num_results = min(num_results, 10)
 
-    if GOOGLE_API_KEY and GOOGLE_CSE_ID:
-        return await _google_api_search(query, num_results)
-    else:
-        return await _duckduckgo_search(query, num_results)
+    if GOOGLE_CSE_KEY and GOOGLE_CSE_ID:
+        result = await _cse_search(query, num_results)
+        if result:
+            return result
+
+    # Use Gemini grounding as primary search
+    if GOOGLE_API_KEY:
+        return await _gemini_grounded_search(query, num_results)
+
+    return f"No search API configured. Set GOOGLE_API_KEY in .env"
 
 
-async def _google_api_search(query: str, num: int) -> str:
-    """Search using Google Custom Search JSON API."""
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            "https://www.googleapis.com/customsearch/v1",
-            params={
-                "key": GOOGLE_API_KEY,
-                "cx": GOOGLE_CSE_ID,
-                "q": query,
-                "num": num,
+async def _cse_search(query: str, num: int) -> str | None:
+    """Try Google Custom Search API. Returns None on failure."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_ID, "q": query, "num": num},
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            items = data.get("items", [])
+            if not items:
+                return f"No results for: {query}"
+            results = []
+            for i, item in enumerate(items, 1):
+                results.append(
+                    f"{i}. **{item.get('title', 'Untitled')}**\n"
+                    f"   {item.get('link', '')}\n"
+                    f"   {item.get('snippet', '')}"
+                )
+            return f"# Search results for: {query}\n\n" + "\n\n".join(results)
+    except Exception:
+        return None
+
+
+async def _gemini_grounded_search(query: str, num: int) -> str:
+    """Use Gemini API with Google Search grounding to search the web."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GOOGLE_API_KEY}",
+            json={
+                "contents": [{"parts": [{"text": f"Search the web and provide {num} results with titles, URLs, and brief descriptions for: {query}"}]}],
+                "tools": [{"google_search": {}}],
             },
+            headers={"Content-Type": "application/json"},
         )
         if resp.status_code != 200:
-            return f"Google API error: {resp.status_code} {resp.text[:200]}"
+            return f"Search error: {resp.status_code} {resp.text[:200]}"
 
         data = resp.json()
-        items = data.get("items", [])
-        if not items:
-            return f"No results for: {query}"
 
+        # Extract grounding results
         results = []
-        for i, item in enumerate(items, 1):
-            results.append(
-                f"{i}. **{item.get('title', 'Untitled')}**\n"
-                f"   {item.get('link', '')}\n"
-                f"   {item.get('snippet', '')}"
-            )
-        return f"# Search results for: {query}\n\n" + "\n\n".join(results)
+        candidates = data.get("candidates", [])
+        if candidates:
+            content = candidates[0].get("content", {})
+            parts = content.get("parts", [])
+            for part in parts:
+                if "text" in part:
+                    results.append(part["text"])
 
-
-async def _duckduckgo_search(query: str, num: int) -> str:
-    """Fallback: scrape DuckDuckGo HTML for search results."""
-    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-        resp = await client.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": query},
-            headers={"User-Agent": USER_AGENT},
-        )
-        if resp.status_code != 200:
-            return f"Search error: {resp.status_code}"
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        result_links = soup.select(".result__a")
-
-        results = []
-        for i, link in enumerate(result_links[:num], 1):
-            title = link.get_text(strip=True)
-            href = link.get("href", "")
-            # DuckDuckGo wraps URLs
-            snippet_el = link.find_parent(".result").select_one(".result__snippet") if link.find_parent(".result") else None
-            snippet = snippet_el.get_text(strip=True) if snippet_el else ""
-            results.append(f"{i}. **{title}**\n   {href}\n   {snippet}")
+            # Also extract grounding metadata (URLs)
+            grounding = candidates[0].get("groundingMetadata", {})
+            chunks = grounding.get("groundingChunks", [])
+            if chunks:
+                results.append("\n## Sources:")
+                for i, chunk in enumerate(chunks[:num], 1):
+                    web = chunk.get("web", {})
+                    title = web.get("title", "Untitled")
+                    uri = web.get("uri", "")
+                    results.append(f"{i}. **{title}**\n   {uri}")
 
         if not results:
             return f"No results for: {query}"
 
-        return f"# Search results for: {query}\n\n" + "\n\n".join(results)
+        return "\n\n".join(results)
 
 
 @mcp.tool()

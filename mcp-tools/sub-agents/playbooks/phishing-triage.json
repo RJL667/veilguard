@@ -1,0 +1,18 @@
+{
+  "name": "Phishing Triage",
+  "description": "Rapid phishing email analysis — header check, URL/domain investigation, verdict",
+  "tasks": [
+    {
+      "task": "Analyze the email headers and sender information for {context}. Check for SPF/DKIM/DMARC failures, display name spoofing, and suspicious relay hops. Report sender legitimacy.",
+      "role": "analyst"
+    },
+    {
+      "task": "Investigate all URLs, domains, and attachments referenced in {context}. Check domain age, registration details, hosting infrastructure, and known malicious indicators.",
+      "role": "threat"
+    },
+    {
+      "task": "Based on the header analysis and URL investigation above, produce a final phishing verdict for {context}. Include: MALICIOUS/SUSPICIOUS/CLEAN rating, confidence score, IOC list, and recommended action (block/quarantine/allow).",
+      "role": "writer"
+    }
+  ]
+}

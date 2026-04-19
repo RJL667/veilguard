@@ -1,0 +1,22 @@
+{
+  "name": "APT Investigation",
+  "description": "Full APT threat assessment — intel, forensics, IOC analysis, executive report",
+  "tasks": [
+    {
+      "task": "Research the threat actor involved in {context}. Map all known TTPs to MITRE ATT&CK framework. Identify the actor's motivation, sophistication level, and known campaigns.",
+      "role": "threat"
+    },
+    {
+      "task": "Analyze the IOCs and forensic indicators from {context}. Identify lateral movement, persistence mechanisms, and data exfiltration paths. Document the full attack chain.",
+      "role": "analyst"
+    },
+    {
+      "task": "Assess the organizational risk from {context}. Evaluate potential business impact, data exposure, regulatory implications, and recommend prioritized remediation actions.",
+      "role": "researcher"
+    },
+    {
+      "task": "Write a concise executive incident briefing for {context}. Include: situation summary, business impact, response actions taken, and recommended next steps. Keep it under 500 words.",
+      "role": "writer"
+    }
+  ]
+}

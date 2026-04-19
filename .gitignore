@@ -2,6 +2,27 @@
 .env
 *.pyc
 __pycache__/
+vertex-sa-key.json
+*.pem
+*.key
+
+# Runtime artifacts
+logs/
+tcmm-data/
+mongo-data/
+meili-data/
+
+# Vendor source checkouts
+librechat-src/
+
+# Deploy artifacts
+veilguard-deploy.zip
+*.bak
+
+# Client-daemon build output
+mcp-tools/client-daemon/build/
+mcp-tools/client-daemon/dist/
+mcp-tools/client-daemon/installer_output/
 
 # Workspace (user-generated files)
 workspace/*
