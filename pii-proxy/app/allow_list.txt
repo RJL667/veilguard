@@ -1,0 +1,1615 @@
+# Presidio allow_list — terms that are NEVER PII, even if spaCy NER
+# flags them as PERSON / ORG / LOCATION. One term per line.
+# Case-sensitive (Presidio does exact-text match).
+#
+# Add a term here when you see it showing up as REF_PERSON_* in the
+# audit log but it's actually a technology / brand / product / threat
+# actor / standards body.
+#
+# Rules of thumb for adding:
+#   - SAFE:   Multi-part brand names (LibreChat, CloudFormation).
+#             All-caps acronyms (CISA, NIST, APT28).
+#             Technical compound words (TypeScript, PostgreSQL).
+#   - AVOID:  Single common first names (Adam, Paul, John) — real
+#             people have those names; don't leak them by allowlisting.
+#             Single surnames (Smith, Lamb) — same reason.
+#
+# Loaded once at pii-proxy startup. To update: edit + restart container.
+
+# ══════════════════════════════════════════════════════════════════════
+# OUR STACK / INTERNAL PRODUCTS
+# ══════════════════════════════════════════════════════════════════════
+Veilguard
+Phishield
+LibreChat
+TCMM
+Avalear
+Presidio
+Rehydrator
+pii-proxy
+
+# ══════════════════════════════════════════════════════════════════════
+# PROGRAMMING LANGUAGES
+# ══════════════════════════════════════════════════════════════════════
+Python
+JavaScript
+TypeScript
+Java
+Kotlin
+Swift
+Rust
+Go
+Golang
+Ruby
+PHP
+Perl
+Scala
+Elixir
+Erlang
+Haskell
+Clojure
+Lisp
+F#
+C#
+C++
+Objective-C
+COBOL
+Fortran
+Pascal
+Ada
+Assembly
+Julia
+MATLAB
+Mathematica
+SQL
+PL/SQL
+T-SQL
+PLpgSQL
+Bash
+Zsh
+Fish
+PowerShell
+Dart
+Lua
+Groovy
+Nim
+Crystal
+OCaml
+Scheme
+Racket
+Solidity
+Move
+WebAssembly
+WASM
+Vyper
+
+# ══════════════════════════════════════════════════════════════════════
+# MARKUP / DATA FORMATS
+# ══════════════════════════════════════════════════════════════════════
+HTML
+HTML5
+CSS
+CSS3
+SASS
+SCSS
+LESS
+Stylus
+XML
+YAML
+JSON
+JSONL
+TOML
+CSV
+TSV
+Markdown
+MDX
+AsciiDoc
+RestructuredText
+LaTeX
+GraphQL
+Protobuf
+Avro
+Parquet
+ORC
+MessagePack
+CBOR
+
+# ══════════════════════════════════════════════════════════════════════
+# FRONTEND FRAMEWORKS
+# ══════════════════════════════════════════════════════════════════════
+React
+ReactNative
+Angular
+Vue
+Vue.js
+Svelte
+SvelteKit
+Solid
+SolidJS
+Preact
+Qwik
+Astro
+Next.js
+Nuxt
+Nuxt.js
+Gatsby
+Remix
+Ember
+Backbone
+Meteor
+Alpine
+Alpine.js
+jQuery
+Lit
+Stencil
+Redux
+MobX
+Zustand
+Jotai
+Recoil
+Pinia
+RxJS
+TailwindCSS
+Tailwind
+Bootstrap
+Material-UI
+MUI
+Chakra
+AntDesign
+Shadcn
+Radix
+Storybook
+Vite
+Webpack
+Rollup
+Parcel
+Turbopack
+esbuild
+SWC
+Babel
+
+# ══════════════════════════════════════════════════════════════════════
+# BACKEND FRAMEWORKS
+# ══════════════════════════════════════════════════════════════════════
+Django
+Flask
+FastAPI
+Starlette
+Uvicorn
+Gunicorn
+Hypercorn
+Tornado
+Sanic
+Quart
+Pyramid
+Bottle
+Express
+Koa
+Hapi
+Nest
+NestJS
+Nest.js
+Fastify
+Hono
+AdonisJS
+Spring
+SpringBoot
+Spring Boot
+Micronaut
+Quarkus
+Rails
+Sinatra
+Phoenix
+Plug
+Laravel
+Symfony
+CakePHP
+CodeIgniter
+Zend
+Yii
+ASP.NET
+ASP.NET Core
+Gin
+Echo
+Fiber
+Chi
+Beego
+Iris
+Actix
+Rocket
+Axum
+Warp
+Tonic
+Tower
+
+# ══════════════════════════════════════════════════════════════════════
+# PACKAGE / BUILD TOOLS
+# ══════════════════════════════════════════════════════════════════════
+NPM
+Yarn
+pnpm
+bun
+Bun
+pip
+pipx
+poetry
+uv
+Poetry
+Conda
+Mamba
+virtualenv
+venv
+cargo
+Cargo
+gem
+RubyGems
+composer
+Composer
+maven
+Maven
+gradle
+Gradle
+sbt
+Ant
+Ivy
+Bazel
+Buck
+Buck2
+Pants
+Make
+CMake
+Ninja
+Meson
+Homebrew
+Scoop
+Chocolatey
+apt
+apt-get
+yum
+dnf
+pacman
+zypper
+snap
+flatpak
+
+# ══════════════════════════════════════════════════════════════════════
+# VERSION CONTROL
+# ══════════════════════════════════════════════════════════════════════
+Git
+Mercurial
+Hg
+Subversion
+SVN
+CVS
+Perforce
+Fossil
+Bazaar
+
+# ══════════════════════════════════════════════════════════════════════
+# DATABASES — RELATIONAL
+# ══════════════════════════════════════════════════════════════════════
+Postgres
+PostgreSQL
+MySQL
+MariaDB
+SQLite
+SQL Server
+MSSQL
+Oracle
+DB2
+Firebird
+CockroachDB
+Spanner
+Yugabyte
+TiDB
+Vitess
+PlanetScale
+Neon
+Supabase
+
+# ══════════════════════════════════════════════════════════════════════
+# DATABASES — NOSQL / KV / DOCUMENT
+# ══════════════════════════════════════════════════════════════════════
+MongoDB
+CouchDB
+Couchbase
+DynamoDB
+Cassandra
+ScyllaDB
+Redis
+Valkey
+KeyDB
+DragonflyDB
+Memcached
+etcd
+Consul
+Riak
+Aerospike
+RavenDB
+ArangoDB
+OrientDB
+Neo4j
+JanusGraph
+Dgraph
+TigerGraph
+FaunaDB
+HBase
+Bigtable
+
+# ══════════════════════════════════════════════════════════════════════
+# DATABASES — TIME-SERIES / ANALYTICS / WAREHOUSE
+# ══════════════════════════════════════════════════════════════════════
+InfluxDB
+TimescaleDB
+QuestDB
+VictoriaMetrics
+ClickHouse
+Druid
+Pinot
+Greenplum
+Vertica
+Teradata
+Snowflake
+Databricks
+BigQuery
+Redshift
+Athena
+Presto
+Trino
+Hive
+Spark
+Flink
+Beam
+Dremio
+DuckDB
+
+# ══════════════════════════════════════════════════════════════════════
+# DATABASES — VECTOR / SEARCH
+# ══════════════════════════════════════════════════════════════════════
+LanceDB
+Elasticsearch
+OpenSearch
+Solr
+Meilisearch
+Typesense
+Algolia
+Milvus
+Pinecone
+Weaviate
+Qdrant
+Chroma
+ChromaDB
+Vespa
+Marqo
+Vald
+FAISS
+ScaNN
+
+# ══════════════════════════════════════════════════════════════════════
+# MESSAGE QUEUES / STREAMING
+# ══════════════════════════════════════════════════════════════════════
+Kafka
+Redpanda
+RabbitMQ
+NATS
+Pulsar
+ActiveMQ
+IBM MQ
+Amazon MQ
+Kinesis
+EventBridge
+EventHub
+Pub/Sub
+CloudEvents
+Celery
+Sidekiq
+BullMQ
+Resque
+Dramatiq
+Huey
+
+# ══════════════════════════════════════════════════════════════════════
+# CONTAINERS / ORCHESTRATION
+# ══════════════════════════════════════════════════════════════════════
+Docker
+Podman
+Buildah
+Containerd
+CRI-O
+LXC
+LXD
+Kubernetes
+K8s
+K3s
+OpenShift
+Rancher
+Nomad
+DockerSwarm
+ECS
+EKS
+AKS
+GKE
+Fargate
+Fly
+Fly.io
+Railway
+Render
+Heroku
+DigitalOcean
+Linode
+Vultr
+Hetzner
+
+# ══════════════════════════════════════════════════════════════════════
+# INFRASTRUCTURE AS CODE
+# ══════════════════════════════════════════════════════════════════════
+Terraform
+OpenTofu
+Pulumi
+Ansible
+Chef
+Puppet
+SaltStack
+CloudFormation
+CDK
+Bicep
+ARM
+Crossplane
+Flux
+FluxCD
+ArgoCD
+
+# ══════════════════════════════════════════════════════════════════════
+# PROXIES / WEB SERVERS / LOAD BALANCERS
+# ══════════════════════════════════════════════════════════════════════
+Nginx
+Apache
+Caddy
+Traefik
+HAProxy
+Envoy
+LiteSpeed
+OpenLiteSpeed
+IIS
+Tomcat
+Jetty
+Undertow
+Netty
+
+# ══════════════════════════════════════════════════════════════════════
+# CLOUD PROVIDERS + COMPONENTS
+# ══════════════════════════════════════════════════════════════════════
+AWS
+Amazon Web Services
+Azure
+Microsoft Azure
+GCP
+Google Cloud
+GCE
+OCI
+Oracle Cloud
+IBMCloud
+Alibaba Cloud
+AliCloud
+Tencent Cloud
+Cloudflare
+Vercel
+Netlify
+Supabase
+Firebase
+Appwrite
+
+# AWS services
+S3
+EC2
+RDS
+Lambda
+CloudFront
+Route53
+IAM
+VPC
+CloudWatch
+SQS
+SNS
+SES
+EventBridge
+StepFunctions
+Glue
+EMR
+SageMaker
+Bedrock
+Cognito
+KMS
+Secrets Manager
+SystemsManager
+SSM
+Aurora
+Neptune
+AppSync
+Amplify
+CodeBuild
+CodePipeline
+CodeDeploy
+CodeCommit
+
+# Azure services
+Azure AD
+ActiveDirectory
+AAD
+AKS
+ACR
+AppService
+AzureFunctions
+AzureMonitor
+CosmosDB
+KeyVault
+ServiceBus
+ExpressRoute
+Synapse
+DataFactory
+
+# GCP services
+CloudRun
+CloudFunctions
+CloudStorage
+GCS
+CloudSQL
+Firestore
+Datastore
+Dataflow
+Dataproc
+Dataprep
+Composer
+PubSub
+VertexAI
+Vertex AI
+
+# ══════════════════════════════════════════════════════════════════════
+# MONITORING / OBSERVABILITY
+# ══════════════════════════════════════════════════════════════════════
+Prometheus
+Grafana
+Datadog
+NewRelic
+Dynatrace
+AppDynamics
+Honeycomb
+Lightstep
+Sentry
+Rollbar
+Bugsnag
+Loki
+Tempo
+Jaeger
+Zipkin
+OpenTelemetry
+OTel
+OpenTracing
+Splunk
+SumoLogic
+ELK
+Logstash
+Kibana
+Fluentd
+Fluent Bit
+Vector
+PagerDuty
+Opsgenie
+VictorOps
+StatsD
+
+# ══════════════════════════════════════════════════════════════════════
+# CI/CD
+# ══════════════════════════════════════════════════════════════════════
+Jenkins
+CircleCI
+TravisCI
+Travis
+GitLab CI
+GitHub Actions
+Bitbucket Pipelines
+Azure DevOps
+TeamCity
+Bamboo
+Drone
+Buildkite
+Spinnaker
+Harness
+Tekton
+Argo
+ArgoWorkflows
+Woodpecker
+Concourse
+
+# ══════════════════════════════════════════════════════════════════════
+# DEVELOPER TOOLS / IDEs
+# ══════════════════════════════════════════════════════════════════════
+VSCode
+Visual Studio Code
+Visual Studio
+IntelliJ
+IDEA
+PyCharm
+WebStorm
+PhpStorm
+RubyMine
+CLion
+GoLand
+Rider
+DataGrip
+JetBrains
+Sublime
+SublimeText
+Atom
+Vim
+Neovim
+Emacs
+Helix
+Kakoune
+Nano
+Cursor
+Zed
+Fleet
+Replit
+StackBlitz
+CodeSandbox
+Glitch
+GitPod
+
+# ══════════════════════════════════════════════════════════════════════
+# DESIGN / CREATIVE
+# ══════════════════════════════════════════════════════════════════════
+Figma
+Sketch
+InVision
+Adobe
+Photoshop
+Illustrator
+InDesign
+Premiere
+AfterEffects
+Lightroom
+XD
+Canva
+Miro
+Mural
+Framer
+Penpot
+Affinity
+
+# ══════════════════════════════════════════════════════════════════════
+# SAAS — CRM / SALES
+# ══════════════════════════════════════════════════════════════════════
+Pipedrive
+Salesforce
+Sales Cloud
+Service Cloud
+HubSpot
+Zoho
+Zoho CRM
+Freshsales
+Monday
+Copper
+Insightly
+SugarCRM
+Keap
+Close
+Outreach
+Apollo
+Gong
+Clari
+Gainsight
+
+# ══════════════════════════════════════════════════════════════════════
+# SAAS — PAYMENTS / FINTECH
+# ══════════════════════════════════════════════════════════════════════
+Stripe
+PayPal
+Square
+Braintree
+Adyen
+Checkout.com
+Plaid
+Wise
+Revolut
+Klarna
+Affirm
+Mollie
+Razorpay
+PayStack
+PayFast
+
+# ══════════════════════════════════════════════════════════════════════
+# SAAS — COMMUNICATION
+# ══════════════════════════════════════════════════════════════════════
+Slack
+Microsoft Teams
+Teams
+Zoom
+Discord
+Webex
+Google Meet
+Telegram
+WhatsApp
+Signal
+Messenger
+Skype
+Rocket.Chat
+Mattermost
+
+# ══════════════════════════════════════════════════════════════════════
+# SOCIAL MEDIA / CONTENT PLATFORMS
+# (Presidio's spaCy NER tags most of these as PERSON because they're
+# capitalised single words. Without this section, mentions of LinkedIn
+# or Twitter in threat-intel text get redacted as REF_PERSON_N and
+# corrupt rehydration via the REF_PERSON_1 substring collision bug.
+# Added 23 Apr 2026 after "Your name is LinkedIn5" incident.)
+# ══════════════════════════════════════════════════════════════════════
+LinkedIn
+Twitter
+X
+Facebook
+Meta
+Instagram
+TikTok
+Reddit
+YouTube
+Pinterest
+Snapchat
+Threads
+Bluesky
+Mastodon
+Tumblr
+Medium
+Substack
+Quora
+StackOverflow
+Stack Overflow
+GitHub Copilot
+Copilot
+Twitch
+Vimeo
+SoundCloud
+Spotify
+Patreon
+OnlyFans
+Clubhouse
+Weibo
+WeChat
+QQ
+Line
+KakaoTalk
+Viber
+
+# ══════════════════════════════════════════════════════════════════════
+# SAAS — PRODUCTIVITY / COLLABORATION
+# ══════════════════════════════════════════════════════════════════════
+Notion
+Confluence
+GoogleDocs
+Google Docs
+Office365
+Microsoft 365
+SharePoint
+OneDrive
+OneNote
+Evernote
+Obsidian
+Roam
+Logseq
+Dropbox
+Box
+iCloud
+Airtable
+Coda
+Mem
+
+# ══════════════════════════════════════════════════════════════════════
+# SAAS — PROJECT MGMT / DEV
+# ══════════════════════════════════════════════════════════════════════
+Jira
+Linear
+Asana
+ClickUp
+Basecamp
+Trello
+Monday.com
+Wrike
+Smartsheet
+Shortcut
+Clubhouse
+Aha
+ProductBoard
+Productboard
+
+# ══════════════════════════════════════════════════════════════════════
+# SAAS — CODE HOSTING
+# ══════════════════════════════════════════════════════════════════════
+GitHub
+GitLab
+Bitbucket
+Gitea
+Codeberg
+SourceForge
+Launchpad
+
+# ══════════════════════════════════════════════════════════════════════
+# SAAS — MARKETING / SUPPORT
+# ══════════════════════════════════════════════════════════════════════
+Mailchimp
+SendGrid
+Postmark
+Mailgun
+ConvertKit
+Campaign Monitor
+ActiveCampaign
+Marketo
+Pardot
+Intercom
+Zendesk
+Freshdesk
+Drift
+Crisp
+LiveChat
+Help Scout
+Gorgias
+
+# ══════════════════════════════════════════════════════════════════════
+# SAAS — ANALYTICS / DATA
+# ══════════════════════════════════════════════════════════════════════
+Amplitude
+Mixpanel
+Segment
+PostHog
+Heap
+Hotjar
+Fullstory
+LogRocket
+GoogleAnalytics
+Google Analytics
+GA4
+Adobe Analytics
+Matomo
+Plausible
+Fathom
+Cloudflare Analytics
+Pendo
+Heap
+
+# ══════════════════════════════════════════════════════════════════════
+# AI / ML — PROVIDERS
+# ══════════════════════════════════════════════════════════════════════
+Anthropic
+OpenAI
+Google
+DeepMind
+Meta
+Meta AI
+Microsoft
+IBM
+NVIDIA
+AMD
+Intel
+HuggingFace
+Hugging Face
+Cohere
+AI21
+AI21 Labs
+Mistral
+MistralAI
+Mistral AI
+Stability
+Stability AI
+xAI
+Inflection
+Perplexity
+Databricks
+Runway
+ElevenLabs
+Replicate
+Together
+Together.ai
+Fireworks
+Groq
+Cerebras
+SambaNova
+
+# ══════════════════════════════════════════════════════════════════════
+# AI / ML — MODELS
+# ══════════════════════════════════════════════════════════════════════
+Claude
+ChatGPT
+GPT
+GPT-3
+GPT-3.5
+GPT-4
+GPT-4o
+GPT-5
+Gemini
+Gemma
+LLaMA
+Llama
+Llama2
+Llama3
+Llama-2
+Llama-3
+PaLM
+Bard
+Codex
+DALL-E
+DALLE
+StableDiffusion
+Stable Diffusion
+Midjourney
+FLUX
+Sora
+Whisper
+Phi
+Phi-3
+Phi-4
+Mistral
+Mixtral
+Qwen
+Yi
+DeepSeek
+DBRX
+Command
+Command R
+Cohere
+BERT
+RoBERTa
+DistilBERT
+ALBERT
+T5
+BART
+XLNet
+ELECTRA
+ResNet
+VGG
+EfficientNet
+YOLO
+CLIP
+DINO
+SAM
+Segment Anything
+
+# ══════════════════════════════════════════════════════════════════════
+# AI / ML — FRAMEWORKS / TOOLS
+# ══════════════════════════════════════════════════════════════════════
+LangChain
+LangGraph
+LangSmith
+LlamaIndex
+Haystack
+DSPy
+AutoGen
+CrewAI
+Semantic Kernel
+Transformers
+PyTorch
+TensorFlow
+Keras
+JAX
+Flax
+Equinox
+FastAI
+scikit-learn
+sklearn
+XGBoost
+LightGBM
+CatBoost
+Statsmodels
+MLflow
+WandB
+Weights & Biases
+DVC
+Kubeflow
+Ray
+Dask
+Modin
+Polars
+Pandas
+NumPy
+SciPy
+Matplotlib
+Seaborn
+Plotly
+Bokeh
+Altair
+spaCy
+NLTK
+gensim
+FlashRank
+SentenceTransformers
+OpenCLIP
+
+# ══════════════════════════════════════════════════════════════════════
+# AI / ML — SERVING / INFERENCE
+# ══════════════════════════════════════════════════════════════════════
+Ollama
+LM Studio
+vLLM
+TGI
+Text Generation Inference
+Triton
+TorchServe
+BentoML
+KServe
+Seldon
+llama.cpp
+llamacpp
+ExLlama
+ExLlamaV2
+MLX
+GGUF
+GGML
+ONNX
+ONNXRuntime
+CoreML
+TensorRT
+DeepSpeed
+FSDP
+
+# ══════════════════════════════════════════════════════════════════════
+# SECURITY — TOOLS
+# ══════════════════════════════════════════════════════════════════════
+Metasploit
+BurpSuite
+Burp Suite
+OWASP
+Wireshark
+tcpdump
+Nmap
+Masscan
+ZAP
+Nikto
+Nessus
+Qualys
+Rapid7
+Tenable
+Snyk
+Dependabot
+Renovate
+SonarQube
+Checkmarx
+Veracode
+Semgrep
+Bandit
+Trivy
+Grype
+Syft
+Clair
+Falco
+Cilium
+Calico
+WireGuard
+OpenVPN
+Tailscale
+Twingate
+ZeroTier
+
+# ══════════════════════════════════════════════════════════════════════
+# SECURITY — VENDORS / PRODUCTS
+# ══════════════════════════════════════════════════════════════════════
+CrowdStrike
+SentinelOne
+Carbon Black
+Sophos
+McAfee
+Symantec
+Norton
+Bitdefender
+Kaspersky
+ESET
+TrendMicro
+Trend Micro
+Fortinet
+PaloAlto
+Palo Alto
+Palo Alto Networks
+Check Point
+Cisco
+Juniper
+Zscaler
+Netskope
+Cloudflare Zero Trust
+Akamai
+Imperva
+F5
+Barracuda
+Proofpoint
+Mimecast
+Abnormal
+Darktrace
+Vectra
+ExtraHop
+Okta
+Auth0
+Ping
+OneLogin
+Duo
+JumpCloud
+HashiCorp Vault
+1Password
+LastPass
+Bitwarden
+Dashlane
+
+# ══════════════════════════════════════════════════════════════════════
+# SECURITY — STANDARDS / FRAMEWORKS
+# ══════════════════════════════════════════════════════════════════════
+CISA
+MITRE
+ATT&CK
+MITRE ATT&CK
+NIST
+ISO
+ISO27001
+ISO 27001
+SOC2
+SOC 2
+PCI
+PCIDSS
+PCI-DSS
+PCI DSS
+GDPR
+HIPAA
+FedRAMP
+FISMA
+CCPA
+POPIA
+LGPD
+NIS2
+DORA
+CMMC
+OWASP Top 10
+CWE
+CVE
+CVSS
+STIX
+TAXII
+YARA
+SIGMA
+OSCAL
+CIS
+CIS Controls
+Zero Trust
+
+# ══════════════════════════════════════════════════════════════════════
+# SECURITY — THREAT INTEL SERVICES
+# ══════════════════════════════════════════════════════════════════════
+VirusTotal
+Shodan
+Censys
+AbuseIPDB
+URLVoid
+URLScan
+GreyNoise
+AlienVault
+Recorded Future
+Mandiant
+FireEye
+Unit42
+Unit 42
+Cisco Talos
+Talos
+Kaspersky SecureList
+Proofpoint
+Trellix
+Dragos
+Claroty
+Nozomi
+
+# ══════════════════════════════════════════════════════════════════════
+# THREAT ACTORS / APT GROUPS
+# (spaCy often tags these as PERSON because they're capitalized names)
+# ══════════════════════════════════════════════════════════════════════
+Lazarus
+Lazarus Group
+Guacamaya
+SEDENA
+Kimsuky
+BlueNoroff
+Andariel
+APT1
+APT28
+APT29
+APT30
+APT32
+APT33
+APT34
+APT37
+APT38
+APT39
+APT40
+APT41
+APT42
+APT43
+Fancy Bear
+Cozy Bear
+Sandworm
+Voodoo Bear
+Equation Group
+Equation
+Shadow Brokers
+DarkHotel
+DarkHydrus
+Elfin
+MuddyWater
+OilRig
+Charming Kitten
+Mustang Panda
+Winnti
+Turla
+Carbanak
+FIN7
+FIN8
+FIN11
+FIN12
+Wizard Spider
+Lapsus$
+Scattered Spider
+Cl0p
+LockBit
+BlackCat
+ALPHV
+REvil
+Conti
+RansomExx
+Ryuk
+Maze
+Hive
+DarkSide
+BlackBasta
+Royal
+Akira
+8Base
+Black Suit
+Play
+Qilin
+Rhysida
+Medusa
+Vice Society
+Snatch
+Karakurt
+BianLian
+Vanilla Tempest
+Silk Typhoon
+Salt Typhoon
+Volt Typhoon
+Flax Typhoon
+
+# ══════════════════════════════════════════════════════════════════════
+# GOVERNMENT / INTERNATIONAL BODIES (often mis-tagged as PERSON/ORG)
+# ══════════════════════════════════════════════════════════════════════
+FBI
+NSA
+CIA
+DHS
+DoD
+DoJ
+State Department
+DEA
+ATF
+USSS
+DIA
+ODNI
+FinCEN
+FDIC
+SEC
+OFAC
+Treasury
+FTC
+FCC
+Interpol
+Europol
+NATO
+UN
+United Nations
+EU
+European Union
+WHO
+CDC
+NHS
+NCSC
+GCHQ
+MI5
+MI6
+ASD
+CSE
+ANSSI
+BSI
+JPCERT
+KISA
+JCSC
+
+# ══════════════════════════════════════════════════════════════════════
+# NEWS / MEDIA (commonly referenced, NOT people)
+# ══════════════════════════════════════════════════════════════════════
+Reuters
+Associated Press
+AP
+BBC
+CNN
+NBC
+ABC
+CBS
+Fox
+FOX
+Bloomberg
+TechCrunch
+Wired
+Ars Technica
+The Verge
+VentureBeat
+Hacker News
+YCombinator
+Y Combinator
+ProductHunt
+Product Hunt
+
+# ══════════════════════════════════════════════════════════════════════
+# BROWSERS / DESKTOP
+# ══════════════════════════════════════════════════════════════════════
+Chrome
+Firefox
+Safari
+Edge
+Opera
+Brave
+Arc
+Vivaldi
+Tor
+DuckDuckGo
+Chromium
+WebKit
+Gecko
+Blink
+V8
+SpiderMonkey
+JavaScriptCore
+Mac
+macOS
+Windows
+Linux
+Ubuntu
+Debian
+Fedora
+CentOS
+RHEL
+RedHat
+AlmaLinux
+Rocky Linux
+Arch
+ArchLinux
+Manjaro
+NixOS
+Nix
+Gentoo
+openSUSE
+Alpine
+AlpineLinux
+FreeBSD
+OpenBSD
+NetBSD
+iOS
+iPadOS
+Android
+ChromeOS
+WSL
+
+# ══════════════════════════════════════════════════════════════════════
+# HARDWARE / CHIPS
+# ══════════════════════════════════════════════════════════════════════
+NVIDIA
+GeForce
+Quadro
+Tesla
+RTX
+GTX
+AMD
+Ryzen
+EPYC
+Radeon
+Intel
+Xeon
+Core i3
+Core i5
+Core i7
+Core i9
+Pentium
+Celeron
+Arc
+Apple Silicon
+Apple
+M1
+M2
+M3
+M4
+A17
+A18
+ARM
+x86
+x86_64
+amd64
+RISC-V
+ARM64
+Aarch64
+Snapdragon
+Qualcomm
+Broadcom
+Mediatek
+Raspberry Pi
+RPi
+Arduino
+ESP32
+ESP8266
+
+# ══════════════════════════════════════════════════════════════════════
+# PROTOCOLS / STANDARDS
+# ══════════════════════════════════════════════════════════════════════
+HTTP
+HTTPS
+HTTP/2
+HTTP/3
+WebSocket
+gRPC
+REST
+GraphQL
+OData
+OAuth
+OAuth2
+OIDC
+OpenID Connect
+SAML
+JWT
+JWK
+JWKS
+TLS
+SSL
+mTLS
+SSH
+SCP
+SFTP
+FTP
+SMTP
+IMAP
+POP3
+LDAP
+Active Directory
+Kerberos
+RADIUS
+SMB
+NFS
+CIFS
+SMB3
+RDP
+VNC
+DNS
+DHCP
+TCP
+UDP
+QUIC
+ICMP
+BGP
+OSPF
+IPv4
+IPv6
+IPSec
+WireGuard
+
+# ══════════════════════════════════════════════════════════════════════
+# FILE / DOC FORMATS
+# ══════════════════════════════════════════════════════════════════════
+PDF
+DOCX
+XLSX
+PPTX
+ODT
+ODS
+ODP
+RTF
+EPUB
+MOBI
+PNG
+JPEG
+JPG
+GIF
+WebP
+AVIF
+SVG
+ICO
+TIFF
+BMP
+HEIC
+MP3
+MP4
+M4A
+AAC
+WAV
+FLAC
+OGG
+OPUS
+WebM
+AVI
+MKV
+MOV
+H264
+H265
+HEVC
+VP9
+AV1
+DICOM
+
+# ══════════════════════════════════════════════════════════════════════
+# BLOCKCHAIN / CRYPTO (tech names, not PII)
+# ══════════════════════════════════════════════════════════════════════
+Bitcoin
+Ethereum
+Solana
+Cardano
+Polkadot
+Avalanche
+Cosmos
+BNB
+BNB Chain
+Polygon
+Arbitrum
+Optimism
+Base
+Sui
+Aptos
+NEAR
+Algorand
+Stellar
+Ripple
+XRP
+MetaMask
+Phantom
+Ledger
+Trezor
+Coinbase
+Binance
+Kraken
+Uniswap
+Aave
+Compound
+OpenSea
+Chainlink
+IPFS
+Filecoin
+
+# ══════════════════════════════════════════════════════════════════════
+# COMMON TECHNICAL TERMS spaCy MIS-TAGS AS PERSON
+# ══════════════════════════════════════════════════════════════════════
+Linux
+Unix
+POSIX
+GNU
+BSD
+Ubuntu
+systemd
+dbus
+Wayland
+XOrg
+X11
+KDE
+GNOME
+XFCE
+I3
+Hyprland
+Sway
+OpenGL
+Vulkan
+DirectX
+Metal
+WebGL
+WebGPU
+CUDA
+ROCm
+oneAPI
+SYCL
+MPI
+OpenMP
+POSIX Threads
+pthread

@@ -1,7 +1,9 @@
 """PII redaction and rehydration engine using Microsoft Presidio."""
 
 import logging
-from typing import Optional
+import os
+from pathlib import Path
+from typing import List, Optional
 
 from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
 from presidio_anonymizer import AnonymizerEngine
@@ -11,6 +13,57 @@ from .recognizers import SouthAfricanIDRecognizer, SouthAfricanPhoneRecognizer
 from .session import pii_store
 
 logger = logging.getLogger("pii-proxy")
+
+
+def _load_allow_list() -> List[str]:
+    """Load the Presidio allow_list from config/allow_list.txt (one term per line).
+
+    Presidio's built-in ``allow_list`` parameter tells the analyzer to skip
+    any span whose text matches a term on the list. We use it to suppress
+    false-positive PERSON tags on known brand / product / technology names
+    like ``Docker``, ``Veilguard``, ``LibreChat`` etc. The spaCy ``en_core_web_lg``
+    model routinely classifies these as PERSON (0.85 confidence) because
+    they look like surnames to the statistical NER.
+
+    Without this list, Petrus's Pipedrive traffic redacts every ``Docker`` /
+    ``Python`` / ``Pipedrive`` mention, destroying the LLM's ability to
+    reason about technical topics.
+
+    File format: one term per line, blank lines and ``#`` comments ignored.
+    Case-sensitive (Presidio does exact-text match). Fall back to an empty
+    list if the file is missing — all brand names will be redacted but
+    the system still works.
+    """
+    # Search order (first hit wins):
+    #   1. ${PII_ALLOW_LIST_PATH} env override
+    #   2. /app/app/allow_list.txt — same dir as this module (mounted)
+    #   3. /app/config/allow_list.txt — /app/config is NOT mounted
+    #      but falls back to baked-in image if someone rebuilds with COPY
+    #   4. ../config/allow_list.txt — dev-mode layout
+    candidates = [
+        Path(__file__).parent / "allow_list.txt",
+        Path("/app/config/allow_list.txt"),
+        Path(__file__).parent.parent / "config" / "allow_list.txt",
+    ]
+    env_override = os.environ.get("PII_ALLOW_LIST_PATH", "")
+    if env_override:
+        candidates.insert(0, Path(env_override))
+
+    for p in candidates:
+        if p.is_file():
+            with open(p, "r", encoding="utf-8") as f:
+                terms = [
+                    line.strip() for line in f
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            logger.info(f"Loaded {len(terms)} allow_list terms from {p}")
+            return terms
+
+    logger.warning(
+        "No allow_list.txt found — brand/tech names may be false-positive "
+        "redacted as PERSON. Create config/allow_list.txt to fix."
+    )
+    return []
 
 # Entity types to detect
 PII_ENTITIES = [
@@ -49,7 +102,14 @@ class PIIRedactor:
 
         self.analyzer = AnalyzerEngine(registry=registry)
         self.anonymizer = AnonymizerEngine()
-        logger.info("Presidio engine ready with SA recognizers")
+        # Load the allow_list once at init so per-request redact calls
+        # don't pay the file IO. Reload requires a container restart —
+        # acceptable because the list changes rarely.
+        self.allow_list = _load_allow_list()
+        logger.info(
+            f"Presidio engine ready with SA recognizers + "
+            f"{len(self.allow_list)} allow_list terms"
+        )
 
     def redact_text(self, text: str, conversation_id: str) -> str:
         """Detect PII in text and replace with deterministic tokens."""
@@ -62,6 +122,7 @@ class PIIRedactor:
                 entities=PII_ENTITIES,
                 language="en",
                 score_threshold=self.min_score,
+                allow_list=self.allow_list if self.allow_list else None,
             )
             if not results:
                 return text
