@@ -20,8 +20,24 @@ logger = logging.getLogger("veilguard-setup")
 
 SETUP_PORT = 9090
 
-# HTML with embedded QR scanner (html5-qrcode CDN) + manual paste
-SETUP_HTML = """<!DOCTYPE html>
+# Paste-only setup page — no external CDN, no camera permissions, no
+# tabs.  Scanning your own screen with your own webcam was never a
+# realistic flow on a laptop; "Click to copy" in LibreChat + paste
+# here is what everyone actually does.  Removing the QR scanner also
+# eliminates a class of dead-page bugs (CDN blocked, camera stuck
+# on permission prompt, etc.).
+#
+# IMPORTANT — raw string ``r"""..."""``.  Regular Python triple-quoted
+# strings process ``\u200B``, ``\uFEFF``, ``\r``, ``\n`` and similar
+# escapes *before* writing to HTML.  The regex below
+# (``/[\u200B-\u200D\uFEFF\r\n]/``) would therefore emit real unicode
+# zero-width chars + an actual CRLF inside a JS regex literal, which
+# is a JS syntax error that kills every statement after it — including
+# the button click handler.  Raw string leaves the backslash-escapes
+# literal so the JS engine parses them itself.  This bug dated back
+# to the original file; it only showed up once the paste flow became
+# the only flow.
+SETUP_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -30,21 +46,16 @@ SETUP_HTML = """<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0f; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
-  .container { max-width: 480px; width: 100%; padding: 40px; }
+  .container { max-width: 560px; width: 100%; padding: 40px; }
   .logo { text-align: center; margin-bottom: 32px; }
   .logo h1 { font-size: 28px; font-weight: 700; color: #fff; }
   .logo span { color: #7c3aed; }
   .logo p { color: #888; font-size: 14px; margin-top: 8px; }
   .card { background: #141420; border: 1px solid #2a2a3a; border-radius: 12px; padding: 24px; margin-bottom: 20px; }
-  .card h2 { font-size: 16px; margin-bottom: 16px; color: #fff; }
-  #reader { width: 100%; border-radius: 8px; overflow: hidden; }
-  .divider { text-align: center; color: #555; font-size: 13px; margin: 20px 0; position: relative; }
-  .divider::before, .divider::after { content: ''; position: absolute; top: 50%; width: 40%; height: 1px; background: #2a2a3a; }
-  .divider::before { left: 0; }
-  .divider::after { right: 0; }
-  input[type="text"] { width: 100%; padding: 12px 16px; background: #0a0a0f; border: 1px solid #2a2a3a; border-radius: 8px; color: #fff; font-size: 14px; font-family: monospace; outline: none; }
-  input[type="text"]:focus { border-color: #7c3aed; }
-  input[type="text"]::placeholder { color: #555; }
+  .card h2 { font-size: 14px; margin-bottom: 12px; color: #fff; font-weight: 600; }
+  textarea { width: 100%; min-height: 120px; padding: 12px 16px; background: #0a0a0f; border: 1px solid #2a2a3a; border-radius: 8px; color: #fff; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; outline: none; resize: vertical; }
+  textarea:focus { border-color: #7c3aed; }
+  textarea::placeholder { color: #555; }
   .btn { width: 100%; padding: 14px; background: #7c3aed; color: #fff; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; margin-top: 12px; transition: background 0.2s; }
   .btn:hover { background: #6d28d9; }
   .btn:disabled { background: #333; cursor: not-allowed; }
@@ -52,13 +63,9 @@ SETUP_HTML = """<!DOCTYPE html>
   .status.success { display: block; background: #0a2e1a; border: 1px solid #166534; color: #4ade80; }
   .status.error { display: block; background: #2e0a0a; border: 1px solid #991b1b; color: #f87171; }
   .status.loading { display: block; background: #1a1a2e; border: 1px solid #312e81; color: #a78bfa; }
-  .help { text-align: center; color: #555; font-size: 12px; margin-top: 24px; }
-  .help a { color: #7c3aed; text-decoration: none; }
-  .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
-  .tab { flex: 1; padding: 10px; text-align: center; font-size: 13px; font-weight: 500; border: 1px solid #2a2a3a; border-radius: 8px; cursor: pointer; color: #888; background: transparent; }
-  .tab.active { background: #7c3aed22; border-color: #7c3aed; color: #a78bfa; }
-  .tab-content { display: none; }
-  .tab-content.active { display: block; }
+  .help { color: #666; font-size: 12px; line-height: 1.6; padding: 8px 4px; }
+  .help ol { padding-left: 20px; margin: 6px 0; }
+  .help code { background: #1a1a2e; padding: 1px 6px; border-radius: 3px; color: #a78bfa; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -69,70 +76,40 @@ SETUP_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div class="tabs">
-      <div class="tab active" onclick="switchTab('scan')">Scan QR Code</div>
-      <div class="tab" onclick="switchTab('paste')">Paste Token</div>
-    </div>
-
-    <div id="tab-scan" class="tab-content active">
-      <div id="reader"></div>
-      <p style="color:#888; font-size:12px; margin-top:12px; text-align:center;">
-        Point your camera at the QR code shown in LibreChat
-      </p>
-    </div>
-
-    <div id="tab-paste" class="tab-content">
-      <label style="font-size:13px; color:#888; display:block; margin-bottom:8px;">
-        Connection string from LibreChat:
-      </label>
-      <input type="text" id="tokenInput" placeholder="wss://server/ws/client#token=abc123..." />
-      <button class="btn" onclick="submitManual()">Connect</button>
-    </div>
+    <h2>Paste the connection string from LibreChat</h2>
+    <textarea id="tokenInput" placeholder='{"server":"wss://veilguard.phishield.com/ws/client","token":"...","user_id":"..."}'></textarea>
+    <button class="btn" id="connectBtn" type="button">Connect</button>
   </div>
 
   <div id="status" class="status"></div>
 
   <div class="help">
-    Open LibreChat &rarr; Cowork panel &rarr; "Connect Machine" to see your QR code
+    <strong style="color:#888;">How to get the string:</strong>
+    <ol>
+      <li>Open <code>veilguard.phishield.com</code> in your browser, log in</li>
+      <li>Open the <strong>Workspace</strong> side panel</li>
+      <li>Under "Scan QR code in the installer", click the grey box labelled <strong>Click to copy</strong></li>
+      <li>Paste above and click Connect</li>
+    </ol>
   </div>
 </div>
 
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script>
-let scanner = null;
-
-function switchTab(tab) {
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
-  document.querySelector(`.tab:nth-child(${tab === 'scan' ? 1 : 2})`).classList.add('active');
-  document.getElementById(`tab-${tab}`).classList.add('active');
-
-  if (tab === 'scan' && !scanner) { startScanner(); }
-}
-
-function startScanner() {
-  scanner = new Html5Qrcode("reader");
-  scanner.start(
-    { facingMode: "environment" },
-    { fps: 10, qrbox: { width: 250, height: 250 } },
-    onScanSuccess,
-    () => {}
-  ).catch(err => {
-    document.getElementById('reader').innerHTML =
-      '<p style="color:#f87171; padding:20px; text-align:center;">Camera not available. Use the Paste Token tab instead.</p>';
-  });
-}
-
-function onScanSuccess(decoded) {
-  if (scanner) { scanner.stop().catch(() => {}); }
-  processConnectionString(decoded);
-}
-
-function submitManual() {
-  const val = document.getElementById('tokenInput').value.trim();
+// Paste-only flow.  Wiring the click handler in JS (rather than inline
+// onclick) so this works even if something weird happens with HTML
+// attribute parsing.
+document.getElementById('connectBtn').addEventListener('click', function () {
+  var val = document.getElementById('tokenInput').value.trim();
   if (!val) return;
   processConnectionString(val);
-}
+});
+// Also submit on Ctrl/Cmd+Enter from the textarea — quality-of-life.
+document.getElementById('tokenInput').addEventListener('keydown', function (e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    document.getElementById('connectBtn').click();
+  }
+});
 
 function processConnectionString(rawStr) {
   const status = document.getElementById('status');
@@ -142,35 +119,44 @@ function processConnectionString(rawStr) {
   // Clean input: trim whitespace, remove zero-width chars, newlines
   const str = rawStr.trim().replace(/[\u200B-\u200D\uFEFF\r\n]/g, '');
 
-  let server = '', token = '';
+  let server = '', token = '', user_id = '';
 
-  // Method 1: JSON format {"server":"...","token":"..."}
+  // Method 1: JSON format {"server":"...","token":"...","user_id":"..."}
   // Extract JSON if embedded in other text
-  const jsonMatch = str.match(/\{[^}]*"server"\s*:\s*"[^"]+[^}]*\}/);
+  const jsonMatch = str.match(/\{[^}]*"(server|ws_url)"\s*:\s*"[^"]+[^}]*\}/);
   if (jsonMatch) {
     try {
       const obj = JSON.parse(jsonMatch[0]);
-      server = obj.server || '';
+      server = obj.server || obj.ws_url || '';
       token = obj.token || '';
+      user_id = obj.user_id || '';
     } catch { /* fall through */ }
   }
 
-  // Method 2: URL format ws://host/ws/client#token=abc or ?token=abc
+  // Method 2: URL format ws://host/ws/client#token=abc&user_id=xyz
   if (!server && str.match(/^wss?:\/\//)) {
-    const hashIdx = str.indexOf('#token=');
-    const queryIdx = str.indexOf('?token=');
+    const hashIdx = str.indexOf('#');
+    const queryIdx = str.indexOf('?');
+    let paramStr = '';
     if (hashIdx > 0) {
       server = str.substring(0, hashIdx);
-      token = str.substring(hashIdx + 7);
+      paramStr = str.substring(hashIdx + 1);
     } else if (queryIdx > 0) {
       server = str.substring(0, queryIdx);
-      token = str.substring(queryIdx + 7);
+      paramStr = str.substring(queryIdx + 1);
     } else {
       server = str;
     }
+    if (paramStr) {
+      for (const part of paramStr.split('&')) {
+        const [k, v] = part.split('=');
+        if (k === 'token') token = decodeURIComponent(v || '');
+        else if (k === 'user_id') user_id = decodeURIComponent(v || '');
+      }
+    }
   }
 
-  // Method 3: Just a hex token (32+ chars)
+  // Method 3: Just a hex token (32+ chars) — legacy, no user_id
   if (!server && !token && str.match(/^[a-f0-9]{24,}$/i)) {
     token = str;
   }
@@ -181,6 +167,12 @@ function processConnectionString(rawStr) {
     return;
   }
 
+  if (!user_id) {
+    status.className = 'status error';
+    status.textContent = 'Missing user_id — re-copy the QR code from LibreChat (must be a per-user token).';
+    return;
+  }
+
   // Show what we parsed
   status.textContent = 'Connecting to ' + (server || 'server') + '...';
 
@@ -188,7 +180,7 @@ function processConnectionString(rawStr) {
   fetch('/setup', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ server, token })
+    body: JSON.stringify({ server, token, user_id })
   })
   .then(r => r.json())
   .then(data => {
@@ -205,9 +197,6 @@ function processConnectionString(rawStr) {
     status.textContent = 'Failed to connect: ' + err.message;
   });
 }
-
-// Auto-start scanner
-startScanner();
 </script>
 </body>
 </html>"""
@@ -240,14 +229,21 @@ class SetupHandler(http.server.BaseHTTPRequestHandler):
 
             server = body.get("server", "")
             token = body.get("token", "")
+            user_id = body.get("user_id", "")
 
             if not server:
                 self._json_response(400, {"status": "error", "error": "Missing server URL"})
                 return
+            if not user_id:
+                self._json_response(
+                    400,
+                    {"status": "error", "error": "Missing user_id — re-copy the QR from LibreChat"},
+                )
+                return
 
             # Save config
             try:
-                config = save_config(server, token)
+                config = save_config(server, token, user_id)
                 self._json_response(200, {"status": "ok", "config": config})
 
                 # Signal daemon to start
@@ -260,17 +256,30 @@ class SetupHandler(http.server.BaseHTTPRequestHandler):
             self.send_error(404)
 
     def _json_response(self, code, data):
+        # Explicit Content-Length + Connection: close.  Without these,
+        # Python's BaseHTTPRequestHandler emits an HTTP response with
+        # neither ``Content-Length`` nor ``Transfer-Encoding: chunked``,
+        # and the browser keeps reading past the JSON body looking for
+        # more bytes — producing a parse error like "Unexpected
+        # non-whitespace character after JSON at position 292".
+        body = json.dumps(data).encode("utf-8")
         self.send_response(code)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+        self.wfile.write(body)
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
 
     def log_message(self, format, *args):
         logger.debug(f"[SETUP] {args[0]}")
 
 
-def save_config(server: str, token: str) -> dict:
+def save_config(server: str, token: str, user_id: str = "") -> dict:
     """Save connection config to ~/.veilguard/config.yaml."""
     import platform
 
@@ -281,6 +290,7 @@ def save_config(server: str, token: str) -> dict:
     config = {
         "server": server,
         "token": token,
+        "user_id": user_id,
         "client_id": client_id,
         "project_root": os.path.expanduser("~"),
         "timeout": 60,

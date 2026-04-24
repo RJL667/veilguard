@@ -10,6 +10,13 @@ Usage:
     python veilguard_client.py --server ws://host:8809/ws/client --token abc123
 """
 
+# Bump this on every release. The auto-updater compares against the
+# manifest served by the cloud at GET /api/client/latest — when the
+# remote version is higher, the client downloads the new installer,
+# runs it silently, and exits so Inno Setup can replace files.
+# Semver: MAJOR.MINOR.PATCH. 3-part only; pre-release tags not supported.
+__version__ = "0.2.1"
+
 import argparse
 import asyncio
 import json
@@ -18,9 +25,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, urlunparse
 
 try:
     import websockets
@@ -126,12 +134,36 @@ class ToolExecutor:
             self.project_root = self.working_folders[0]
 
     async def execute(self, tool: str, args: dict) -> str:
-        """Dispatch tool execution. Returns result string."""
+        """Dispatch tool execution. Returns result string.
+
+        Critical detail: the sync ``_tool_*`` handlers use blocking
+        ``subprocess.run()`` calls. If we invoked them directly from
+        this async function, the blocking call would freeze the ENTIRE
+        asyncio event loop for the duration of the subprocess. During
+        that freeze:
+          - the heartbeat task can't fire (app-level keepalive dies)
+          - the WebSocket recv loop can't read new frames
+          - the connection eventually drops
+        Observed 23 Apr 2026 with Petrus's Pipedrive run: a 2-3 minute
+        ``run_command`` froze the loop, heartbeat missed, daemon
+        dropped three times in 10 minutes.
+
+        Fix: dispatch sync handlers via ``asyncio.to_thread`` so they
+        run in the default thread pool. The event loop stays
+        responsive, heartbeat keeps ticking, websocket pings answer.
+        Async handlers (web_search / web_fetch) are awaited directly —
+        they're already non-blocking.
+        """
         handler = getattr(self, f"_tool_{tool}", None)
         if handler is None:
             return f"Error: Unknown tool '{tool}'"
         try:
-            result = handler(args) if not asyncio.iscoroutinefunction(handler) else await handler(args)
+            if asyncio.iscoroutinefunction(handler):
+                result = await handler(args)
+            else:
+                # Run in a worker thread so subprocess.run doesn't
+                # block the event loop.
+                result = await asyncio.to_thread(handler, args)
             return result
         except Exception as e:
             return f"Error executing {tool}: {e}"
@@ -226,14 +258,18 @@ class ToolExecutor:
             for ext in ["*.py", "*.md", "*.json", "*.yaml", "*.yml", "*.txt", "*.js", "*.ts"]:
                 grep_args.append(f"--include={ext}")
         grep_args.extend(["--", pattern, search_path])
+        # 15s grep timeout was too tight on large monorepos. 60s gives
+        # slack for deep recursive scans; event loop stays free because
+        # execute() now dispatches sync handlers through asyncio.to_thread.
+        grep_timeout = int(args.get("timeout") or 60)
         try:
-            result = subprocess.run(grep_args, capture_output=True, text=True, timeout=15, cwd=self.project_root)
+            result = subprocess.run(grep_args, capture_output=True, text=True, timeout=grep_timeout, cwd=self.project_root)
             output = result.stdout[:3000]
         except FileNotFoundError:
             search_dir = os.path.join(self.project_root, search_path)
             result = subprocess.run(
                 ["findstr", "/S", "/N", "/R", pattern, os.path.join(search_dir, "*.*")],
-                capture_output=True, text=True, timeout=15, cwd=self.project_root
+                capture_output=True, text=True, timeout=grep_timeout, cwd=self.project_root
             )
             output = result.stdout[:3000]
         return output or "(no matches)"
@@ -243,14 +279,25 @@ class ToolExecutor:
         safe, reason = validate_command(cmd)
         if not safe:
             return reason
+        # Timeout bumped 30s -> 600s (10 min). Real scripts (Pipedrive
+        # bulk loaders, batch NLP passes, etc.) routinely take 2-5
+        # minutes and were timing out mid-run with the 30s cap — users
+        # saw TimeoutExpired, the script kept running in background,
+        # and they had no reliable way to get the result back. Caller
+        # can still override via args["timeout"] if they know they
+        # need shorter. 10 min is generous enough for any reasonable
+        # interactive script; anything longer should be a proper
+        # background job via start_task rather than a blocking tool
+        # call.
+        timeout = int(args.get("timeout") or 600)
         if os.name == "nt":
             has_pipe = "|" in cmd or ">" in cmd or "&&" in cmd
             if has_pipe:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=self.project_root)
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=self.project_root)
             else:
-                result = subprocess.run(["cmd", "/c", cmd], capture_output=True, text=True, timeout=30, cwd=self.project_root)
+                result = subprocess.run(["cmd", "/c", cmd], capture_output=True, text=True, timeout=timeout, cwd=self.project_root)
         else:
-            result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=30, cwd=self.project_root)
+            result = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout, cwd=self.project_root)
         out = result.stdout[:2000]
         if result.stderr:
             out += f"\nstderr: {result.stderr[:500]}"
@@ -297,9 +344,13 @@ class ToolExecutor:
         safe, reason = validate_command(cmd)
         if not safe:
             return reason
+        # 60s was too short for real PS work (installers, bulk file
+        # ops, Get-ChildItem -Recurse on big trees). Now 600s w/
+        # caller override, matching _tool_run_command.
+        timeout = int(args.get("timeout") or 600)
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", cmd],
-            capture_output=True, text=True, timeout=60, cwd=self.project_root
+            capture_output=True, text=True, timeout=timeout, cwd=self.project_root
         )
         out = result.stdout[:2000]
         if result.stderr:
@@ -311,9 +362,12 @@ class ToolExecutor:
         safe, reason = validate_command(cmd)
         if not safe:
             return reason
+        # docker build / compose up / pull on fresh images easily
+        # blow past 120s. Bump to 600s w/ caller override.
+        timeout = int(args.get("timeout") or 600)
         result = subprocess.run(
             f"docker {cmd}", shell=True,
-            capture_output=True, text=True, timeout=120, cwd=self.project_root
+            capture_output=True, text=True, timeout=timeout, cwd=self.project_root
         )
         out = result.stdout[:2000]
         if result.stderr:
@@ -332,9 +386,12 @@ class ToolExecutor:
         for pat in git_dangerous:
             if pat.search(cmd):
                 return f"BLOCKED: Destructive git operation"
+        # git clone / fetch / push on big repos can exceed 30s. Bump
+        # to 300s w/ caller override. Matches run_command/docker pattern.
+        timeout = int(args.get("timeout") or 300)
         result = subprocess.run(
             f"git {cmd}", shell=True,
-            capture_output=True, text=True, timeout=30, cwd=self.project_root
+            capture_output=True, text=True, timeout=timeout, cwd=self.project_root
         )
         out = result.stdout[:2000]
         if result.stderr:
@@ -348,12 +405,213 @@ class ToolExecutor:
         return self._tool_write_file(args)
 
 
+# ── Auto-updater ─────────────────────────────────────────────────────────────
+#
+# Every UPDATE_CHECK_INTERVAL seconds the daemon hits the cloud manifest
+# endpoint (derived from the WebSocket URL). If the manifest advertises a
+# higher version, the client:
+#   1. Downloads the new installer to a temp file
+#   2. Launches it detached with Inno Setup silent flags
+#   3. Calls os._exit(0) so the installer can overwrite the running .exe
+#      (Inno Setup's CloseApplications=yes also kills running instances
+#      as a belt-and-braces measure)
+#
+# The installer's [Run] section relaunches VeilguardClient.exe, so the
+# user never sees a "daemon stopped" state for more than ~10s.
+#
+# Ops flow for shipping a release:
+#   1. Bump __version__ in this file
+#   2. Bump AppVersion in installer.iss
+#   3. Run build.bat → produces installer_output/VeilguardSetup.exe
+#   4. scp VeilguardSetup.exe + version.json to the VM downloads dir
+#   5. Every connected client picks up the update within UPDATE_CHECK_INTERVAL
+#
+# First check runs 60s after startup so a freshly-installed client doesn't
+# immediately re-update in a loop if the manifest is briefly stale.
+
+UPDATE_CHECK_INTERVAL_SEC = 30 * 60   # every 30 minutes
+UPDATE_FIRST_CHECK_DELAY_SEC = 60     # first check 60s after startup
+
+
+def _parse_version(v: str) -> tuple:
+    """Parse '0.2.0' → (0, 2, 0). Returns (0,0,0) on malformed input."""
+    try:
+        parts = [int(x) for x in v.strip().split(".")[:3]]
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts)
+    except Exception:
+        return (0, 0, 0)
+
+
+def _http_base_from_ws(ws_url: str) -> str:
+    """Convert ws(s)://host:port/ws/client → http(s)://host:port."""
+    parsed = urlparse(ws_url)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    return urlunparse((scheme, parsed.netloc, "", "", "", ""))
+
+
+def _candidate_manifest_urls(ws_url: str, explicit: str = "") -> list:
+    """Return manifest URLs to try, in priority order.
+
+    If the user set update_manifest_url in config.yaml, that wins.
+    Otherwise we try two derivations because the prod Caddy reverse
+    proxy routes /ws/client direct to the backend but prefixes HTTP
+    routes with /api/sub-agents/. Local dev doesn't have that prefix.
+    """
+    if explicit:
+        return [explicit]
+    base = _http_base_from_ws(ws_url)
+    return [
+        # Caddy prod routing (phishield.com): HTTP has /api/sub-agents/ prefix
+        f"{base}/api/sub-agents/api/client/latest",
+        # Local dev (no Caddy) or when ws+http share the same path layout
+        f"{base}/api/client/latest",
+    ]
+
+
+async def _download_and_launch_installer(url: str):
+    """Download installer, launch silently detached, exit self.
+
+    On Windows, uses Inno Setup silent-install flags; on non-Windows
+    (no installer available) just logs and skips — Linux/macOS users
+    run the daemon via ``python veilguard_client.py`` and can use
+    pip/git pull for updates.
+    """
+    if httpx is None:
+        logger.warning("[UPDATE] httpx not installed — cannot download installer")
+        return
+
+    if os.name != "nt":
+        logger.info(
+            "[UPDATE] Non-Windows platform — skipping auto-install. "
+            "Update via `git pull` or `pip install -U veilguard-client`."
+        )
+        return
+
+    try:
+        tmp_path = os.path.join(tempfile.gettempdir(), "VeilguardSetup_update.exe")
+        async with httpx.AsyncClient(timeout=600, follow_redirects=True) as client:
+            async with client.stream("GET", url) as resp:
+                if resp.status_code != 200:
+                    logger.error(f"[UPDATE] Download failed: HTTP {resp.status_code}")
+                    return
+                with open(tmp_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(64 * 1024):
+                        f.write(chunk)
+        size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
+        logger.info(f"[UPDATE] Installer downloaded ({size_mb:.1f}MB) → {tmp_path}")
+    except Exception as e:
+        logger.error(f"[UPDATE] Download failed: {e}")
+        return
+
+    # DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP so the installer
+    # survives this process exiting.
+    DETACHED_PROCESS = 0x00000008
+    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    try:
+        subprocess.Popen(
+            [tmp_path, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL"],
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+    except Exception as e:
+        logger.error(f"[UPDATE] Failed to launch installer: {e}")
+        return
+
+    logger.info("[UPDATE] Installer launched silently. Exiting so it can replace files.")
+    # Give Inno Setup a moment to start before we exit, so it can hold a
+    # handle on the file and kill us via CloseApplications.
+    await asyncio.sleep(2)
+    os._exit(0)
+
+
+async def auto_updater(server_ws_url: str, explicit_manifest_url: str = ""):
+    """Background task — polls the manifest and triggers updates.
+
+    Tries multiple candidate URLs on each cycle to tolerate the Caddy
+    routing difference (prod has /api/sub-agents/ prefix on HTTP routes,
+    local dev doesn't). The first candidate that returns 200 with a
+    valid JSON manifest wins — once one works, we could pin it, but
+    the cost of trying all candidates is a handful of 404s every 30min
+    which is cheaper than extra config complexity.
+    """
+    if httpx is None:
+        logger.info("[UPDATE] httpx not installed — auto-update disabled")
+        return
+
+    candidates = _candidate_manifest_urls(server_ws_url, explicit_manifest_url)
+    logger.info(
+        f"[UPDATE] Auto-updater active — will try manifest URLs: {candidates}"
+    )
+
+    await asyncio.sleep(UPDATE_FIRST_CHECK_DELAY_SEC)
+
+    while True:
+        manifest = None
+        winning_url = ""
+        for url in candidates:
+            try:
+                async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+                    resp = await client.get(url)
+                if resp.status_code == 200:
+                    try:
+                        manifest = resp.json()
+                        winning_url = url
+                        break
+                    except Exception:
+                        continue
+                else:
+                    logger.debug(f"[UPDATE] {url} → HTTP {resp.status_code}")
+            except Exception as e:
+                logger.debug(f"[UPDATE] {url} → {e}")
+
+        if manifest is not None:
+            remote_version = manifest.get("version", "0.0.0")
+            if _parse_version(remote_version) > _parse_version(__version__):
+                download_url = manifest.get("url", "")
+                if download_url and not download_url.startswith(("http://", "https://")):
+                    # Resolve relative URL against the base that served
+                    # the manifest (NOT the raw ws->http base) so the
+                    # Caddy prefix is preserved.
+                    parsed = urlparse(winning_url)
+                    # Keep everything up to the last /api/ segment that
+                    # matches the server layout.
+                    if "/api/sub-agents/" in winning_url:
+                        http_base = winning_url.split("/api/sub-agents/")[0] + "/api/sub-agents"
+                    else:
+                        http_base = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+                    download_url = f"{http_base}{download_url}"
+                if download_url:
+                    logger.info(
+                        f"[UPDATE] New version available: "
+                        f"{__version__} → {remote_version}. "
+                        f"Downloading from {download_url}"
+                    )
+                    await _download_and_launch_installer(download_url)
+                    # If we return here, install failed — fall through
+                    # to sleep and retry on the next cycle.
+                else:
+                    logger.warning("[UPDATE] Manifest missing 'url' field")
+            else:
+                logger.debug(f"[UPDATE] Up to date (v{__version__})")
+        else:
+            logger.debug("[UPDATE] No manifest endpoint responded; will retry")
+
+        await asyncio.sleep(UPDATE_CHECK_INTERVAL_SEC)
+
+
 # ── WebSocket Client ─────────────────────────────────────────────────────────
 
 async def run_daemon(config: dict):
     """Main daemon loop — connect, authenticate, handle tool requests."""
     server = config["server"]
     token = config.get("token", "")
+    # user_id is REQUIRED by the server for per-user token validation.
+    # setup_server.save_config() writes it to ~/.veilguard/config.yaml;
+    # if it's missing the user needs to re-copy their QR code from
+    # LibreChat's "Connect Client" panel.
+    user_id = config.get("user_id", "")
     client_id = config.get("client_id", "veilguard-client")
     project_root = os.path.realpath(config.get("project_root", "."))
 
@@ -362,18 +620,54 @@ async def run_daemon(config: dict):
     max_delay = config.get("max_reconnect_delay", 300)
     current_delay = reconnect_delay
 
+    logger.info(f"Veilguard Client v{__version__}")
     logger.info(f"Project root: {project_root}")
     logger.info(f"Server: {server}")
+    if not user_id:
+        logger.warning(
+            "[AUTH] No user_id in config — server will reject auth. "
+            "Re-pair via LibreChat's 'Connect Client' panel, or add "
+            "'user_id: <your-lc-user-id>' to ~/.veilguard/config.yaml."
+        )
+    else:
+        logger.info(f"[AUTH] user_id: {user_id[:8]}...{user_id[-4:]}")
+
+    # Auto-updater runs for the lifetime of the process, independent of
+    # WebSocket reconnects. If it triggers an update it calls os._exit(0)
+    # so Inno Setup can overwrite files.
+    if config.get("auto_update", True):
+        asyncio.create_task(
+            auto_updater(server, config.get("update_manifest_url", ""))
+        )
 
     while True:
         try:
             logger.info(f"Connecting to {server}...")
-            async with websockets.connect(server, ping_interval=None) as ws:
-                # Authenticate
+            # ping_interval=20s, ping_timeout=60s — native WebSocket keepalive.
+            # Previously ping_interval=None disabled pings entirely; combined
+            # with sync handlers that blocked the event loop, the connection
+            # silently dropped after idle timeout during long subprocess.run
+            # calls. With sync handlers now routed through asyncio.to_thread,
+            # the recv loop stays responsive and native pings can fire every
+            # 20s. ping_timeout=60s tolerates brief network hiccups.
+            async with websockets.connect(
+                server,
+                ping_interval=20,
+                ping_timeout=60,
+                close_timeout=10,
+            ) as ws:
+                # Authenticate — user_id is REQUIRED by the server for
+                # per-user token validation. version is sent so the cloud
+                # can track which clients are still on old builds.
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0",
                     "method": "auth",
-                    "params": {"token": token, "client_id": client_id},
+                    "params": {
+                        "user_id": user_id,
+                        "token": token,
+                        "client_id": client_id,
+                        "version": __version__,
+                    },
                 }))
 
                 resp = json.loads(await ws.recv())
@@ -524,6 +818,8 @@ def load_config(args) -> dict:
         config["server"] = args.server
     if args.token:
         config["token"] = args.token
+    if getattr(args, "user_id", None):
+        config["user_id"] = args.user_id
     if args.client_id:
         config["client_id"] = args.client_id
     if args.project_root:
@@ -532,11 +828,11 @@ def load_config(args) -> dict:
     return config
 
 
-def setup_and_run(server: str, token: str, project_root: str = "."):
+def setup_and_run(server: str, token: str, project_root: str = ".", user_id: str = ""):
     """One-liner setup: save config and start daemon immediately.
 
     Called via:
-        pip install veilguard-client && veilguard --setup wss://server/ws/client --token abc123
+        pip install veilguard-client && veilguard --setup wss://server/ws/client --token abc123 --user-id u123
     Or the combined one-liner the cloud UI generates.
     """
     import platform
@@ -551,6 +847,7 @@ def setup_and_run(server: str, token: str, project_root: str = "."):
     config = {
         "server": server,
         "token": token,
+        "user_id": user_id,
         "client_id": client_id,
         "project_root": project_root,
         "timeout": 60,
@@ -584,13 +881,18 @@ def main():
         description="Veilguard Client Daemon — local tool execution for cloud Veilguard",
         epilog="Quick start: veilguard --setup wss://your-server/ws/client --token YOUR_TOKEN",
     )
+    parser.add_argument("--version", action="version",
+                        version=f"Veilguard Client {__version__}")
     parser.add_argument("--setup", metavar="SERVER_URL",
                         help="One-step setup: save config to ~/.veilguard/ and start daemon")
     parser.add_argument("--server", help="WebSocket server URL")
     parser.add_argument("--token", help="Auth token")
+    parser.add_argument("--user-id", dest="user_id", help="LibreChat user ID (from QR code)")
     parser.add_argument("--client-id", dest="client_id", help="Client identifier")
     parser.add_argument("--project-root", dest="project_root", help="Project root directory")
     parser.add_argument("--config", help="Config file path (default: ~/.veilguard/config.yaml)")
+    parser.add_argument("--no-auto-update", action="store_true",
+                        help="Disable auto-update check (for development)")
     args = parser.parse_args()
 
     # Quick setup mode
@@ -598,6 +900,7 @@ def main():
         setup_and_run(
             server=args.setup,
             token=args.token or "",
+            user_id=args.user_id or "",
             project_root=args.project_root or ".",
         )
         return
@@ -610,6 +913,9 @@ def main():
             args.config = home_config
 
     config = load_config(args)
+
+    if args.no_auto_update:
+        config["auto_update"] = False
 
     # If no token configured (and no CLI override), launch setup UI
     if not config.get("token"):
