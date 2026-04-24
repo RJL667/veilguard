@@ -81,16 +81,50 @@ async def call_llm(
 
     call_start = time.time()
 
-    # Inherit parent conversation id so sub-agent LLM calls land in the
-    # SAME TCMM namespace as the parent chat instead of each spawning
-    # a fresh `new-<userid>-XXX` namespace. Without this, every
+    # Inherit parent conversation id AND user id so sub-agent LLM calls
+    # land in the SAME TCMM namespace as the parent chat instead of each
+    # spawning a fresh `new-<userid>-XXX` namespace. Without this, every
     # spawn_agent / spawn_agentic / coordinate call fragments memory:
     # tool calls + results get scattered across unrelated namespaces,
     # temporal chains are broken, and the semantic linker has nothing
-    # to link across. The x-conversation-id middleware in server.py
-    # captured this into state.active_conversation_id — we just have
-    # to forward it.
-    active_cid = getattr(state, "active_conversation_id", "") or ""
+    # to link across. Worse, without user_id every block archived
+    # against the sub-agent's conversation lands with user_id="" — a
+    # multi-tenancy bug (two users' sub-agents would share a namespace).
+    #
+    # The server.py middleware captured both into state.active_*
+    # (legacy) and the request_ctx contextvars. Prefer the contextvars
+    # — they're per-request and race-safe. Fall back to the state
+    # global so in-flight tests without middleware still work.
+    from core.request_ctx import (
+        get_user_id,
+        get_effective_conversation_id,
+        get_lineage_parent_conv,
+    )
+    # ``get_effective_conversation_id`` prefers the spawned child cid
+    # over the LibreChat parent cid — so sub-agent LLM iterations land
+    # in their own namespace (``sub-<parent16>-<uuid8>``) instead of
+    # blending invisibly into the parent's archive. Legacy fallback
+    # to the state global for the edge case where the middleware
+    # hasn't run yet.
+    active_cid = get_effective_conversation_id() or getattr(state, "active_conversation_id", "") or ""
+    active_uid = get_user_id() or ""
+    lineage_parent = get_lineage_parent_conv() or ""
+
+    # Build the metadata block used for TCMM tenancy + conversation
+    # scoping. Emitted whenever ANY id is known — the PII proxy reads:
+    # conversation_id for namespace routing, user_id for pii_audit +
+    # TCMM multi-tenancy, lineage_parent_conv so TCMM can wire the
+    # child's first block to the parent's latest aid. The proxy strips
+    # conversation_id + lineage_parent_conv before forwarding to
+    # Anthropic (rejects unknown metadata fields); user_id is native
+    # Anthropic metadata so it stays.
+    tcmm_meta = {}
+    if active_cid:
+        tcmm_meta["conversation_id"] = active_cid
+    if active_uid:
+        tcmm_meta["user_id"] = active_uid
+    if lineage_parent:
+        tcmm_meta["lineage_parent_conv"] = lineage_parent
 
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -107,8 +141,8 @@ async def call_llm(
                     "system": effective_prompt,
                     "messages": [{"role": "user", "content": user_message}],
                 }
-                if active_cid:
-                    payload["metadata"] = {"conversation_id": active_cid}
+                if tcmm_meta:
+                    payload["metadata"] = dict(tcmm_meta)
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
                     _track_error(backend_name, role)
@@ -130,8 +164,8 @@ async def call_llm(
                     "temperature": temperature,
                     "max_tokens": 4096,
                 }
-                if active_cid:
-                    payload["metadata"] = {"conversation_id": active_cid}
+                if tcmm_meta:
+                    payload["metadata"] = dict(tcmm_meta)
                 response = await client.post(url, json=payload, headers=headers)
                 if response.status_code != 200:
                     _track_error(backend_name, role)
@@ -192,8 +226,25 @@ async def call_llm_with_tools(
     if not api_key:
         return [{"type": "text", "text": f"Error: No API key for {backend}"}], "error"
 
-    # Inherit parent conversation id — see call_llm() above for rationale.
-    active_cid = getattr(state, "active_conversation_id", "") or ""
+    # Inherit parent conversation id + user id — see call_llm() above
+    # for rationale. ``get_effective_conversation_id`` prefers a
+    # spawned child cid when one is set (sub-agent isolation), else
+    # falls back to the LibreChat parent cid.
+    from core.request_ctx import (
+        get_user_id,
+        get_effective_conversation_id,
+        get_lineage_parent_conv,
+    )
+    active_cid = get_effective_conversation_id() or getattr(state, "active_conversation_id", "") or ""
+    active_uid = get_user_id() or ""
+    lineage_parent = get_lineage_parent_conv() or ""
+    tcmm_meta = {}
+    if active_cid:
+        tcmm_meta["conversation_id"] = active_cid
+    if active_uid:
+        tcmm_meta["user_id"] = active_uid
+    if lineage_parent:
+        tcmm_meta["lineage_parent_conv"] = lineage_parent
 
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -210,8 +261,8 @@ async def call_llm_with_tools(
                     "messages": messages,
                     "tools": tools,
                 }
-                if active_cid:
-                    payload["metadata"] = {"conversation_id": active_cid}
+                if tcmm_meta:
+                    payload["metadata"] = dict(tcmm_meta)
                 resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code != 200:
                     return [{"type": "text", "text": f"API error {resp.status_code}: {resp.text[:300]}"}], "error"
@@ -248,8 +299,8 @@ async def call_llm_with_tools(
                     "tools": oai_tools if oai_tools else None,
                     "max_tokens": 4096,
                 }
-                if active_cid:
-                    payload["metadata"] = {"conversation_id": active_cid}
+                if tcmm_meta:
+                    payload["metadata"] = dict(tcmm_meta)
                 resp = await client.post(url, json=payload, headers=headers)
                 if resp.status_code != 200:
                     return [{"type": "text", "text": f"API error {resp.status_code}: {resp.text[:300]}"}], "error"

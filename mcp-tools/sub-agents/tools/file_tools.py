@@ -64,10 +64,20 @@ def register(mcp):
 
     @mcp.tool()
     async def run_command(command: str) -> str:
-        """Run a shell command on the host. Dangerous commands are blocked.
+        """Run a shell command on the user's local machine via their client daemon.
+
+        IMPORTANT: The shell is the user's native OS shell — could be
+        Windows CMD, macOS zsh, or Linux bash. The first result includes
+        a `[Host: ...]` hint identifying the platform; match your command
+        syntax to that. If you haven't seen the hint yet, prefer
+        platform-neutral commands or probe first:
+          - Windows CMD: `cd` (current dir), `dir` (list), `echo %OS%`
+          - Unix/macOS:  `pwd`, `ls -la`, `uname -a`
+        Avoid Unix-only commands like `pwd`/`ls -la` on an unknown host —
+        they fail on Windows. Dangerous commands are blocked. Max 30s.
 
         Args:
-            command: Shell command to execute (max 30s timeout)
+            command: Shell command to execute
         """
         return await handle_tool("run_command", {"command": command})
 

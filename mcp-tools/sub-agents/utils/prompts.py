@@ -42,8 +42,14 @@ TOKEN_COSTS = {
     "gemini-2.5-pro": {"input": 0.00125, "output": 0.005},
     "gemini-3-pro-preview": {"input": 0.00125, "output": 0.005},
     "gemini-3-flash-preview": {"input": 0.00015, "output": 0.0006},
-    "claude-sonnet-4-6": {"input": 0.003, "output": 0.015},
-    "claude-opus-4": {"input": 0.015, "output": 0.075},
+    # Claude model lineup matches librechat.yaml + config.py PLAN_MODELS.
+    # ``claude-opus-4-7-1m`` is the same weights as ``claude-opus-4-7``
+    # (pii-proxy aliases it + adds the 1M beta header) so we price it
+    # identically.
+    "claude-haiku-4-5":     {"input": 0.0008, "output": 0.004},
+    "claude-sonnet-4-6":    {"input": 0.003,  "output": 0.015},
+    "claude-opus-4-7":      {"input": 0.015,  "output": 0.075},
+    "claude-opus-4-7-1m":   {"input": 0.015,  "output": 0.075},
 }
 
 

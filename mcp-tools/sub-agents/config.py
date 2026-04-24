@@ -37,7 +37,15 @@ BACKENDS = {
 }
 
 DEFAULT_MODEL = BACKENDS[DEFAULT_BACKEND]["default_model"]
-PLAN_MODELS = {"gemini": "gemini-2.5-pro", "claude": "claude-opus-4"}
+# Planner / reasoning-heavy model per backend.  ``claude-opus-4`` used
+# to live here but Anthropic never shipped that exact alias —
+# requests against it 404 with
+# ``{"type":"not_found_error","message":"model: claude-opus-4..."}``.
+# Sub-agents' spawn_agentic planner crashed with "model error" as a
+# result.  Latest Opus is ``claude-opus-4-7``.  Keep this list aligned
+# with the canonical model set declared in
+# librechat.yaml::endpoints.anthropic.models.
+PLAN_MODELS = {"gemini": "gemini-2.5-pro", "claude": "claude-opus-4-7"}
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 

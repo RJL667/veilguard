@@ -61,10 +61,24 @@ async def handle_tool(name: str, args: dict) -> str:
     import server as _srv
     if not getattr(_srv, "LOCAL_MODE", True) and is_client_tool(name):
         from core.client_bridge import get_bridge
-        bridge = get_bridge()
+        from core.request_ctx import get_user_id
+        # Per-user routing: each LibreChat user's tool calls only reach
+        # their own registered client daemon.  Without this, whoever's
+        # daemon connected last would receive every user's tool calls.
+        user_id = get_user_id()
+        bridge = get_bridge(user_id)
         if bridge and bridge.connected:
             return await bridge.execute_remote(name, args)
-        return "Error: No client daemon connected. Start the Veilguard client daemon."
+        if not user_id:
+            return (
+                "Error: No user context — MCP request missing x-user-id "
+                "header. Reconnect LibreChat so it forwards user identity."
+            )
+        return (
+            "Error: No client daemon connected for this user. "
+            "Install and start the Veilguard client daemon from the "
+            "LibreChat Cowork panel."
+        )
 
     # Local execution (--local mode or cloud-only tools)
     try:
@@ -186,16 +200,16 @@ async def handle_tool(name: str, args: dict) -> str:
             return out or "(no output)"
 
         elif name == "web_search":
-            from urllib.parse import quote_plus
-            safe_query = quote_plus(args.get("query", ""))
-            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-                resp = await client.get(f"https://lite.duckduckgo.com/lite/?q={safe_query}", headers={"User-Agent": "Veilguard-Agent/1.0"})
-                text = resp.text[:3000]
-                text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL)
-                text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
-                text = re.sub(r'<[^>]+>', ' ', text)
-                text = re.sub(r'\s+', ' ', text).strip()
-                return f"Web search results:\n\n{text[:2000]}"
+            # Vertex AI google_search grounding — same backend as the
+            # `web` MCP's google_search tool.  Auth via ADC (VM's SA).
+            # Cloud-side so the agent can search even when the user's
+            # client daemon isn't connected (web search doesn't need
+            # anything local).  Previous DuckDuckGo scrape returned
+            # raw HTML noise; Vertex returns structured citations.
+            from utils.vertex_search import vertex_grounded_search
+            query = args.get("query", "")
+            n = min(int(args.get("num_results", 8) or 8), 10)
+            return await vertex_grounded_search(query, n)
 
         elif name == "web_fetch":
             url = args.get("url", "")
@@ -241,8 +255,15 @@ async def handle_tool(name: str, args: dict) -> str:
         else:
             return f"Unknown tool: {name}"
     except Exception as e:
-        logger.error(f"Tool {name} error: {e}")
-        return f"Error executing {name}: {e}"
+        # ``str(e)`` is empty for some exception types (httpx.ReadTimeout,
+        # certain asyncio cancellations). Emit the class name + repr so
+        # the log is actionable instead of ``Tool web_fetch error:``
+        # with nothing after the colon. Same on the returned string so
+        # the agentic loop's next turn can reason about what failed.
+        err_class = type(e).__name__
+        err_detail = str(e) or repr(e) or "no detail"
+        logger.error(f"Tool {name} error ({err_class}): {err_detail}", exc_info=True)
+        return f"Error executing {name}: [{err_class}] {err_detail}"
 
 
 async def agentic_loop(
@@ -294,6 +315,45 @@ async def agentic_loop(
             result = await handle_tool(tc["name"], tc.get("input", {}))
             tool_results.append({"type": "tool_result", "tool_use_id": tc["id"], "content": result[:3000]})
         messages.append({"role": "user", "content": tool_results})
+
+    # If we exited via max_turns exhaustion while the last turn was
+    # still calling tools, the assistant never got a chance to write
+    # the final synthesis — the for-loop just walked off the end with
+    # `tool_use` still pending. That's why the 22 Apr Mexican-gov run
+    # had all four workers return "(Agent produced no text output)"
+    # despite each having made 10+ grounded web_search/web_fetch
+    # calls whose results were safely archived by TCMM. Fix: force ONE
+    # synthesis turn with tools=[] so the model MUST return text.
+    if stop_reason == "tool_use" and tool_calls and len(transcript) >= max_turns:
+        logger.info(
+            f"Agentic hit max_turns={max_turns} mid-tool-use — "
+            f"forcing synthesis turn (tool_calls={[tc['name'] for tc in tool_calls]})"
+        )
+        # Append the pending assistant+tool_results so the model sees
+        # everything it already learned before being asked to answer.
+        messages.append({"role": "assistant", "content": content_blocks})
+        tool_results = []
+        for tc in tool_calls:
+            result = await handle_tool(tc["name"], tc.get("input", {}))
+            tool_results.append({"type": "tool_result", "tool_use_id": tc["id"], "content": result[:3000]})
+        messages.append({"role": "user", "content": tool_results})
+        messages.append({
+            "role": "user",
+            "content": (
+                "You've reached the tool-turn limit. Using everything the tools "
+                "returned above, write the final answer now — no more tool calls."
+            ),
+        })
+        try:
+            synth_blocks, _synth_stop = await call_llm_with_tools(
+                system_prompt, messages, tools=[], backend=backend, model=model,
+            )
+            for block in synth_blocks:
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    all_text.append(block["text"])
+            transcript.append({"turn": "synth", "tools": ["final-answer"]})
+        except Exception as e:
+            logger.warning(f"synthesis turn failed: {type(e).__name__}: {e}")
 
     output = "\n\n".join(all_text) if all_text else "(Agent produced no text output)"
     turn_summary = ", ".join(f"T{t['turn']}:{'+'.join(t['tools']) or 'text'}" for t in transcript)
