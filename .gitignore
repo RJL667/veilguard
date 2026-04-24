@@ -42,3 +42,59 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# One-off diagnostic / audit / benchmark scripts at repo root.
+# These are scratch tools created during incident response or data
+# audits — checked into laptop history via the shell, not source control.
+# Anything worth keeping gets promoted to scripts/ or tools/ with a
+# proper entry point.
+/audit_*.py
+/backfill_*.py
+/bench_*.py
+/check_*.py
+/classify_backfill*.py
+/cleanup_*.py
+/compact_*.py
+/damage_*.py
+/dedupe_*.py
+/delete_*.py
+/e2e_*.py
+/emb_types.py
+/embeddings_inspect.py
+/final_user_check.py
+/find_ref_in_all_cols.py
+/fix_recallable_flags.py
+/hunt_*.py
+/inspect_*.py
+/investigate_*.py
+/per_user_stats.py
+/pii_audit_health.py
+/pii_empty_user_deep.py
+/purge_false_memory.py
+/reclassify_*.py
+/recover_sparse_archive.py
+/retrace_*.py
+/semantic_health_recallable.py
+/tcmm_counts.py
+/test_*.py
+/test_audit_write.sh
+/trace_*.py
+/verify_*.py
+/generate_health_report.py
+Veilguard_Health_Report_*.pdf
+
+# More scratch / one-off scripts at repo root
+/archive_coverage.py
+/clean_polluted_rows.py
+/debug-sarel.js
+/drop_vector_index.py
+/dump-archive.py
+/grant-user-capabilities.js
+/grant-user-permissions.js
+/mark-nonrecallable.py
+/profile_tcmm_*.sh
+/setup_lance_indices.py
+/tcmm_health_check.py
+/verify-endpoints.js
+/verify-new-user.js
+pii-proxy/migrate_audit_log.py
