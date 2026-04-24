@@ -15,18 +15,33 @@ interface:
   prompts: true
   bookmarks: true
   multiConvo: true
-  agents: true
+  # Agents and MCP server permissions are authored here because LibreChat
+  # reads interface.{agents,mcpServers} at api boot and seeds the USER +
+  # ADMIN role-permission documents from them (mapping in
+  # librechat-data-provider/permissions.ts:PERMISSION_TYPE_INTERFACE_FIELDS).
+  # Anything we set here survives container restarts; direct MongoDB
+  # edits on role docs get overwritten every boot.
+  agents:
+    use: true
+    create: true
+    share: true
+    public: true
+  mcpServers:
+    placeholder: "Configure your MCP servers..."
+    use: true
+    create: true
+    share: true
+    public: true
   webSearch: true
   fileSearch: true
   runCode: true
   temporaryChat: true
   temporaryChatRetention: 24
-  mcpServers:
-    placeholder: "Configure your MCP servers..."
 
-# Explicit role permissions (override LibreChat defaults so the
-# agent / MCP tool stack stays accessible for every user in this
-# tenant).
+# Registration is restricted to Avalear + Phishield employees.  Role
+# permissions are authored under `interface` above — LibreChat's schema
+# doesn't accept a top-level rolePermissions block (that was a LibreChat
+# 0.8.x ZodError — "Unrecognized key(s) in object").
 registration:
   socialLogins: []
   allowedDomains:
@@ -34,108 +49,37 @@ registration:
     - "phishield.com"
 
 endpoints:
-  custom:
-    - name: "Gemini"
-      apiKey: "${GOOGLE_API_KEY}"
-      baseURL: "http://pii-proxy:4000/gemini/v1beta/openai"
-      models:
-        default:
-          - "gemini-2.5-flash"
-          - "gemini-2.5-pro"
-          - "gemini-3-pro-preview"
-          - "gemini-3-flash-preview"
-        fetch: false
-      titleConvo: true
-      titleModel: "gemini-2.5-flash"
-      modelDisplayLabel: "Gemini"
-      promptPrefix: |
-        You are Veilguard, a Phishield AI cybersecurity assistant with access to tools.
-
-        # TONE & STYLE
-
-        - Be concise and direct. Lead with the answer, not the reasoning.
-        - Only use emojis if the user explicitly requests it.
-        - Do not add filler phrases ("Sure!", "Great question!", "I'd be happy to help!").
-        - Do not give time estimates or predictions.
-        - Do not add features, refactoring, or improvements beyond what was asked.
-        - Keep responses short. If you can say it in one sentence, don't use three.
-        - Use markdown for structure when helpful. Reference files as path:line_number.
-
-        # CORE RULES
-
-        1. For normal conversation, questions, and information sharing — just respond naturally. Do NOT use tools.
-        2. Only use tools when the user explicitly asks you to DO something: read a file, run a command, search, write code, investigate.
-        3. When the user gives you information ("My name is...", "We detected an incident...") — acknowledge it and respond. Do NOT call scratchpad_write or any tool.
-        4. If asked about code, files, or data — use read_file to check before answering.
-        5. If asked to change something — use edit_file or write_file.
-        6. If asked to run something — use run_command.
-
-        # WHEN TO USE DIRECT TOOLS (no agent needed)
-
-        Use these for single, quick operations:
-        - read_file: Read any file. Use FIRST before answering questions about code.
-        - write_file: Create new files or full rewrites.
-        - edit_file: Change specific parts of existing files. Read first to get exact strings.
-        - search_files: Find files by name/pattern (glob). Use when you don't know the path.
-        - grep: Search file contents for code, strings, patterns.
-        - run_command: Execute shell commands (dir, git, python, npm, etc.)
-        - web_search: Look up current information, CVEs, threat intel.
-        - web_fetch: Read a specific URL or documentation page.
-
-        # WHEN TO SPAWN AGENTS (for complex work)
-
-        Use agents when the task requires reasoning, multiple steps, or specialist knowledge:
-        - spawn_agent(task, role="threat"): Single focused task delegated to a specialist.
-          Roles: analyst, threat, writer, coder, researcher, critic, verify, security, explore, planner
-        - spawn_agentic(task, role, effort="high"): Agent that iterates with tools — reads files, searches, then answers. Use for investigation/research tasks.
-        - coordinate(goal): Complex goals needing 2-5 parallel specialists. Auto-plans, executes, reconciles.
-        - pipeline(steps): Sequential chain — step 1 output feeds step 2. Use for workflows.
-        - run_playbook(name, context): Pre-built workflows:
-          * "apt-investigation" — Full APT assessment (4 workers)
-          * "phishing-triage" — Email analysis (3 workers)
-          * "vulnerability-assessment" — Vuln review (3 workers)
-
-        # DECISION TREE
-
-        User asks a question about their code/files?
-          → read_file to check, then answer
-        User asks you to modify code?
-          → read_file first, then edit_file
-        User asks about current threats, CVEs, news?
-          → web_search, then summarize
-        User asks for analysis of an incident?
-          → spawn_agent(task, role="threat") or coordinate(goal) for full assessment
-        User asks for a report or document?
-          → spawn_agent(task, role="writer") or coordinate for multi-source report
-        User asks to investigate something complex?
-          → spawn_agentic(task, role="researcher", effort="high") — it will use tools iteratively
-        User asks to monitor something ongoing?
-          → start_daemon(name, task, interval_minutes)
-        User gives multiple independent tasks?
-          → start_parallel_tasks([...]) then wait_for_tasks(ids)
-        Not sure which tool?
-          → tool_search("keyword")
-
-        # SKILLS (load with spawn_agent skill="name")
-        - phishing-triage: Phishing email analysis checklist
-        - incident-response: NIST IR framework
-        - threat-intel: MITRE ATT&CK structured reporting
-
-        # IMPORTANT
-        - NEVER spawn an agent just to read a file — use read_file directly.
-        - NEVER ask the user to copy/paste code — write it with write_file or edit_file.
-        - NEVER say "I can't access files" — you CAN, use read_file.
-        - Use memory=True on spawn_agent/coordinate to recall past incidents.
-        - Prefer gemini backend for speed, claude backend for complex reasoning.
-
+  # Claude-only tenant.  Gemini + OpenAI + Google built-ins disabled.
+  # All traffic routes through pii-proxy which strips PII before
+  # forwarding to api.anthropic.com (baseURL below) — same pattern the
+  # previous Gemini custom endpoint used.
+  # LibreChat's anthropic-endpoint schema is narrow: only
+  # streamRate/baseURL/title*/maxToolResultChars from baseEndpointSchema
+  # plus ``vertex`` and ``models: array<string>``.  Fields like
+  # ``disabled``, ``apiKey``, ``modelDisplayLabel``, ``promptPrefix``,
+  # or the ``{default, fetch}`` custom-endpoint shape raise Zod errors
+  # on boot and crash the container.  API key comes from
+  # ANTHROPIC_API_KEY in .env; Veilguard system prompt lives on the
+  # Agents endpoint / per-Agent presets in the UI.
   anthropic:
-    disabled: false
-  openAI:
-    disabled: true
-  google:
-    disabled: true
-  assistants:
-    disabled: true
+    baseURL: "http://pii-proxy:4000/anthropic"
+    # Order here drives the dropdown order in LibreChat.
+    # "claude-opus-4-7-1m" is a synthetic ID the pii-proxy rewrites to
+    # "claude-opus-4-7" + ``context-1m-2025-08-07`` beta header —
+    # same weights, 1M-token context window.
+    models:
+      - "claude-opus-4-7"
+      - "claude-opus-4-7-1m"
+      - "claude-sonnet-4-6"
+      - "claude-haiku-4-5"
+    titleConvo: true
+    titleModel: "claude-haiku-4-5"
+
+  # OpenAI / Google / Assistants not declared → LibreChat won't render
+  # them.  (The previous ``disabled: true`` pattern was accepted by
+  # older schemas but is no-op on anthropicEndpointSchema and adds
+  # noise on the other built-ins.  Leaving a key off is the supported
+  # way to hide it.)
 
   # Agents endpoint: LibreChat's built-in tool-using runtime. This is
   # what exposes MCP server tools in the UI — without it, the tool
@@ -145,6 +89,16 @@ endpoints:
   # documents/image MCP servers.
   agents:
     disableBuilder: false
+    # LangGraph recursion cap — each node transition (LLM call OR tool
+    # invocation) counts as 1 step, so 1 tool-use round-trip = ~2 steps.
+    # Default 50 = ~25 tool iterations; observed 23 Apr 2026 hitting
+    # GRAPH_RECURSION_LIMIT on a normal dev run that chained grep +
+    # run_command + edit across multiple files. Bump to 150 (~75
+    # iterations) for headroom on agentic research flows. Keep
+    # maxRecursionLimit as a hard safety cap so a buggy agent can't
+    # infinite-loop and melt the bill.
+    recursionLimit: 150
+    maxRecursionLimit: 250
     capabilities:
       - "execute_code"
       - "file_search"
@@ -166,11 +120,15 @@ mcpServers:
     url: "http://host.docker.internal:8809/sse"
     headers:
       x-conversation-id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      x-user-id: "{{LIBRECHAT_USER_ID}}"
 
   # Forge: dynamic tool creation
   forge:
     type: sse
     url: "http://host.docker.internal:8810/sse"
+    headers:
+      x-conversation-id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      x-user-id: "{{LIBRECHAT_USER_ID}}"
 
   # Documents: PDF, DOCX, XLSX, PPTX (no overlap with sub-agents)
   documents:
@@ -185,3 +143,15 @@ mcpServers:
     command: python
     args:
       - "/app/mcp-tools/image/server.py"
+
+  # Web: Google Custom Search + URL fetching + HTML-to-markdown.
+  # Uses GOOGLE_CSE_KEY + GOOGLE_CSE_ID from .env — both live under the
+  # admin@phishield.com GCP project and Programmable Search Engine.
+  # Stdio spawn (like documents/image) — lives inside the LibreChat
+  # container so the Agents endpoint can dispatch google_search alongside
+  # the other MCP tools.
+  web:
+    type: stdio
+    command: python
+    args:
+      - "/app/mcp-tools/web/server.py"
