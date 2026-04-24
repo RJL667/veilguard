@@ -130,19 +130,19 @@ def register_user_token(user_id: str, regenerate: bool = False) -> str:
 def validate_token(user_id: str, token: str) -> bool:
     """Constant-time check that ``token`` matches ``user_id``'s record.
 
-    Falls back to the legacy shared ``CLIENT_TOKEN`` env var so already-
-    deployed daemons keep working during the rollout.  Once every daemon
-    has been reinstalled with per-user tokens, remove the fallback.
+    The legacy ``CLIENT_TOKEN`` env-var fallback was removed on
+    2026-04-24 as part of the spear-phish incident response: it authed
+    any ``user_id`` absent from ``.client-tokens.json`` against a single
+    shared secret, which meant one leaked value gave impersonation
+    across every not-yet-registered identity. Per-user tokens are the
+    only path now; unknown user_ids fail closed.
     """
     if not user_id or not token:
         return False
     expected = get_user_token(user_id)
-    if expected is not None:
-        return hmac.compare_digest(expected, token)
-    legacy = os.environ.get("CLIENT_TOKEN", "")
-    if legacy:
-        return hmac.compare_digest(legacy, token)
-    return False
+    if expected is None:
+        return False
+    return hmac.compare_digest(expected, token)
 
 
 def revoke_user_token(user_id: str) -> None:

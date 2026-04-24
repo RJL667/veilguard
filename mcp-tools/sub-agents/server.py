@@ -190,18 +190,68 @@ if __name__ == "__main__":
         )
         import json as _json
 
-        # Legacy shared CLIENT_TOKEN kept for backward-compat during
-        # rollout. Per-user tokens (core/client_bridge.register_user_token)
-        # supersede it. Can be removed once every daemon reinstalls.
-        CLIENT_TOKEN = os.environ.get("CLIENT_TOKEN", "")
+        # Legacy shared CLIENT_TOKEN removed 2026-04-24 as part of the
+        # spear-phish incident response: validate_token used to fall back
+        # to this env var for any user_id absent from .client-tokens.json,
+        # which meant a single leaked secret authed as any fake user_id.
+        # Per-user tokens (core/client_bridge.register_user_token) are the
+        # only auth path now. Retained as an empty string so references
+        # elsewhere (if any) don't NameError during the rollout.
+        CLIENT_TOKEN = ""
+
+        # --- Internal-secret gate for /api/client/* (except /latest) ----
+        # All client-admin routes (status, install, register, folders,
+        # browse) must carry ``X-Internal-Secret`` matching the env var
+        # ``VEILGUARD_INTERNAL_SECRET``. The only legitimate caller is
+        # LibreChat's server-side proxy (api/server/routes/veilguardClient.js),
+        # which injects the header after requireJwtAuth validates the
+        # user. Caddy already blocks these paths from the public domain
+        # (2026-04-24 Caddyfile lockdown); this check is defense-in-depth
+        # for docker-bridge callers and for any future re-expose.
+        # /api/client/latest and /download/* deliberately skip this check
+        # because un-authenticated daemons poll them for update manifests
+        # and installer binaries.
+        import hmac as _hmac_internal
+        _INTERNAL_SECRET = os.environ.get("VEILGUARD_INTERNAL_SECRET", "")
+        if not _INTERNAL_SECRET:
+            logger.error(
+                "VEILGUARD_INTERNAL_SECRET is unset. /api/client/* routes "
+                "will reject every request with 503 until the env var is "
+                "configured. Set it in .env and restart sub-agents."
+            )
+
+        def _check_internal_secret(request):
+            """Return a JSONResponse rejecting the request, or None to pass.
+
+            Fails closed when ``VEILGUARD_INTERNAL_SECRET`` is unset so a
+            misconfigured server can't accidentally serve unauthenticated
+            traffic. Uses constant-time compare to avoid timing side
+            channels on header inspection.
+            """
+            if not _INTERNAL_SECRET:
+                return JSONResponse(
+                    {"error": "server misconfigured: VEILGUARD_INTERNAL_SECRET unset"},
+                    status_code=503,
+                )
+            got = request.headers.get("x-internal-secret", "")
+            if not _hmac_internal.compare_digest(got, _INTERNAL_SECRET):
+                return JSONResponse(
+                    {"error": "unauthorized"}, status_code=401,
+                )
+            return None
 
         def _request_user_id(request) -> str:
-            """Extract x-user-id from a request (falls back to contextvar)."""
-            uid = request.headers.get("x-user-id", "")
-            if not uid:
-                from core.request_ctx import get_user_id
-                uid = get_user_id()
-            return uid
+            """Extract x-user-id from a trusted caller's request.
+
+            The contextvar fallback that previously resolved a missing
+            header was removed 2026-04-24 — it leaked the most recent
+            MCP-session user across unrelated HTTP requests, allowing a
+            ``curl /api/client/register`` with no headers to receive the
+            last-active LibreChat user's client token. Callers (i.e.
+            LibreChat's veilguardClient.js proxy) must now set the
+            header explicitly after authenticating the session.
+            """
+            return request.headers.get("x-user-id", "")
 
         def _public_ws_url(request) -> str:
             """Build the daemon-facing WebSocket URL.
@@ -238,6 +288,9 @@ if __name__ == "__main__":
 
         async def api_client_install(request):
             """Return the daemon installer URL for the calling user."""
+            rej = _check_internal_secret(request)
+            if rej is not None:
+                return rej
             return JSONResponse({
                 "download_url": _public_download_url(request),
                 "ws_url": _public_ws_url(request),
@@ -247,10 +300,16 @@ if __name__ == "__main__":
             """Mint (or return) a per-user install token for the calling user.
 
             Called by the LibreChat Cowork panel once the user is
-            authenticated. LibreChat forwards the user's id as
-            ``x-user-id`` so we know whose token to mint. The QR / paste
-            payload rendered in the panel embeds the returned fields.
+            authenticated. LibreChat's veilguardClient.js proxy injects
+            two headers after requireJwtAuth validates the session:
+              - ``X-Internal-Secret``: shared secret with this service
+              - ``x-user-id``: the JWT subject (req.user.id)
+            Missing either header => 401. The QR / paste payload rendered
+            in the panel embeds the returned fields.
             """
+            rej = _check_internal_secret(request)
+            if rej is not None:
+                return rej
             user_id = _request_user_id(request)
             if not user_id:
                 return JSONResponse(
@@ -385,6 +444,9 @@ if __name__ == "__main__":
 
         async def api_client_status(request):
             """Client daemon connection status for the calling user."""
+            rej = _check_internal_secret(request)
+            if rej is not None:
+                return rej
             user_id = _request_user_id(request)
             if not user_id:
                 return JSONResponse(
@@ -403,6 +465,9 @@ if __name__ == "__main__":
 
         async def api_client_folders(request):
             """Get or set working folders on the calling user's daemon."""
+            rej = _check_internal_secret(request)
+            if rej is not None:
+                return rej
             user_id = _request_user_id(request)
             if not user_id:
                 return JSONResponse(
@@ -425,6 +490,9 @@ if __name__ == "__main__":
 
         async def api_client_browse(request):
             """Browse directories on the calling user's daemon."""
+            rej = _check_internal_secret(request)
+            if rej is not None:
+                return rej
             user_id = _request_user_id(request)
             if not user_id:
                 return JSONResponse(

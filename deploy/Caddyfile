@@ -1,0 +1,66 @@
+# Veilguard production - LibreChat on HTTPS + path-routed backends
+# Caddy auto-provisions a Let's Encrypt cert on first request to :443
+# and renews it automatically.
+
+veilguard.phishield.com {
+    encode gzip zstd
+
+    # Client daemon WebSocket (wss://veilguard.phishield.com/ws/client)
+    # Caddy passes Upgrade headers through reverse_proxy transparently;
+    # the handle block just scopes the route to this path.
+    handle /ws/client {
+        reverse_proxy localhost:8809
+    }
+
+    # --- SECURITY LOCKDOWN 2026-04-24 -----------------------------------
+    # TCMM (:8811) is reachable only through the Docker bridge from
+    # LibreChat + pii-proxy (TCMM_URL=http://172.17.0.1:8811). It must
+    # NEVER be proxied publicly: the service exposes unauthenticated
+    # routes like /api/memory_heatmap, /api/sessions, /debug_session/{id},
+    # /debug_persist, and write endpoints /pre_request, /post_response,
+    # /ingest_turn. Returning 404 at the edge is the cheapest stopgap
+    # until TCMM enforces a shared-secret header on every route.
+    handle /api/tcmm/* {
+        respond "Not Found" 404
+    }
+
+    # Sub-agents (:8809) is also docker-bridge-only for LibreChat's MCP
+    # calls. The only routes the browser/client-daemon legitimately hit
+    # via the public domain are:
+    #   GET /api/sub-agents/api/client/latest   (update manifest)
+    #   GET /api/sub-agents/download/<file>     (installer binaries)
+    # Everything else under /api/sub-agents/* - /api/client/register,
+    # /api/stats, /api/tasks, /api/teams, /api/scratchpad, /api/daemons,
+    # /api/client/folders|browse|status|install, /trigger/*, /sse -
+    # is blocked. /ws/client has its own handle block above.
+    handle /api/sub-agents/api/client/latest {
+        uri strip_prefix /api/sub-agents
+        reverse_proxy localhost:8809
+    }
+    handle /api/sub-agents/download/* {
+        uri strip_prefix /api/sub-agents
+        reverse_proxy localhost:8809
+    }
+    handle /api/sub-agents/* {
+        respond "Not Found" 404
+    }
+    # --------------------------------------------------------------------
+
+    # LibreChat websocket for streaming assistant responses needs
+    # long-lived connections; Caddy's default reverse_proxy handles
+    # WebSocket upgrade transparently.
+    reverse_proxy localhost:3080 {
+        # Surface the real client IP to LibreChat (for audit logs)
+        header_up X-Real-IP {remote_host}
+        # Long timeouts for streaming chat responses
+        transport http {
+            read_timeout 300s
+            write_timeout 300s
+        }
+    }
+
+    log {
+        output file /var/log/caddy/veilguard-access.log
+        format json
+    }
+}
