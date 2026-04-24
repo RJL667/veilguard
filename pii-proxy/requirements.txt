@@ -4,3 +4,8 @@ httpx==0.28.1
 presidio-analyzer==2.2.356
 presidio-anonymizer==2.2.356
 spacy==3.8.4
+# audit_db.py writes PII audit rows to the same Lance directory TCMM
+# uses.  Pin to the version TCMM runs on prod to avoid on-disk
+# format skew; upgrading either side requires bumping both.
+lancedb==0.30.2
+pyarrow>=15.0.0

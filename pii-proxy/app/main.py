@@ -57,15 +57,18 @@ if _AUDIT_ENABLED:
 
 
 def audit_log(direction: str, conv_id: str, content: str, extra: str = ""):
-    """Write to the PII audit log. direction: 'TO_LLM' or 'FROM_LLM'."""
+    """Write to the PII audit log. direction: 'TO_LLM' or 'FROM_LLM'.
+
+    No truncation — the full payload needs to land both here (for
+    tail -f debugging) and in the LanceDB audit table for replay /
+    query.  Previous 3000-char cap hid TCMM memory + tool histories.
+    """
     if _audit_logger:
-        # Truncate very long content for the log
-        truncated = content[:3000] + "..." if len(content) > 3000 else content
         _audit_logger.info(
             f"\n{'='*80}\n"
             f"[{direction}] conv={conv_id[:12] if conv_id else '?'} {extra}\n"
             f"{'─'*80}\n"
-            f"{truncated}\n"
+            f"{content}\n"
             f"{'='*80}"
         )
 
@@ -243,6 +246,7 @@ async def _tcmm_pre_request(
     conversation_id: str,
     user_id: str = "",
     origin: str = "user",
+    lineage_parent_conv: str = "",
 ) -> str | None:
     """Call TCMM service to get enriched prompt. Returns None on failure.
 
@@ -266,6 +270,14 @@ async def _tcmm_pre_request(
                     "conversation_id": conversation_id,
                     "user_id": user_id,
                     "origin": origin,
+                    # Sub-agent spawn lineage: when present, tells TCMM
+                    # "this conversation is a fork of <parent_conv>;
+                    # stamp lineage.parents[0] + lineage.root on my
+                    # first archive block". Empty for top-level
+                    # LibreChat turns. TCMM falls back to default
+                    # root-is-self if this is missing or the parent
+                    # namespace has no rows yet.
+                    "lineage_parent_conv": lineage_parent_conv,
                 },
             )
             if resp.status_code == 200:
@@ -299,6 +311,7 @@ async def _tcmm_post_response(
     conversation_id: str,
     user_id: str = "",
     origin: str = "assistant_text",
+    lineage_parent_conv: str = "",
 ) -> str | None:
     """Call TCMM service to process response. Returns clean answer or None on failure.
 
@@ -315,6 +328,7 @@ async def _tcmm_post_response(
                     "conversation_id": conversation_id,
                     "user_id": user_id,
                     "origin": origin,
+                    "lineage_parent_conv": lineage_parent_conv,
                 },
             )
             if resp.status_code == 200:
@@ -337,6 +351,7 @@ async def _tcmm_ingest_turn(
     items: list,
     conversation_id: str,
     user_id: str = "",
+    lineage_parent_conv: str = "",
 ) -> int:
     """Persist auxiliary turn items (tool_use / tool_result) into TCMM.
 
@@ -355,6 +370,7 @@ async def _tcmm_ingest_turn(
                     "conversation_id": conversation_id,
                     "user_id": user_id,
                     "items": items,
+                    "lineage_parent_conv": lineage_parent_conv,
                 },
             )
             if resp.status_code == 200:
@@ -544,7 +560,22 @@ def _is_anthropic_format(remaining_path: str) -> bool:
 # Minimum cacheable segment is ~1024 tokens (~4000 chars). Up to 4 markers
 # allowed. Any byte change in the cached prefix invalidates it.
 
-_MIN_CACHE_CHARS = 2500  # Apply marker aggressively; Anthropic itself gates below ~1024 tokens.
+_MIN_CACHE_CHARS = 9200  # ~2300 tokens. Empirically verified 23 Apr 2026
+# via binary-search against api.anthropic.com directly:
+#
+#   4508B (1127 tok) create=0 read=0    ← silently refused
+#   6758B (1689 tok) create=0 read=0    ← silently refused
+#   9008B (2252 tok) create=2205 read=0 ← first cache write succeeds
+#
+# So Sonnet-4.6's real minimum cacheable segment is ~2048 tokens, NOT the
+# ~1024 tokens quoted in public docs (which may apply to older Sonnet 3.x
+# models, or may have been raised silently). When ANY cache_control marker
+# sits below this threshold, Anthropic silently refuses to cache ANY marker
+# in the entire request — so you get `create=0 read=0` and every turn pays
+# full input cost instead of the 90%-discount cache_read rate. Was costing
+# us real money on every chat turn because the static Veilguard preamble
+# (5716B / 1430 tok) fell in the dead zone between published-doc-minimum
+# and actual-minimum. Preamble is now expanded to >9200B to clear the floor.
 
 
 def _split_for_cache(prompt: str, marker: str | None = None) -> tuple[str | None, str]:
@@ -564,6 +595,155 @@ def _split_for_cache(prompt: str, marker: str | None = None) -> tuple[str | None
     return (prompt[:idx], prompt[idx:])
 
 
+# Anthropic enforces a hard cap of 4 cache_control markers per request.
+# LibreChat itself already emits some (tool_use/tool_result blocks in
+# ongoing multi-turn conversations), and the TCMM split-cache path adds
+# one more on the system head.  We must count what exists before
+# adding any of our own, otherwise we blow past 4 and the API 400s
+# with "A maximum of 4 blocks with cache_control may be provided".
+_ANTHROPIC_CACHE_LIMIT = 4
+
+
+def _count_cache_markers(data: dict) -> int:
+    """Count cache_control markers already attached to system + messages."""
+    total = 0
+    system = data.get("system")
+    if isinstance(system, list):
+        for blk in system:
+            if isinstance(blk, dict) and "cache_control" in blk:
+                total += 1
+    messages = data.get("messages") or []
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                for blk in content:
+                    if isinstance(blk, dict) and "cache_control" in blk:
+                        total += 1
+    return total
+
+
+def _scrub_malformed_thinking(data: dict) -> int:
+    """Remove malformed extended-thinking content blocks before forwarding.
+
+    Anthropic's extended-thinking API rejects a request with
+    ``messages.N.content.M.thinking.thinking: Field required`` when an
+    assistant content block has ``{type: "thinking"}`` without its inner
+    ``thinking`` string (and ``signature`` is also required for echo-back
+    verification on multi-turn). Observed in two independent sessions:
+
+      22 Apr — Sarel, cursed conv bb400c87, 3 persisted blocks in MongoDB
+      23 Apr — Petrus, fresh new conv, mid-tool-round-trip
+
+    Upstream path handled the Mongo-stored case via the formatAgentMessages
+    patch in the LibreChat fork, but that function only runs at the initial
+    payload-to-LangGraph hydration. Mid-run AIMessages that LangGraph holds
+    in memory go through @langchain/anthropic's own serializer, which can
+    produce the same malformed shape without going near our patch. Scrubbing
+    here — at the last hop before Anthropic — catches every path.
+
+    Scrub logic: for each content block with ``type == "thinking"``, keep
+    it only when ``thinking`` is a non-empty string AND ``signature`` is
+    non-empty (both Anthropic requirements for cross-turn reuse). Drop
+    anything else silently. If removing the thinking block leaves the
+    parent ``content`` array empty (unlikely — usually there's also text
+    or tool_use siblings), the whole content is replaced with a single
+    placeholder text block so Anthropic doesn't reject an empty array.
+
+    Returns the number of blocks scrubbed.
+    """
+    scrubbed = 0
+
+    def _is_well_formed(blk):
+        if not isinstance(blk, dict):
+            return False
+        if blk.get("type") != "thinking":
+            return True  # we only police thinking blocks
+        thinking_text = blk.get("thinking")
+        signature = blk.get("signature")
+        return (
+            isinstance(thinking_text, str) and thinking_text.strip() != ""
+            and isinstance(signature, str) and signature != ""
+        )
+
+    messages = data.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            cleaned = []
+            for blk in content:
+                if _is_well_formed(blk):
+                    cleaned.append(blk)
+                else:
+                    scrubbed += 1
+            if len(cleaned) != len(content):
+                # Don't emit an empty content array — Anthropic 400s on
+                # that too. Put a single text placeholder so the turn
+                # still exists as a structural element.
+                if not cleaned:
+                    cleaned = [{
+                        "type": "text",
+                        "text": "[previous reasoning omitted]",
+                    }]
+                msg["content"] = cleaned
+
+    # Same defense on the system field — unusual for system to carry a
+    # thinking block, but belt-and-braces since we own this filter now.
+    system = data.get("system")
+    if isinstance(system, list):
+        cleaned_sys = []
+        for blk in system:
+            if _is_well_formed(blk):
+                cleaned_sys.append(blk)
+            else:
+                scrubbed += 1
+        if len(cleaned_sys) != len(system):
+            data["system"] = cleaned_sys
+
+    return scrubbed
+
+
+def _cap_cache_markers(data: dict, limit: int = _ANTHROPIC_CACHE_LIMIT) -> int:
+    """Enforce Anthropic's 4-marker limit — strip oldest message markers first.
+
+    Preserves system-field markers (largest cached prefix, highest
+    value) and the most recent message markers.  Walks ``messages`` in
+    chronological order, deleting ``cache_control`` keys until the total
+    marker count drops to ``limit``.
+
+    Returns the number of markers stripped.
+    """
+    total = _count_cache_markers(data)
+    if total <= limit:
+        return 0
+    stripped = 0
+    messages = data.get("messages") or []
+    if not isinstance(messages, list):
+        return 0
+    for msg in messages:
+        if total <= limit:
+            break
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if total <= limit:
+                break
+            if isinstance(blk, dict) and "cache_control" in blk:
+                del blk["cache_control"]
+                stripped += 1
+                total -= 1
+    return stripped
+
+
 def _apply_anthropic_cache(data: dict) -> int:
     """Add cache_control markers to the Anthropic request body.
 
@@ -573,37 +753,57 @@ def _apply_anthropic_cache(data: dict) -> int:
     so turn N+1's request (system_N+1 = system_N + new_block) shares the
     system_N prefix and will hit that cache entry if still within TTL.
 
-    Returns the number of cache_control markers added.
+    Never exceeds Anthropic's hard limit of 4 cache_control markers:
+    counts what's already present (from TCMM's split-cache setup in the
+    /chat handler, plus any tool_use/tool_result cache markers
+    LibreChat emitted) and stops adding once we'd cross the limit.
+
+    Returns the number of cache_control markers added by this call.
     """
     markers = 0
+    existing = _count_cache_markers(data)
+    budget = _ANTHROPIC_CACHE_LIMIT - existing
+    if budget <= 0:
+        return 0
 
     # 1. System message — cache the whole thing. Prefix matching across
     #    turns gives cache hits on the common prefix.
     system = data.get("system")
-    if isinstance(system, str) and len(system) >= _MIN_CACHE_CHARS:
+    if isinstance(system, str) and len(system) >= _MIN_CACHE_CHARS and budget > 0:
         data["system"] = [{
             "type": "text",
             "text": system,
             "cache_control": {"type": "ephemeral"},
         }]
         markers += 1
-    elif isinstance(system, list) and system:
-        # Already structured. Mark the last text block if the total is long enough.
-        total_len = sum(
-            len(b.get("text", "")) for b in system
-            if isinstance(b, dict) and b.get("type") == "text"
+        budget -= 1
+    elif isinstance(system, list) and system and budget > 0:
+        # Already structured. Skip entirely if ANY block is already
+        # marked — the TCMM /chat path carefully sets cache_control on
+        # the head block only, leaving the volatile tail uncached.
+        # Adding another marker here undoes that split AND eats into
+        # the cache-marker budget.
+        already_marked = any(
+            isinstance(b, dict) and "cache_control" in b for b in system
         )
-        if total_len >= _MIN_CACHE_CHARS:
-            for blk in reversed(system):
-                if isinstance(blk, dict) and blk.get("type") == "text":
-                    blk.setdefault("cache_control", {"type": "ephemeral"})
-                    markers += 1
-                    break
+        if not already_marked:
+            total_len = sum(
+                len(b.get("text", "")) for b in system
+                if isinstance(b, dict) and b.get("type") == "text"
+            )
+            if total_len >= _MIN_CACHE_CHARS:
+                for blk in reversed(system):
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        blk.setdefault("cache_control", {"type": "ephemeral"})
+                        markers += 1
+                        budget -= 1
+                        break
 
     # 2. Conversation history — cache everything up to (but not including)
-    #    the last user message. Only worth it if there are 3+ prior turns.
+    #    the last user message. Only worth it if there are 3+ prior turns
+    #    and we still have cache-marker budget.
     messages = data.get("messages") or []
-    if isinstance(messages, list) and len(messages) >= 4 and markers < 4:
+    if isinstance(messages, list) and len(messages) >= 4 and budget > 0:
         # Find the final user message; cache the message just before it.
         last_user_idx = -1
         for i in range(len(messages) - 1, -1, -1):
@@ -623,17 +823,25 @@ def _apply_anthropic_cache(data: dict) -> int:
                             "cache_control": {"type": "ephemeral"},
                         }]
                         markers += 1
+                        budget -= 1
                 elif isinstance(content, list) and content:
-                    total_len = sum(
-                        len(b.get("text", "")) for b in content
-                        if isinstance(b, dict) and b.get("type") == "text"
+                    # Skip if any block in this message is already marked
+                    # (LibreChat caches recent tool_use/tool_result).
+                    already_marked = any(
+                        isinstance(b, dict) and "cache_control" in b for b in content
                     )
-                    if total_len >= 200:
-                        for blk in reversed(content):
-                            if isinstance(blk, dict) and blk.get("type") == "text":
-                                blk.setdefault("cache_control", {"type": "ephemeral"})
-                                markers += 1
-                                break
+                    if not already_marked:
+                        total_len = sum(
+                            len(b.get("text", "")) for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                        if total_len >= 200:
+                            for blk in reversed(content):
+                                if isinstance(blk, dict) and blk.get("type") == "text":
+                                    blk.setdefault("cache_control", {"type": "ephemeral"})
+                                    markers += 1
+                                    budget -= 1
+                                    break
 
     return markers
 
@@ -669,14 +877,64 @@ def _strip_heatmap_from_text(text: str) -> str:
     return _HEATMAP_RE.sub('', text).strip()
 
 
+# Canonical Claude-only model lineup surfaced in LibreChat's dropdown.
+# ``claude-opus-4-7-1m`` is a synthetic alias: same weights as
+# claude-opus-4-7 but forwarded to Anthropic with the 1M-context beta
+# header (see _rewrite_claude_1m_alias below).
+VEILGUARD_CLAUDE_MODELS = [
+    "claude-opus-4-7",
+    "claude-opus-4-7-1m",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+]
+
+# Anthropic beta header that unlocks the 1M-token context window on
+# Opus 4.7.  Appended to the request's ``anthropic-beta`` header (if
+# any) when the synthetic ``-1m`` alias is used.
+CLAUDE_1M_BETA = "context-1m-2025-08-07"
+
+
+def _rewrite_claude_1m_alias(data: dict, headers: dict) -> None:
+    """Translate the synthetic claude-opus-4-7-1m alias.
+
+    LibreChat's model dropdown lists ``claude-opus-4-7-1m`` as a
+    separate entry so users can explicitly pick the 1M-context variant
+    (matches the Claude Code model selector).  Anthropic's API doesn't
+    know that ID — it's the same underlying model as ``claude-opus-4-7``
+    with a beta flag.  Before forwarding we rewrite the model ID and
+    merge ``CLAUDE_1M_BETA`` into the outgoing ``anthropic-beta``
+    header so downstream calls succeed.
+
+    Mutates ``data`` and ``headers`` in place.
+    """
+    model = data.get("model")
+    if not isinstance(model, str) or not model.endswith("-1m"):
+        return
+    if model != "claude-opus-4-7-1m":
+        return  # guard — only Opus 4.7 has a 1M variant for now
+    data["model"] = "claude-opus-4-7"
+    existing = headers.get("anthropic-beta") or headers.get("Anthropic-Beta") or ""
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    if CLAUDE_1M_BETA not in parts:
+        parts.append(CLAUDE_1M_BETA)
+    headers["anthropic-beta"] = ",".join(parts)
+    # Strip the alternate-casing variant so we don't double-send.
+    headers.pop("Anthropic-Beta", None)
+
+
 # Stub for Anthropic model listing — LibreChat calls this during auto-discovery
 @app.get("/anthropic/v1/models")
 async def anthropic_models():
     """Return available Anthropic models (stub for LibreChat model discovery)."""
     return {
         "data": [
-            {"id": "claude-sonnet-4-6", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
-            {"id": "claude-3-haiku-20240307", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
+            {
+                "id": mid,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "anthropic",
+            }
+            for mid in VEILGUARD_CLAUDE_MODELS
         ],
         "object": "list",
     }
@@ -692,51 +950,136 @@ async def health():
     }
 
 
+def _is_unsubstituted_placeholder(value: str) -> bool:
+    """Detect ``{{...}}`` template placeholders that upstream forgot to substitute.
+
+    LibreChat's MCP SSE transport and (in some code paths) its main
+    Anthropic client forward header/metadata values containing
+    ``{{LIBRECHAT_BODY_CONVERSATIONID}}`` / ``{{LIBRECHAT_USER_ID}}``
+    literally when ``processMCPEnv`` runs with an empty requestBody.
+    We treat those as absent so downstream TCMM namespaces and
+    ``pii_audit.user_id`` don't get a string full of braces as an
+    identifier — that's how you end up with a ``default`` tenant
+    accidentally holding another user's blocks.
+    """
+    return isinstance(value, str) and value.startswith("{{") and value.endswith("}}")
+
+
+def _clean_conv_id(value: str, skip: set) -> str:
+    """Return the value if it looks like a real conv id; ``""`` otherwise."""
+    if not value or value in skip or _is_unsubstituted_placeholder(value):
+        return ""
+    return value
+
+
 def extract_conversation_id(data: dict, headers: dict) -> str:
     """Extract conversation ID for TCMM session tracking.
 
     LibreChat sends conversationId="new" on the first message of a new chat.
     We skip that and fall through to generate a stable temporary ID.
     On the second message, LibreChat sends the real UUID.
+
+    Also rejects unsubstituted ``{{LIBRECHAT_BODY_...}}`` placeholders
+    (see ``_is_unsubstituted_placeholder``) at every lookup layer —
+    otherwise they leak into namespace/user_id and corrupt tenancy.
     """
     _skip = {"", "new", "null", "undefined", "None"}
 
     # 1. Explicit headers
-    conv_id = headers.get("x-conversation-id") or headers.get("x-request-id")
-    if conv_id and conv_id not in _skip:
+    conv_id = _clean_conv_id(
+        headers.get("x-conversation-id") or headers.get("x-request-id") or "",
+        _skip,
+    )
+    if conv_id:
         return conv_id
 
     # 2. From Anthropic metadata (LibreChat patched)
-    metadata = data.get("metadata", {})
-    conv_id = metadata.get("conversation_id", "")
-    if conv_id and conv_id not in _skip:
+    metadata = data.get("metadata", {}) or {}
+    conv_id = _clean_conv_id(metadata.get("conversation_id", ""), _skip)
+    if conv_id:
         return conv_id
 
     # 3. From request body
-    conv_id = data.get("conversationId") or data.get("conversation_id") or ""
-    if conv_id and conv_id not in _skip:
+    conv_id = _clean_conv_id(
+        data.get("conversationId") or data.get("conversation_id") or "",
+        _skip,
+    )
+    if conv_id:
         return conv_id
 
     # 4. parent_message_id (stable across the conversation)
-    parent_id = data.get("parentMessageId") or data.get("parent_message_id") or ""
-    if parent_id and parent_id not in _skip:
+    parent_id = _clean_conv_id(
+        data.get("parentMessageId") or data.get("parent_message_id") or "",
+        _skip,
+    )
+    if parent_id:
         return f"parent-{parent_id[:24]}"
 
-    # 5. Fallback: unique per request (isolates orphan first messages)
-    user_id = metadata.get("user_id", "")
+    # 5. Fallback: unique per request (isolates orphan first messages).
+    # Also sanitize user_id so we don't bake a placeholder into the
+    # fallback conv_id itself.
+    raw_user_id = metadata.get("user_id", "") or ""
+    user_id = "" if _is_unsubstituted_placeholder(raw_user_id) else raw_user_id
     if user_id:
         return f"new-{user_id[:16]}-{uuid.uuid4().hex[:8]}"
 
     return str(uuid.uuid4())
 
 
+def extract_user_id(data: dict, headers: dict) -> str:
+    """Extract the LibreChat user_id from a request, trying multiple sources.
+
+    LibreChat populates ``metadata.user_id`` only on some endpoints. First-
+    message requests and /chat/completions from certain flows may omit it,
+    leaving audit rows (and downstream TCMM namespaces) stamped with an
+    empty tenant. We fall back through:
+
+        1. headers['x-user-id']    — MCP/header convention
+        2. data.metadata.user_id   — LibreChat's patched Anthropic SDK
+        3. data.user_id / userId   — top-level body key (some endpoints)
+        4. data.metadata.user      — alternate LibreChat metadata shape
+        5. "" (empty)              — last resort
+
+    Unsubstituted ``{{LIBRECHAT_USER_ID}}`` template literals are stripped
+    at every layer so they never poison the audit log or TCMM namespace.
+    """
+    # 1. Explicit header (MCP convention)
+    h_uid = headers.get("x-user-id", "") or ""
+    if h_uid and not _is_unsubstituted_placeholder(h_uid):
+        return h_uid
+
+    # 2. Anthropic-metadata (LibreChat patched SDK)
+    metadata = data.get("metadata", {}) or {}
+    m_uid = metadata.get("user_id", "") or ""
+    if m_uid and not _is_unsubstituted_placeholder(m_uid):
+        return m_uid
+
+    # 3. Top-level body key (some LibreChat routes put it here)
+    for key in ("user_id", "userId", "user"):
+        b_uid = data.get(key, "")
+        # Skip if it's a dict (Anthropic "user" metadata block)
+        if isinstance(b_uid, str) and b_uid and not _is_unsubstituted_placeholder(b_uid):
+            return b_uid
+
+    # 4. Alternate metadata shape
+    alt = metadata.get("user", "")
+    if isinstance(alt, str) and alt and not _is_unsubstituted_placeholder(alt):
+        return alt
+
+    return ""
+
+
 def extract_pii_session_id(data: dict) -> str:
     """Extract PII session ID — always per-user so token mappings are consistent
     across all conversations for the same user. This ensures REF_PERSON_2 always
-    maps to the same person regardless of which conversation it appears in."""
-    metadata = data.get("metadata", {})
+    maps to the same person regardless of which conversation it appears in.
+
+    Rejects unsubstituted ``{{LIBRECHAT_USER_ID}}`` placeholders so
+    multiple users don't silently share the same ``pii-{{LIBRECHAT_``
+    session and cross-contaminate each other's redacted tokens."""
+    metadata = data.get("metadata", {}) or {}
     user_id = metadata.get("user_id", "")
-    if user_id:
+    if user_id and not _is_unsubstituted_placeholder(user_id):
         return f"pii-{user_id[:24]}"
     return "pii-default"
 
@@ -792,16 +1135,38 @@ async def gateway(request: Request, path: str):
         if "json" in content_type or body.strip()[:1] == b"{":
             try:
                 data = json.loads(body)
+                # Translate our synthetic ``claude-opus-4-7-1m`` model
+                # alias into the real Anthropic model + 1M beta header
+                # before any downstream logic reads ``data["model"]``.
+                # Safe no-op for every other model ID.
+                _rewrite_claude_1m_alias(data, headers)
                 is_stream = data.get("stream", False)
                 conversation_id = extract_conversation_id(data, headers)
                 pii_session_id = extract_pii_session_id(data)
-                tcmm_user_id = data.get("metadata", {}).get("user_id", "")
+                # Multi-source user_id extraction — see extract_user_id
+                # docstring. Previously we only checked metadata.user_id
+                # which left 712+ pii_audit rows stamped with empty user
+                # because LibreChat omits the field on some endpoints.
+                tcmm_user_id = extract_user_id(data, headers)
+                # Sub-agent spawn lineage hint: if the sub-agents MCP
+                # wrapped this LLM call in a ``_spawn_scope``, it
+                # planted the parent's conv id here. We forward it to
+                # TCMM so the child's first archive block can carry
+                # a real ``lineage.parents[0]`` pointer instead of
+                # looking like an orphan.
+                _raw_lineage = data.get("metadata", {}).get("lineage_parent_conv", "") or ""
+                tcmm_lineage_parent = (
+                    ""
+                    if _is_unsubstituted_placeholder(_raw_lineage)
+                    else _raw_lineage
+                )
 
-                # Strip conversation_id from metadata before forwarding to LLM API
+                # Strip TCMM-only fields from metadata before forwarding to LLM API
                 # (Anthropic only allows user_id in metadata — extra fields cause 400)
                 metadata = data.get("metadata")
-                if isinstance(metadata, dict) and "conversation_id" in metadata:
-                    del metadata["conversation_id"]
+                if isinstance(metadata, dict):
+                    metadata.pop("conversation_id", None)
+                    metadata.pop("lineage_parent_conv", None)
 
                 logger.info(
                     f">>> {request.method} [{backend_name}] /{remaining_path} "
@@ -830,6 +1195,7 @@ async def gateway(request: Request, path: str):
                                 tool_items,
                                 conversation_id,
                                 user_id=tcmm_user_id,
+                                lineage_parent_conv=tcmm_lineage_parent,
                             )
                         else:
                             logger.info("  [TCMM] tool-followup with no extractable tool blocks — passthrough")
@@ -860,6 +1226,7 @@ async def gateway(request: Request, path: str):
                                 conversation_id,
                                 user_id=tcmm_user_id,
                                 origin=user_origin,
+                                lineage_parent_conv=tcmm_lineage_parent,
                             )
                             if tcmm_context:
                                 # Inject TCMM context RAW (with real PII).
@@ -996,7 +1363,89 @@ async def gateway(request: Request, path: str):
 
                         "The TCMM memory section follows immediately below. Memory may be empty on "
                         "your first interaction with a new user, in which case you rely entirely "
-                        "on the current user turn in the messages array."
+                        "on the current user turn in the messages array.\n\n"
+
+                        "## 4. TOOL USE GUIDELINES\n\n"
+
+                        "You have access to MCP tools via the sub-agents server (file operations, "
+                        "web search, web fetch, memory recall, scratchpad, background tasks, "
+                        "team coordination) and optionally forge (dynamic tool creation), "
+                        "documents (PDF/DOCX/XLSX/PPTX), image (Pillow + charts), host-exec "
+                        "(command execution on the user's local machine via their client "
+                        "daemon), and tcmm-service (direct memory inspection). Default to the "
+                        "minimum tool surface needed for the task. Use the following routing:\n\n"
+
+                        "- **File reads, grep, search_files**: local to the user's machine via "
+                        "their client daemon. Prefer relative paths when the user is in a "
+                        "known working directory.\n"
+                        "- **run_command**: the user's native shell. On Windows that is CMD "
+                        "(use `cd` to print current dir, `dir` to list files, `echo %OS%` to "
+                        "confirm OS). On Unix it's bash/zsh (`pwd`, `ls -la`, `uname -a`). The "
+                        "first run_command result will include a `[Host: ...]` tag on its first "
+                        "line — match your syntax to that tag for subsequent calls.\n"
+                        "- **web_search, web_fetch**: cloud-side. Grounded via Vertex AI; real "
+                        "URLs and citations come back. Prefer web_search to orient, then "
+                        "web_fetch for a specific URL when you need its full contents.\n"
+                        "- **spawn_agent, spawn_agentic, start_task, start_parallel_tasks**: "
+                        "fan out research across independent sub-agents when the question has "
+                        "clearly separable sub-questions. Each sub-agent runs its own agentic "
+                        "loop with tools, its own memory namespace, and its own lineage stamp. "
+                        "Use wait_for_tasks with timeout=600+ for grounded research; agentic "
+                        "workers legitimately take 5-10 minutes. Don't poll with check_task in "
+                        "tight loops — wait_for_tasks blocks efficiently.\n"
+                        "- **write_scratchpad, read_scratchpad**: share intermediate state "
+                        "across sub-agents or across turns of the same conversation. Not a "
+                        "replacement for TCMM memory; scratchpad is ephemeral working data.\n"
+                        "- **tcmm_recall**: pull specific archived facts by semantic query when "
+                        "TCMM's own recall did not surface them in the memory context above. "
+                        "The memory context is already curated — only reach for tcmm_recall "
+                        "when the user asks for something clearly outside the surfaced blocks.\n"
+                        "- **todo_write**: track multi-step plans in a structured checklist. "
+                        "Useful for complex tasks the user wants you to drive end-to-end.\n\n"
+
+                        "When running tools, honor the safety boundary: destructive commands "
+                        "(rm -rf, format, dd of=/dev/*, drop table, force push to main) are "
+                        "blocked server-side. If a tool returns an error mentioning a blocked "
+                        "pattern, do not retry with variations — ask the user whether to "
+                        "proceed and let them decide. Long-running tools have a 30-second "
+                        "default timeout; if a command legitimately needs longer, break it "
+                        "into pieces or submit it as a background task.\n\n"
+
+                        "## 5. MEMORY BLOCK SEMANTICS\n\n"
+
+                        "Memory blocks come from TCMM's per-user archive. Each block has:\n\n"
+
+                        "- An `index` (stable integer, globally unique within the user's "
+                        "archive). You see it in the block header as `index=<N>`. Use this "
+                        "value in the `used` map of your answer contract.\n"
+                        "- A `role`: USER (something the user said), THOUGHT (something the "
+                        "assistant said in a past turn), TOOL (a tool result that was retained), "
+                        "RECALL (a block hydrated from archive via semantic search for this "
+                        "turn), or DREAM (a synthesized canonical-state summary produced by "
+                        "TCMM's dream-cycle, representing a user-scoped long-term fact).\n"
+                        "- A `src` (source): `live` means the block is currently in the live "
+                        "region of the cacheable prefix; `shadow` means it was recalled for "
+                        "this turn and sits in the volatile tail. Both are equally trustworthy "
+                        "— src is a caching concept, not a quality one.\n\n"
+
+                        "Heat: TCMM scores block relevance as a heat value in [0, 1]. Blocks "
+                        "with high heat are more likely to be surfaced in future recall; "
+                        "blocks with zero heat are candidates for eviction from live (they "
+                        "remain in archive and stay recallable via semantic search). Your "
+                        "answer contract's `used` map directly drives heat: blocks you mark "
+                        "as used with relevance near 1.0 warm up; blocks you ignore cool. "
+                        "This is the reinforcement signal that makes the memory layer "
+                        "self-tuning — so be accurate about what you actually referenced.\n\n"
+
+                        "Lineage: sub-agent conversations you spawn inherit a lineage pointer "
+                        "to the parent conversation so TCMM's dream-cycle can synthesize "
+                        "canonical state across related conversations. You do not need to "
+                        "manage lineage directly — TCMM stamps it on ingestion — but when "
+                        "you spawn_agent, know that the child's memory is isolated in its "
+                        "own namespace AND linked back to yours for cross-conversation "
+                        "synthesis later.\n\n"
+
+                        "End of preamble. Memory context follows below."
                     )
 
                     existing_system = data.get("system", "")
@@ -1031,38 +1480,78 @@ async def gateway(request: Request, path: str):
                         cacheable_mem = ""
                         volatile_tail = ""
 
-                    # Assemble the system field.
-                    # Content block 1: preamble + L0+L1 memory, cache_control=ephemeral
-                    # Content block 2: L2 shadow + L3 contract, no cache
-                    cached_head = veilguard_static_preamble
+                    # Assemble the system field using TWO cache_control
+                    # markers:
+                    #   block 1 — veilguard_static_preamble
+                    #             Literal string constant in this file →
+                    #             byte-identical every request →
+                    #             GUARANTEED cache hit after the first.
+                    #   block 2 — L0 + L1 memory (up to END-LIVE-MEMORY)
+                    #             May drift across turns if TCMM re-orders
+                    #             or re-summarises L1.  Hits cache when
+                    #             TCMM is append-only, misses otherwise —
+                    #             but block 1 keeps hitting regardless.
+                    #   block 3 — L2 shadow + L3 answer contract
+                    #             No cache_control, rebuilt every request.
+                    #
+                    # Previously we concatenated preamble + memory into a
+                    # single cached block.  A single byte of drift in the
+                    # memory portion meant the preamble never got a hit
+                    # either — Anthropic's prefix hash is over the whole
+                    # block.  Splitting lets them cache independently.
+                    system_blocks = [
+                        {
+                            "type": "text",
+                            "text": veilguard_static_preamble,
+                            "cache_control": {"type": "ephemeral"},
+                        },
+                    ]
                     if cacheable_mem:
-                        cached_head = f"{cached_head}\n\n{cacheable_mem}"
-
+                        mem_block = {
+                            "type": "text",
+                            "text": cacheable_mem,
+                        }
+                        # Only mark the memory block as cacheable if it's
+                        # individually big enough to cache. Anthropic's
+                        # Sonnet cache minimum is ~1024 tokens (~4K chars);
+                        # if the memory block falls below that, attaching
+                        # cache_control here causes Anthropic to silently
+                        # refuse to cache ANY marker in the request, which
+                        # is how every conversation with short TCMM memory
+                        # ended up with create=0 read=0 on turn 2 (verified
+                        # 23 Apr 2026 isolation test — an 18-byte marker
+                        # next to a 6742-byte marker produced a total cache
+                        # rejection). Without the marker the preamble still
+                        # caches on its own.
+                        if len(cacheable_mem) >= _MIN_CACHE_CHARS:
+                            mem_block["cache_control"] = {"type": "ephemeral"}
+                        system_blocks.append(mem_block)
                     if volatile_tail:
-                        data["system"] = [
-                            {
-                                "type": "text",
-                                "text": cached_head,
-                                "cache_control": {"type": "ephemeral"},
-                            },
-                            {
-                                "type": "text",
-                                "text": volatile_tail,
-                            },
-                        ]
-                    else:
-                        # No volatile tail — still mark the head for cache.
-                        data["system"] = [
-                            {
-                                "type": "text",
-                                "text": cached_head,
-                                "cache_control": {"type": "ephemeral"},
-                            },
-                        ]
+                        system_blocks.append({
+                            "type": "text",
+                            "text": volatile_tail,
+                        })
+                    data["system"] = system_blocks
 
+                    # Diagnostic: per-block SHA-256 prefix + byte length.
+                    # Across turns in the same conversation, the preamble
+                    # hash MUST stay constant (it's a literal).  The
+                    # memory hash changing indicates TCMM isn't
+                    # append-only and is the real cause of cache-miss
+                    # churn.  Hashes live in logs; diff them by conv_id
+                    # to confirm which block is drifting.
+                    import hashlib as _hashlib
+                    _pre_hash = _hashlib.sha256(
+                        veilguard_static_preamble.encode("utf-8")
+                    ).hexdigest()[:10]
+                    _mem_hash = _hashlib.sha256(
+                        cacheable_mem.encode("utf-8")
+                    ).hexdigest()[:10] if cacheable_mem else "(empty)"
                     logger.info(
-                        f"  [CACHE] split at --- END LIVE MEMORY --- "
-                        f"(cached={len(cached_head)}B volatile={len(volatile_tail)}B)"
+                        f"  [CACHE] conv={conversation_id[:8]} "
+                        f"preamble={_pre_hash}/{len(veilguard_static_preamble)}B  "
+                        f"memory={_mem_hash}/{len(cacheable_mem)}B  "
+                        f"volatile={len(volatile_tail)}B"
                     )
 
                     # Still run _apply_anthropic_cache for the conversation-history
@@ -1070,6 +1559,35 @@ async def gateway(request: Request, path: str):
                     # messages[] arrays). It skips the system field now that we've
                     # already structured it.
                     _apply_anthropic_cache(data)
+
+                # Scrub malformed extended-thinking blocks from messages
+                # before sending. LibreChat + LangGraph occasionally produce
+                # a content block shaped ``{type:"thinking"}`` without the
+                # required ``thinking`` text / ``signature`` strings — when
+                # Anthropic sees that it 400s with "messages.N.content.M.
+                # thinking.thinking: Field required". Seen twice (22 Apr
+                # Sarel bb400c87 persisted, 23 Apr Petrus fresh turn) — we
+                # police it here so no upstream path can bypass the filter.
+                _thinking_scrubbed = _scrub_malformed_thinking(data)
+                if _thinking_scrubbed:
+                    logger.info(
+                        f"  [SCRUB] dropped {_thinking_scrubbed} malformed "
+                        f"thinking block(s) before sending to Anthropic"
+                    )
+
+                # Final safety net: hard-cap to Anthropic's 4-marker limit by
+                # stripping the oldest cache_control from messages if needed.
+                # LibreChat emits cache_control on tool_use/tool_result blocks
+                # in long conversations, and that plus our TCMM/message markers
+                # has already sent one request to 5 markers in prod ("A maximum
+                # of 4 blocks with cache_control may be provided").
+                _stripped = _cap_cache_markers(data)
+                if _stripped:
+                    logger.info(
+                        f"  [CACHE] capped cache_control markers — stripped "
+                        f"{_stripped} oldest to stay within Anthropic's limit of "
+                        f"{_ANTHROPIC_CACHE_LIMIT}"
+                    )
 
                 # Redact PII
                 redacted = redactor.redact_json(data, pii_session_id)
@@ -1134,19 +1652,58 @@ async def gateway(request: Request, path: str):
                 except Exception:
                     pass
 
-                # Audit log: what we're sending to the LLM (redacted)
+                # Audit log: what we're sending to the LLM (redacted).
+                # Full payload, no truncation — the DB-backed audit
+                # (app.audit_db) needs the complete envelope for
+                # replay / debugging of long-context prompts, and the
+                # text log file is kept in sync so tail -f still works.
                 _redacted_messages = redacted.get("messages", [])
                 _redacted_system = redacted.get("system", "")
-                _audit_text = ""
+                _audit_text_parts: list[str] = []
                 if _redacted_system:
-                    _audit_text += f"[SYSTEM] {_redacted_system[:500]}\n\n"
-                for _m in _redacted_messages[-3:]:  # Last 3 messages
+                    # System field may be a string or a list of content
+                    # blocks (cached TCMM split).  Render both.
+                    if isinstance(_redacted_system, list):
+                        _sys_rendered = "\n".join(
+                            str(b.get("text", "")) for b in _redacted_system
+                            if isinstance(b, dict)
+                        )
+                    else:
+                        _sys_rendered = str(_redacted_system)
+                    _audit_text_parts.append(f"[SYSTEM]\n{_sys_rendered}")
+                for _m in _redacted_messages:  # ALL messages, not last 3
                     _role = _m.get("role", "?")
                     _content = _m.get("content", "")
                     if isinstance(_content, list):
-                        _content = " ".join(str(b.get("text", b.get("content", "")))[:200] for b in _content if isinstance(b, dict))
-                    _audit_text += f"[{_role.upper()}] {str(_content)[:500]}\n"
-                audit_log("TO_LLM", conversation_id, _audit_text, f"model={redacted.get('model','?')}")
+                        # Render each block's text / content verbatim.
+                        _content = "\n".join(
+                            str(b.get("text", b.get("content", "")))
+                            for b in _content if isinstance(b, dict)
+                        )
+                    _audit_text_parts.append(f"[{_role.upper()}]\n{_content}")
+                _audit_text = "\n\n".join(_audit_text_parts)
+
+                _model_id = redacted.get("model", "?")
+                audit_log(
+                    "TO_LLM", conversation_id, _audit_text,
+                    f"model={_model_id}",
+                )
+                # Write the full payload to LanceDB as well (separate
+                # from the text log — DB rows are queryable, multi-
+                # tenant, and never truncated).  Lives in a sibling
+                # table of TCMM's archive; TCMM itself is never aware.
+                try:
+                    from app import audit_db as _audit_db
+                    _audit_db.record(
+                        direction="TO_LLM",
+                        conversation_id=conversation_id or "",
+                        user_id=tcmm_user_id or "",
+                        model=_model_id if _model_id != "?" else None,
+                        stream=bool(is_stream),
+                        content=_audit_text,
+                    )
+                except Exception as _e:
+                    logger.warning(f"[audit_db] TO_LLM record failed: {_e}")
 
             except json.JSONDecodeError:
                 logger.info(f">>> {request.method} [{backend_name}] /{remaining_path} (non-json)")
@@ -1274,7 +1831,29 @@ async def gateway(request: Request, path: str):
                 clean_content = _strip_heatmap_from_text(all_content_text)
                 heatmap_stripped = clean_content != all_content_text
 
-                if heatmap_stripped:
+                # Combined-text rehydration pass.  The per-chunk
+                # rehydrate at line 1408 catches tokens that arrive
+                # whole within a single chunk, but misses tokens that
+                # straddle a chunk boundary (e.g. "REF_PERSO" +
+                # "N_2") — the regex needs the complete token to
+                # match.  Opus 4.7 chunks differ from Sonnet's and
+                # frequently split placeholders, so users see raw
+                # ``REF_PERSON_1`` in the UI for Opus conversations
+                # while Sonnet works fine.  After events reassemble
+                # into all_content_text the token is whole again, so
+                # a final rehydrate pass over clean_content recovers
+                # the split tokens.  Idempotent for already-rehydrated
+                # text.
+                if conversation_id:
+                    rehydrated = redactor.rehydrate_text(clean_content, pii_session_id)
+                    if rehydrated != clean_content:
+                        logger.info(
+                            f"  [REHYDRATE] combined-text pass recovered "
+                            f"{len(rehydrated) - len(clean_content):+d} chars "
+                            f"(split tokens across chunks)"
+                        )
+                        clean_content = rehydrated
+                        heatmap_stripped = True  # trigger rebuild path
                     # Rebuild ALL events with heatmap removed from content deltas
                     # Walk through events, reconstruct content from clean_content
                     clean_pos = 0
@@ -1319,11 +1898,50 @@ async def gateway(request: Request, path: str):
 
                 # Audit log: what the LLM returned
                 audit_log("FROM_LLM", conversation_id, all_content_text or "(empty)", "stream=anthropic")
+                try:
+                    from app import audit_db as _audit_db
+                    # Stamp model from the request we just sent (_model_id
+                    # captured at line ~1686 as redacted.get("model", "?")).
+                    # Without this the FROM_LLM row shows model=null and
+                    # cost analysis over the audit log has to join TO_LLM
+                    # rows on conversation_id to reconstruct the model.
+                    _from_model = _model_id if _model_id and _model_id != "?" else None
+                    _audit_db.record(
+                        direction="FROM_LLM",
+                        conversation_id=conversation_id or "",
+                        user_id=tcmm_user_id or "",
+                        model=_from_model,
+                        stream=True,
+                        content=all_content_text or "",
+                        tokens_input=_cache_usage.get("input_tokens") if _cache_usage else None,
+                        tokens_output=_cache_usage.get("output_tokens") if _cache_usage else None,
+                        cache_create=_cache_usage.get("cache_creation_input_tokens") if _cache_usage else None,
+                        cache_read=_cache_usage.get("cache_read_input_tokens") if _cache_usage else None,
+                    )
+                except Exception as _e:
+                    logger.warning(f"[audit_db] FROM_LLM record failed: {_e}")
 
-                # Feed full content (WITH heatmap) to TCMM for learning
+                # Feed full content (WITH heatmap) to TCMM for learning.
+                # We MUST rehydrate before ingest — per-chunk rehydrate at
+                # line ~1408 misses tokens that straddle chunk boundaries
+                # (Opus 4.7 chunks differently to Sonnet and regularly
+                # splits ``REF_PERSON_1`` across deltas). ``clean_content``
+                # got the combined-text rehydrate pass at ~1848 but had
+                # heatmap stripped. TCMM wants WITH-heatmap content, so
+                # we rehydrate ``all_content_text`` here. rehydrate_text
+                # is idempotent — safe if it was already fully restored.
+                # Without this, REF_* tokens leak into archive.text and
+                # later conversations pull them back in as ghost
+                # placeholders that Claude fills with fabricated names
+                # like "Jun Hirata" (observed 23 Apr 2026, aid=641).
                 if tcmm_active and all_content_text:
-                    await _tcmm_post_response(all_content_text, conversation_id, user_id=tcmm_user_id)
-                    logger.info(f"  [TCMM] Anthropic stream done, ingested {len(all_content_text)} chars")
+                    tcmm_content = (
+                        redactor.rehydrate_text(all_content_text, pii_session_id)
+                        if pii_session_id
+                        else all_content_text
+                    )
+                    await _tcmm_post_response(tcmm_content, conversation_id, user_id=tcmm_user_id, lineage_parent_conv=tcmm_lineage_parent)
+                    logger.info(f"  [TCMM] Anthropic stream done, ingested {len(tcmm_content)} chars")
 
                 try:
                     await response.aclose()
@@ -1524,11 +2142,37 @@ async def gateway(request: Request, path: str):
 
                 # Audit log: what the LLM returned
                 audit_log("FROM_LLM", conversation_id, full_content or "(empty)", "stream=openai")
+                try:
+                    from app import audit_db as _audit_db
+                    # OpenAI streaming responses emit usage in the final
+                    # chunk (opt-in via ``stream_options: {"include_usage": true}``).
+                    # If LibreChat hasn't enabled that, usage will be None.
+                    _oai_usage = locals().get("_openai_final_usage") or {}
+                    _from_model = _model_id if _model_id and _model_id != "?" else None
+                    _audit_db.record(
+                        direction="FROM_LLM",
+                        conversation_id=conversation_id or "",
+                        user_id=tcmm_user_id or "",
+                        model=_from_model,
+                        stream=True,
+                        content=full_content or "",
+                        tokens_input=_oai_usage.get("prompt_tokens"),
+                        tokens_output=_oai_usage.get("completion_tokens"),
+                    )
+                except Exception as _e:
+                    logger.warning(f"[audit_db] FROM_LLM record failed: {_e}")
 
-                # Feed content to TCMM for learning
+                # Feed content to TCMM for learning — rehydrate first
+                # so REF_ tokens don't poison the archive. Same rationale
+                # as the anthropic-stream branch above.
                 if all_content:
-                    await _tcmm_post_response(full_content, conversation_id, user_id=tcmm_user_id)
-                    logger.info(f"  [TCMM] Stream done, ingested {len(full_content)} chars")
+                    tcmm_content = (
+                        redactor.rehydrate_text(full_content, pii_session_id)
+                        if pii_session_id
+                        else full_content
+                    )
+                    await _tcmm_post_response(tcmm_content, conversation_id, user_id=tcmm_user_id, lineage_parent_conv=tcmm_lineage_parent)
+                    logger.info(f"  [TCMM] Stream done, ingested {len(tcmm_content)} chars")
 
         resp_headers = {
             k: v for k, v in response.headers.items()
@@ -1583,10 +2227,47 @@ async def gateway(request: Request, path: str):
                     if raw_content:
                         # Audit log
                         audit_log("FROM_LLM", conversation_id, raw_content or "(empty)", "stream=false")
+                        try:
+                            from app import audit_db as _audit_db
+                            # Non-streaming responses carry usage in the
+                            # response body — extract it so FROM_LLM
+                            # audit rows actually have token metrics.
+                            # Previously this call site had no token
+                            # fields, which is why audit-log token
+                            # coverage was only ~18% (only anthropic
+                            # streaming was populating them).
+                            _usage = resp_json.get("usage", {}) or {}
+                            _model_from_resp = resp_json.get("model") or (
+                                _model_id if _model_id and _model_id != "?" else None
+                            )
+                            if is_anthropic_resp:
+                                _tok_in  = _usage.get("input_tokens")
+                                _tok_out = _usage.get("output_tokens")
+                                _cc      = _usage.get("cache_creation_input_tokens")
+                                _cr      = _usage.get("cache_read_input_tokens")
+                            else:
+                                # OpenAI usage keys
+                                _tok_in  = _usage.get("prompt_tokens")
+                                _tok_out = _usage.get("completion_tokens")
+                                _cc, _cr = None, None
+                            _audit_db.record(
+                                direction="FROM_LLM",
+                                conversation_id=conversation_id or "",
+                                user_id=tcmm_user_id or "",
+                                model=_model_from_resp,
+                                stream=False,
+                                content=raw_content or "",
+                                tokens_input=_tok_in,
+                                tokens_output=_tok_out,
+                                cache_create=_cc,
+                                cache_read=_cr,
+                            )
+                        except Exception as _e:
+                            logger.warning(f"[audit_db] FROM_LLM record failed: {_e}")
 
                         # Feed REAL content to TCMM (no redaction — private local storage)
                         if tcmm_active:
-                            clean_answer = await _tcmm_post_response(raw_content, conversation_id, user_id=tcmm_user_id)
+                            clean_answer = await _tcmm_post_response(raw_content, conversation_id, user_id=tcmm_user_id, lineage_parent_conv=tcmm_lineage_parent)
                             logger.info(f"  [TCMM] Non-stream response processed")
 
                         # Strip heatmap from user-visible response
