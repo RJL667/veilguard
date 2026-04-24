@@ -3,9 +3,25 @@
 Stores {conversation_id: {token: original_value}} with TTL eviction.
 """
 
+import re
 import threading
 import time
 from typing import Optional
+
+
+# Whole-token matcher for rehydration. The critical property is the
+# ``\d+`` — matches GREEDILY — plus the ``\b`` word-boundary on both
+# sides. Together they ensure ``REF_PERSON_1`` and ``REF_PERSON_15`` are
+# disjoint matches: the regex engine sees ``REF_PERSON_15`` as a single
+# 13-character token, never as ``REF_PERSON_1`` + trailing ``5``. This
+# is the difference between per-token replace and a naive loop of
+# ``text.replace(tok, orig)`` — the loop substring-matches and corrupts
+# ``REF_PERSON_15`` into ``<mapping_of_REF_PERSON_1>5``, which is how
+# users saw ``LinkedIn5`` / ``Jun Hirata1`` in their chat (23 Apr 2026).
+_REF_TOKEN_RE = re.compile(
+    r"\bREF_(?:PERSON|EMAIL|PHONE|IP|LOCATION|URL|CREDIT_CARD|"
+    r"SA_ID|SA_PHONE|IBAN|ORG|DATE|API_KEY|CARD)_\d+\b"
+)
 
 
 class PIISessionStore:
@@ -64,14 +80,31 @@ class PIISessionStore:
         return token
 
     def rehydrate(self, conversation_id: str, text: str) -> str:
-        """Replace all PII tokens in text with original values."""
+        """Replace all PII tokens in text with original values.
+
+        Uses regex-based single-pass substitution with ``\\b`` boundaries
+        on both sides of the token so ``REF_PERSON_1`` cannot substring-
+        match inside ``REF_PERSON_15`` (the bug that surfaced today when
+        recall contexts first exceeded 9 distinct PII entities — see
+        _REF_TOKEN_RE docstring for the full history).
+
+        Stale tokens with no mapping (pii_store TTL expired, or token
+        came from a different session) are left as-is. Upstream TCMM
+        stores real content post-rehydration, so this should only fire
+        for tokens freshly created in the current request.
+        """
         with self._lock:
             if conversation_id not in self._store:
                 return text
-            mapping = self._store[conversation_id]["mapping"]
-        for token, original in mapping.items():
-            text = text.replace(token, original)
-        return text
+            # Snapshot the mapping under lock so we don't hold it during
+            # the regex sub (which can be expensive on large responses).
+            mapping = dict(self._store[conversation_id]["mapping"])
+        if not mapping:
+            return text
+        return _REF_TOKEN_RE.sub(
+            lambda m: mapping.get(m.group(0), m.group(0)),
+            text,
+        )
 
     def get_mapping(self, conversation_id: str) -> Optional[dict]:
         with self._lock:
