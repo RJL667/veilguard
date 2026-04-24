@@ -71,6 +71,161 @@ logger.info(f"Data directory: {DATA_DIR}")
 
 from adapters.veilguard_adapter import VeilguardTCMM
 
+
+def _resolve_lineage_edge(parent_conv: str, user_id: str) -> tuple[int, int] | None:
+    """Look up ``(root, parent_aid)`` for a child-namespace lineage stamp.
+
+    TCMM archive invariant: **every ingested block lives in the
+    LanceDB archive table**. ``live_blocks`` is a VIEW — the current
+    eviction/activation subset of the same archive rows. There is no
+    "live-only" or "archive-only" state. So a parent namespace that
+    has received any ingestion has rows here.
+
+    Queries the shared LanceDB archive table for the latest block in
+    the parent's namespace under the given user_id. Returns ``(root,
+    parent_aid)`` where ``root`` is inherited from that block's own
+    ``lineage.root`` (or the parent_aid itself if the parent block's
+    root is 0 / self-referential — same invariant as a freshly
+    rooted episode).
+
+    Returns ``None`` if parent_conv is empty or the namespace-filtered
+    query genuinely has no rows (meaning no ingestion has happened
+    for that conversation yet — should be rare).
+    """
+    if not parent_conv:
+        return None
+    try:
+        import lancedb
+        # TCMM's internal layout: DATA_DIR / LANCE_DB_NAME / "tcmm.db"
+        # is the actual LanceDB root (see tcmm_core.py's db_path join).
+        # First join gives the session-shared dir; second is the DB.
+        db_dir = os.path.join(DATA_DIR, LANCE_DB_NAME, "tcmm.db")
+        if not os.path.isdir(db_dir):
+            return None
+        db = lancedb.connect(db_dir)
+        try:
+            tbl = db.open_table("archive")
+        except Exception:
+            return None
+        # Normalize parent_conv the same way the session pool does,
+        # so we query the actual stored namespace rather than the
+        # raw header value (defensive — they're usually identical).
+        parent_sid = pool._normalize_id(parent_conv)
+        uid = user_id or "default"
+        # Grab the most recent block in the parent namespace owned
+        # by this tenant. Note the `.limit(1)` is only used to cap
+        # Lance's scan, not to order — Lance returns rows in table
+        # order, not aid-desc — so we pull the full parent namespace
+        # then sort by aid. Parent namespaces are bounded (tens of
+        # rows) so this is cheap.
+        df = (
+            tbl.search()
+               .where(f"namespace = '{parent_sid}' AND user_id = '{uid}'")
+               .to_arrow()
+               .to_pandas()
+               .sort_values("aid", ascending=False)
+               .head(1)
+        )
+        if len(df) == 0:
+            # Parent namespace has zero rows for this tenant. Two
+            # common reasons:
+            #   1. LibreChat's MCP transport forwards a UUID-format
+            #      conversation_id (e.g. ``9aa425aa-2d81-43fa-...``)
+            #      that is DIFFERENT from the ``new-<uid>-XXX`` id
+            #      its main flow archives under. The parent the
+            #      sub-agent captured never matches a real stored
+            #      namespace. Seen on 22 Apr 2026 — sub-agents were
+            #      minting valid child namespaces but lineage kept
+            #      resolving to None because no row answered the
+            #      namespace filter.
+            #   2. A fresh conversation that genuinely hasn't
+            #      ingested its first user/assistant block yet.
+            # Fallback: use the user's most recent archive row
+            # regardless of namespace. That's a weaker anchor than
+            # a real parent-namespace match but it still gives the
+            # child SOMETHING to stamp lineage against, which is
+            # what dream-engine / canonical-state synthesis needs.
+            logger.info(
+                f"[LINEAGE] parent_ns={parent_sid} has no rows for "
+                f"uid={uid[:8]} — falling back to user's latest archive row"
+            )
+            df = (
+                tbl.search()
+                   .where(f"user_id = '{uid}'")
+                   .to_arrow()
+                   .to_pandas()
+                   .sort_values("aid", ascending=False)
+                   .head(1)
+            )
+            if len(df) == 0:
+                logger.info(
+                    f"[LINEAGE] no archive rows at all for uid={uid[:8]} — "
+                    f"child will root on itself"
+                )
+                return None
+        row = df.iloc[0]
+        parent_aid = int(row["aid"])
+        lineage = row.get("lineage")
+        root = 0
+        if lineage is not None:
+            try:
+                root_val = lineage.get("root", 0) if hasattr(lineage, "get") else (
+                    lineage["root"] if "root" in lineage else 0
+                )
+                root = int(root_val or 0)
+            except Exception:
+                root = 0
+        # Freshly rooted episode (parent was the first block of its
+        # own conversation): use parent_aid as the root so every
+        # descendant inherits it.
+        if root <= 0:
+            root = parent_aid
+        return (root, parent_aid)
+    except Exception as e:
+        logger.warning(f"[LINEAGE] resolve failed for parent={parent_conv[:16]}: {e}")
+        return None
+
+
+def _stamp_child_lineage(
+    instance, lineage_root: int, lineage_parent_aid: int, aid_cutoff: int
+) -> int:
+    """Stamp ``lineage`` on archive rows created during the current call.
+
+    Only touches rows whose aid is > ``aid_cutoff`` — that's how we
+    identify blocks the current ingest just added (we snapshot the
+    max aid before calling instance.pre/post_response). All such
+    rows get ``lineage.root = lineage_root`` and
+    ``lineage.parents = [lineage_parent_aid]``.
+
+    Writes go to the in-memory archive dict; the storage provider's
+    lazy persistence picks them up on the next flush. Returns the
+    number of rows stamped.
+    """
+    stamped = 0
+    try:
+        for aid, entry in list(instance.tcmm.archive.items()):
+            if aid <= aid_cutoff:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            entry["lineage"] = {
+                "root": int(lineage_root),
+                "parents": [int(lineage_parent_aid)],
+            }
+            instance.tcmm.archive[aid] = entry
+            stamped += 1
+        # Force-persist so dreams + recall see the edge immediately.
+        try:
+            if hasattr(instance.tcmm, "persist_archive"):
+                instance.tcmm.persist_archive()
+            elif hasattr(instance.tcmm, "flush_archive"):
+                instance.tcmm.flush_archive()
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"[LINEAGE] stamp failed: {e}")
+    return stamped
+
 SYSTEM_PROMPT = os.environ.get("TCMM_SYSTEM_PROMPT", """You are Veilguard, a Phishield AI assistant with persistent memory.
 You remember information from all previous conversations.
 Use your memory blocks to provide contextual, personalized responses.
@@ -311,6 +466,13 @@ class PreRequestBody(BaseModel):
     # ("user" | "user_image" | "tool_result" | "tool"). Default is "user"
     # to preserve backward compatibility with callers that don't set it.
     origin: str = "user"
+    # Sub-agent spawn lineage. Set by the PII proxy when the incoming
+    # LLM call came from a ``_spawn_scope`` in sub-agents (metadata
+    # field ``lineage_parent_conv`` carried the parent's conv_id).
+    # TCMM uses it to stamp ``lineage.parents[0]`` (latest aid in the
+    # parent namespace) and inherit ``lineage.root`` on the child's
+    # first archive block. Empty for top-level LibreChat turns.
+    lineage_parent_conv: str = ""
 
 
 class PostResponseBody(BaseModel):
@@ -320,6 +482,7 @@ class PostResponseBody(BaseModel):
     # Origin tag for the assistant-side block. Usually "assistant_text";
     # set to "tool_use" when the assistant reply is a tool invocation.
     origin: str = "assistant_text"
+    lineage_parent_conv: str = ""
 
 
 class IngestTurnBody(BaseModel):
@@ -334,10 +497,71 @@ class IngestTurnBody(BaseModel):
     conversation_id: str = ""
     user_id: str = ""
     items: list = []
+    lineage_parent_conv: str = ""
 
 
 import asyncio
-_tcmm_lock = asyncio.Lock()
+
+# Per-session locks keyed by normalized conversation_id. Replaces the
+# old single ``_tcmm_lock = asyncio.Lock()`` that serialized EVERY
+# TCMM endpoint across the whole process — a ``post_response`` or
+# ``ingest_turn`` from one user's conversation would block an
+# unrelated user's ``pre_request`` for the full duration of the
+# other call. Measured 23 Apr 2026: a pre_request for conv
+# bb400c87 reported ``took=11.02s`` of which only ~1.2s was its own
+# work; the remaining ~9.8s was spent waiting for ``_tcmm_lock``.
+#
+# Each TCMM instance is already session-scoped (``pool.get(cid)``
+# returns the one that owns that conversation's state), so concurrent
+# calls on DIFFERENT sessions have no shared state to protect — they
+# can run in parallel. Only overlapping calls on the SAME session
+# need to serialize, and that's what the per-session lock does.
+#
+# The dict grows as new conversations come in; over long uptimes we
+# may want an LRU cap, but at the current scale (<100 active sessions
+# / day) a plain dict is fine — each Lock object is ~200 bytes.
+# Access from a single asyncio event loop, so the dict itself doesn't
+# need an outer mutex; ``setdefault`` is atomic under the GIL.
+_session_locks: dict[str, asyncio.Lock] = {}
+_GLOBAL_TCMM_LOCK_KEY = "__global__"
+
+# Note: an earlier version of this file had a ``_strip_ref_tokens`` helper
+# that replaced any ``REF_PERSON_N`` / ``REF_EMAIL_N`` / etc. with the
+# literal ``[redacted]`` at ingest time, intended as defense-in-depth
+# against a pii-proxy rehydrate regression. It was removed 23 Apr 2026
+# after tracing the real bug to a substring-collision inside pii-proxy's
+# ``pii_store.rehydrate`` (see session.py). The correct architecture is:
+#   * pii-proxy redacts user + memory content on the way to Claude
+#   * pii-proxy rehydrates Claude's response on the way back
+#   * TCMM stores REAL content (post-rehydrate) — never sees REF tokens
+# The sanitizer was masking the real bug and destroying info. If REF
+# tokens ever land in TCMM again, treat it as a pii-proxy regression and
+# fix upstream — don't paper over it here.
+
+
+def _get_session_lock(conversation_id: str) -> asyncio.Lock:
+    """Return the asyncio.Lock that protects ``conversation_id``'s TCMM state.
+
+    Endpoints that don't operate on a specific conversation (``/dream``,
+    ``/api/memory_heatmap``, etc.) pass an empty string and get the
+    ``__global__`` sentinel lock — still per-key, so they don't block
+    unrelated session endpoints, but they DO serialize with each other
+    since they may touch pool-wide state.
+    """
+    key = conversation_id or _GLOBAL_TCMM_LOCK_KEY
+    existing = _session_locks.get(key)
+    if existing is not None:
+        return existing
+    # setdefault so a concurrent coroutine creating the same key in
+    # parallel ends up using one Lock object, not two.
+    new = asyncio.Lock()
+    return _session_locks.setdefault(key, new)
+
+
+# Legacy alias. Kept for any internal callers we might not have
+# migrated yet — they'll hit ``__global__`` and serialize among
+# themselves but won't block per-session endpoints.
+_tcmm_lock = _get_session_lock("")
 
 
 @app.on_event("startup")
@@ -384,7 +608,10 @@ async def pre_request(body: PreRequestBody):
     if _shared_nlp is None:
         return {"error": "TCMM not initialized", "prompt": None}
 
-    async with _tcmm_lock:
+    # Per-session lock — concurrent pre_request on DIFFERENT conversations
+    # now runs in parallel. Only overlap on the same conversation serializes.
+    _sid = pool._normalize_id(body.conversation_id)
+    async with _get_session_lock(_sid):
         try:
             # Recall-only mode: read from existing session, don't create new one
             if body.recall_only:
@@ -406,6 +633,22 @@ async def pre_request(body: PreRequestBody):
             instance = pool.get(body.conversation_id, user_id=body.user_id)
             sess = pool.get_stats(body.conversation_id)
 
+            # Lineage stamp prep: before we ingest, resolve the edge
+            # back to the parent namespace if a hint was supplied and
+            # not already cached on the session. We snapshot the
+            # child's current max aid so we can stamp only blocks
+            # this call creates (not ones from previous turns).
+            if body.lineage_parent_conv and getattr(instance, "_lineage_root", None) is None:
+                resolved = _resolve_lineage_edge(body.lineage_parent_conv, body.user_id)
+                if resolved is not None:
+                    instance._lineage_root, instance._lineage_parent_aid = resolved
+                    logger.info(
+                        f"[LINEAGE] child={pool._normalize_id(body.conversation_id)[:16]} "
+                        f"parent={body.lineage_parent_conv[:16]} "
+                        f"root={instance._lineage_root} parent_aid={instance._lineage_parent_aid}"
+                    )
+            aid_before = max(instance.tcmm.archive.keys(), default=0)
+
             start = time.time()
             prompt = instance.pre_request(
                 body.user_message,
@@ -413,6 +656,18 @@ async def pre_request(body: PreRequestBody):
                 origin=body.origin or "user",
             )
             elapsed = time.time() - start
+
+            # Post-ingest stamp: any rows added during pre_request
+            # (usually the user message) get their lineage wired.
+            if getattr(instance, "_lineage_root", None):
+                n = _stamp_child_lineage(
+                    instance,
+                    instance._lineage_root,
+                    instance._lineage_parent_aid,
+                    aid_before,
+                )
+                if n:
+                    logger.info(f"[LINEAGE] stamped {n} rows (pre_request)")
 
             status = instance.get_status()
             logger.info(
@@ -504,7 +759,14 @@ async def pre_request(body: PreRequestBody):
                 sess["naive_cost_cached"] += (new / 1000) * _COST_CACHE_WRITE
             sess["_prev_naive_input"] = naive_input_tokens
 
-            return {
+            # Fire the deferred user-message ingest as a background task
+            # AFTER we've built the return payload. The task acquires the
+            # same per-session lock we're about to release, so subsequent
+            # pre_request/post_response calls on this session still see
+            # the user message in the archive — they just wait briefly
+            # for the background ingest to land.
+            has_pending = bool(getattr(instance, "_pending_user_ingest", None))
+            _response_payload = {
                 "prompt": prompt,
                 "stats": {
                     "live_blocks": status["live_blocks"],
@@ -513,36 +775,116 @@ async def pre_request(body: PreRequestBody):
                     "elapsed_ms": int(elapsed * 1000),
                     "input_tokens": tcmm_input_tokens,
                     "session_id": pool._normalize_id(body.conversation_id),
+                    "user_ingest": "deferred" if has_pending else "skipped",
                 },
             }
         except Exception as e:
             logger.error(f"[PRE] Error: {e}", exc_info=True)
             return {"error": str(e), "prompt": None}
 
+    # Lock released. Fire background ingest (it reacquires the session
+    # lock so it serializes correctly behind any subsequent request).
+    if has_pending:
+        asyncio.create_task(_pre_request_ingest_user(_sid, body))
 
-@app.post("/post_response")
-async def post_response(body: PostResponseBody):
-    """Called AFTER PII rehydration. Routes to per-session TCMM instance."""
-    if _shared_nlp is None:
-        return {"error": "TCMM not initialized", "answer": body.raw_output}
+    return _response_payload
 
-    async with _tcmm_lock:
-        try:
+
+async def _pre_request_ingest_user(_sid: str, body: PreRequestBody) -> None:
+    """Background-task body that runs the deferred user-message archive.
+
+    Fired by ``/pre_request`` AFTER the prompt has already been returned
+    to pii-proxy. Acquires the per-session lock so it serializes behind
+    any other request on this conversation — subsequent pre_request /
+    post_response calls will queue behind this and observe the user
+    message as archived by the time they run recall.
+
+    We call ``flush_pending_user_ingest`` on the adapter, which reads
+    the ``_pending_user_ingest`` dict pre_request set synchronously
+    and executes the full add_new_block + flush + archive-entry write.
+    On a slow LanceDB (the 6-7s case) this runs off the critical path
+    so the user gets the prompt instantly and typing into the chat
+    feels responsive.
+    """
+    try:
+        async with _get_session_lock(_sid):
+            instance = pool.get(body.conversation_id, user_id=body.user_id)
+            t0 = time.time()
+            ran = await asyncio.to_thread(
+                instance.flush_pending_user_ingest,
+                body.conversation_id,
+            )
+            if ran:
+                dt = time.time() - t0
+                logger.info(
+                    f"[PRE-BG-INGEST] session={_sid} user-message archived "
+                    f"in {dt*1000:.0f}ms"
+                )
+    except Exception as e:
+        logger.error(
+            f"[PRE-BG-INGEST] failed for session={_sid}: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
+
+
+async def _post_response_ingest(body: PostResponseBody, _sid: str) -> None:
+    """Background-task body for post_response ingestion.
+
+    Runs the full TCMM ingestion pipeline (process_heatmap, add_new_block,
+    flush_current_block, _persist_live_blocks) inside the session lock.
+    The HTTP response has already returned ``answer`` to pii-proxy by now,
+    so any time this takes no longer stalls the chat UI.
+
+    Serialization is preserved: if the user sends another turn before this
+    ingest finishes, their ``pre_request`` waits for the session lock —
+    which is exactly what we want so turn N+1's recall sees turn N's
+    ingested state.
+    """
+    try:
+        async with _get_session_lock(_sid):
             instance = pool.get(body.conversation_id, user_id=body.user_id)
             sess = pool.get_stats(body.conversation_id)
 
+            if body.lineage_parent_conv and getattr(instance, "_lineage_root", None) is None:
+                resolved = _resolve_lineage_edge(body.lineage_parent_conv, body.user_id)
+                if resolved is not None:
+                    instance._lineage_root, instance._lineage_parent_aid = resolved
+                    logger.info(
+                        f"[LINEAGE] child={pool._normalize_id(body.conversation_id)[:16]} "
+                        f"parent={body.lineage_parent_conv[:16]} "
+                        f"root={instance._lineage_root} parent_aid={instance._lineage_parent_aid}"
+                    )
+            aid_before = max(instance.tcmm.archive.keys(), default=0)
+
             start = time.time()
-            answer = instance.post_response(
+            # Run the blocking TCMM ingest in a thread so we don't hog the
+            # event loop. ``instance.post_response`` calls Vertex HTTP from
+            # synchronous code (process_heatmap → lazy recall → embed +
+            # classify); without ``to_thread`` the whole asyncio loop —
+            # which is also serving pre_request for other users — blocks
+            # on the first socket read.
+            answer = await asyncio.to_thread(
+                instance.post_response,
                 body.raw_output,
-                session_id=body.conversation_id,
-                origin=body.origin or "assistant_text",
+                body.conversation_id,
+                body.origin or "assistant_text",
             )
             elapsed = time.time() - start
+
+            if getattr(instance, "_lineage_root", None):
+                n = _stamp_child_lineage(
+                    instance,
+                    instance._lineage_root,
+                    instance._lineage_parent_aid,
+                    aid_before,
+                )
+                if n:
+                    logger.info(f"[LINEAGE] stamped {n} rows (post_response)")
 
             status = instance.get_status()
             sid = pool._normalize_id(body.conversation_id)
             logger.info(
-                f"[POST] session={sid} "
+                f"[POST-BG] session={sid} "
                 f"answer_len={len(answer)} "
                 f"step={status['current_step']} "
                 f"archive={status['archive_blocks']} "
@@ -553,16 +895,12 @@ async def post_response(body: PostResponseBody):
             sess["output_tokens"] += output_tokens
             output_cost = (output_tokens / 1000) * _COST_OUTPUT
             sess["output_cost"] += output_cost
-
-            # Naive: assistant response always grows history
             sess["_all_messages"].append(answer)
 
-            # Token history
             naive_total = sess["naive_cost_cached"] + sess["output_cost"]
             tcmm_total = sess["tcmm_cost_cached"] + sess["output_cost"]
             savings_cost = max(0, naive_total - tcmm_total)
             savings_pct = round(savings_cost * 100 / max(naive_total, 0.0001), 1)
-
             sess["_token_history"].append({
                 "turn": sess["turns"],
                 "step": status["current_step"],
@@ -575,20 +913,63 @@ async def post_response(body: PostResponseBody):
             })
             if len(sess["_token_history"]) > 50:
                 sess["_token_history"].pop(0)
+    except Exception as e:
+        logger.error(
+            f"[POST-BG] ingestion failed for session={_sid}: {type(e).__name__}: {e}",
+            exc_info=True,
+        )
 
-            return {
-                "answer": answer,
-                "stats": {
-                    "current_step": status["current_step"],
-                    "archive_blocks": status["archive_blocks"],
-                    "elapsed_ms": int(elapsed * 1000),
-                    "output_tokens": output_tokens,
-                    "session_id": sid,
-                },
-            }
-        except Exception as e:
-            logger.error(f"[POST] Error: {e}", exc_info=True)
-            return {"error": str(e), "answer": body.raw_output}
+
+@app.post("/post_response")
+async def post_response(body: PostResponseBody):
+    """Called AFTER PII rehydration. Returns the clean answer IMMEDIATELY
+    and defers the TCMM ingestion pipeline to a background task.
+
+    Why: the synchronous ingestion path (process_heatmap → lazy recall
+    hydration + new-block NLP classification + block embedding) was
+    firing 5-9 sequential Vertex API calls taking 30+ seconds for a
+    trivial response like "Noted.". Because pii-proxy awaits this
+    endpoint before closing its stream to LibreChat, the frontend
+    kept its stop button visible and the typing indicator pulsing for
+    the full 30s — the response was "done" but the UI said otherwise.
+    Measured 23 Apr 2026: ``[POST] took=32.87s`` for a 50-char answer.
+
+    Fix: split_answer_and_heatmap synchronously (fast regex) so we can
+    return the clean ``answer`` string within milliseconds, then fire
+    the rest of the ingestion as an ``asyncio.create_task``. The
+    background task still acquires the session lock, so subsequent
+    ``pre_request`` / ``post_response`` calls for the same session
+    serialize correctly behind it.
+    """
+    if _shared_nlp is None:
+        return {"error": "TCMM not initialized", "answer": body.raw_output}
+
+    # Fast path: extract the clean answer from raw_output so we can
+    # return immediately. split_answer_and_heatmap is a regex parse —
+    # microseconds, no I/O.
+    try:
+        from core.tcmm_core import split_answer_and_heatmap as _split
+        answer, _flag = _split(body.raw_output or "")
+    except Exception:
+        answer = None
+    if not answer:
+        answer = (body.raw_output or "").strip()
+
+    _sid = pool._normalize_id(body.conversation_id)
+
+    # Fire the heavy ingest in the background. Do NOT await.
+    # The task runs in the current event loop and will acquire the
+    # session lock in ``_post_response_ingest`` so concurrent calls on
+    # the same session still serialize.
+    asyncio.create_task(_post_response_ingest(body, _sid))
+
+    return {
+        "answer": answer,
+        "stats": {
+            "session_id": _sid,
+            "ingest": "deferred",
+        },
+    }
 
 
 @app.get("/tool_invocations")
@@ -724,15 +1105,35 @@ async def ingest_turn(body: IngestTurnBody):
     if not items:
         return {"added": 0, "requested": 0}
 
-    async with _tcmm_lock:
+    _sid = pool._normalize_id(body.conversation_id)
+    async with _get_session_lock(_sid):
         try:
             instance = pool.get(body.conversation_id, user_id=body.user_id)
+            if body.lineage_parent_conv and getattr(instance, "_lineage_root", None) is None:
+                resolved = _resolve_lineage_edge(body.lineage_parent_conv, body.user_id)
+                if resolved is not None:
+                    instance._lineage_root, instance._lineage_parent_aid = resolved
+                    logger.info(
+                        f"[LINEAGE] child={pool._normalize_id(body.conversation_id)[:16]} "
+                        f"parent={body.lineage_parent_conv[:16]} "
+                        f"root={instance._lineage_root} parent_aid={instance._lineage_parent_aid}"
+                    )
+            aid_before = max(instance.tcmm.archive.keys(), default=0)
             added = instance.ingest_turn(items, session_id=body.conversation_id)
             sid = pool._normalize_id(body.conversation_id)
             logger.info(
                 f"[INGEST-TURN] session={sid} added={added}/{len(items)} "
                 f"origins={[ (i or {}).get('origin') for i in items ]}"
             )
+            if getattr(instance, "_lineage_root", None):
+                n = _stamp_child_lineage(
+                    instance,
+                    instance._lineage_root,
+                    instance._lineage_parent_aid,
+                    aid_before,
+                )
+                if n:
+                    logger.info(f"[LINEAGE] stamped {n} rows (ingest_turn)")
             return {"added": added, "requested": len(items), "session_id": sid}
         except Exception as e:
             logger.error(f"[INGEST-TURN] Error: {e}", exc_info=True)
@@ -808,6 +1209,207 @@ async def debug_workers():
     }
 
 
+# ── Debug: per-session state + manual eviction ──────────────────────────────
+# Added for eviction/KV-cache bench testing (23 Apr 2026). TCMM evicts
+# based on per-block heat < COLD_EVICT_HEAT once live token budget is
+# hit, so you can't observe the behaviour just by sending more turns
+# until the 10%-of-context budget is exceeded. These endpoints let you
+# snapshot a session, force eviction without waiting, then compare
+# before/after + watch the PII-proxy cache logs on the next turn.
+
+
+@app.get("/debug_session/{conversation_id:path}")
+async def debug_session_state(conversation_id: str, user_id: str = ""):
+    """Return detailed live/shadow/archive stats for one session.
+
+    Use this to snapshot a session before an eviction test. Pair with
+    ``/debug_evict`` to compare state change, and with PII-proxy's
+    ``[CACHE] ... create= read=`` lines to see how eviction hits
+    Anthropic's prompt-cache boundary.
+
+    Uses ``pool.get()`` so that a session which was persisted to disk
+    but hasn't been referenced since last service restart gets lazy-
+    loaded + its live blocks restored. Without this, snapshotting
+    right after a restart always returns "No active instance".
+    """
+    sid = pool._normalize_id(conversation_id)
+    instance = pool.get(conversation_id, user_id=user_id or "default")
+    if instance is None:
+        return {"error": f"No active instance for sid={sid}"}
+    tcmm = instance.tcmm
+
+    def _tok_count(b):
+        return int(getattr(b, "token_count", 0) or 0)
+
+    live = list(tcmm.live_blocks)
+    shadow = list(getattr(tcmm, "shadow_blocks", []) or [])
+    live_tokens = sum(_tok_count(b) for b in live)
+    shadow_tokens = sum(_tok_count(b) for b in shadow)
+
+    # Show top / bottom live blocks by heat so we can predict which
+    # will be evicted next.
+    def _b_brief(b):
+        return {
+            "id": getattr(b, "id", None),
+            "heat": round(float(getattr(b, "heat", 0.0)), 4),
+            "tokens": _tok_count(b),
+            "created_step": int(getattr(b, "created_step", 0) or 0),
+            "role": getattr(b, "priority_class", "") or "?",
+            "text_preview": (getattr(b, "text", "") or "")[:80],
+        }
+
+    by_heat = sorted(live, key=lambda b: float(getattr(b, "heat", 0.0)))
+    return {
+        "session_id": sid,
+        "user_id": user_id or getattr(instance, "user_id", ""),
+        "live": {
+            "count": len(live),
+            "tokens": live_tokens,
+            "max_tokens": int(getattr(tcmm, "max_live_tokens", 0) or 0),
+            "absolute_max_tokens": int(
+                getattr(tcmm, "absolute_max_live_tokens", 0) or 0
+            ),
+            "coldest": [_b_brief(b) for b in by_heat[:5]],
+            "hottest": [_b_brief(b) for b in by_heat[-5:]],
+        },
+        "shadow": {
+            "count": len(shadow),
+            "tokens": shadow_tokens,
+            "max_tokens": int(getattr(tcmm, "max_shadow_tokens", 0) or 0),
+        },
+        "archive": {"count": len(tcmm.archive)},
+        "current_step": int(getattr(tcmm, "current_step", 0) or 0),
+    }
+
+
+class EvictBody(BaseModel):
+    conversation_id: str
+    user_id: str = ""
+    # Mode: ``cold`` (default) runs the normal cold-eviction policy
+    # at whatever ``COLD_EVICT_HEAT`` threshold is configured, which
+    # may evict 0 blocks if everything is above the floor. ``n``
+    # force-evicts the N coldest blocks regardless of heat floor —
+    # use for deterministic bench runs. ``budget`` temporarily lowers
+    # ``max_live_tokens`` to ``target_tokens`` and evicts until the
+    # budget is met — simulates "a bigger conversation hitting the
+    # 10%-of-context cap".
+    mode: str = "cold"
+    n: int = 0
+    target_tokens: int = 0
+
+
+@app.post("/debug_evict")
+async def debug_evict(body: EvictBody):
+    """Force live → archive eviction on a specific session.
+
+    Returns the before/after stats so you can see exactly which
+    blocks moved. The eviction path is the same ``_evict_live_block``
+    TCMM uses in production — blocks get enqueued to the archive
+    table and disappear from ``live_blocks``. Shadow promotion is
+    NOT triggered here (that's a separate recall pathway).
+    """
+    sid = pool._normalize_id(body.conversation_id)
+    # Same lazy-load as /debug_session — evict_debug can fire right
+    # after a service restart as long as the session has a persisted
+    # live-block snapshot on disk.
+    instance = pool.get(body.conversation_id, user_id=body.user_id or "default")
+    if instance is None:
+        return {"error": f"No active instance for sid={sid}"}
+    tcmm = instance.tcmm
+
+    def _snapshot():
+        live = list(tcmm.live_blocks)
+        return {
+            "live_count": len(live),
+            "live_tokens": sum(int(getattr(b, "token_count", 0) or 0) for b in live),
+            "archive_count": len(tcmm.archive),
+        }
+
+    before = _snapshot()
+    evicted_ids: list[int] = []
+
+    async with _get_session_lock(sid):
+        try:
+            if body.mode == "cold":
+                # Run the native cold-eviction policy. Records ids it
+                # touches so we can report which blocks moved.
+                pre_ids = {getattr(b, "id", None) for b in tcmm.live_blocks}
+                tcmm._evict_cold_live_blocks()
+                post_ids = {getattr(b, "id", None) for b in tcmm.live_blocks}
+                evicted_ids = sorted(i for i in pre_ids - post_ids if i is not None)
+
+            elif body.mode == "n":
+                n = max(1, int(body.n or 1))
+                # Evict the N coldest. Mirrors the cold-eviction
+                # selection but ignores the heat floor — useful when
+                # everything's above floor and you just want to see
+                # the mechanism fire.
+                by_heat = sorted(
+                    tcmm.live_blocks,
+                    key=lambda b: float(getattr(b, "heat", 0.0)),
+                )[:n]
+                for b in by_heat:
+                    try:
+                        tcmm.live_blocks.remove(b)
+                    except ValueError:
+                        continue
+                    evicted_ids.append(int(getattr(b, "id", 0) or 0))
+                    tcmm._evict_live_block(b, reason="debug-n")
+
+            elif body.mode == "budget":
+                # Temporarily lower the budget and let the built-in
+                # ``_live_token_count() > max_live_tokens`` loop drain
+                # cold blocks to fit. Restores the old budget after.
+                target = max(0, int(body.target_tokens or 0))
+                old_budget = int(getattr(tcmm, "max_live_tokens", 0) or 0)
+                try:
+                    tcmm.max_live_tokens = target
+                    # The same loop shape as the internal enforcement.
+                    while tcmm._live_token_count() > tcmm.max_live_tokens and tcmm.live_blocks:
+                        # Pick coldest victim.
+                        victim = min(
+                            tcmm.live_blocks,
+                            key=lambda b: float(getattr(b, "heat", 0.0)),
+                        )
+                        tcmm.live_blocks.remove(victim)
+                        evicted_ids.append(int(getattr(victim, "id", 0) or 0))
+                        tcmm._evict_live_block(victim, reason="debug-budget")
+                finally:
+                    tcmm.max_live_tokens = old_budget
+
+            else:
+                return {"error": f"unknown mode: {body.mode}"}
+
+            # Persist live blocks so the disk snapshot reflects the
+            # new state (otherwise a restart would restore the
+            # pre-eviction set from ``_latest.json``).
+            try:
+                instance._persist_live_blocks(session_id=body.conversation_id)
+            except Exception as e:
+                logger.warning(f"[DEBUG-EVICT] persist_live_blocks failed: {e}")
+
+        except Exception as e:
+            import traceback
+            return {"error": str(e), "traceback": traceback.format_exc()}
+
+    after = _snapshot()
+    logger.info(
+        f"[DEBUG-EVICT] sid={sid} mode={body.mode} "
+        f"evicted={len(evicted_ids)} "
+        f"live {before['live_count']}→{after['live_count']} "
+        f"({before['live_tokens']}→{after['live_tokens']} tokens), "
+        f"archive {before['archive_count']}→{after['archive_count']}"
+    )
+    return {
+        "session_id": sid,
+        "mode": body.mode,
+        "evicted_ids": evicted_ids,
+        "evicted_count": len(evicted_ids),
+        "before": before,
+        "after": after,
+    }
+
+
 @app.post("/dream")
 async def trigger_dream():
     """Trigger a dream cycle on the active session."""
@@ -815,7 +1417,9 @@ async def trigger_dream():
     if instance is None:
         return {"error": "No active session"}
 
-    async with _tcmm_lock:
+    # Per-session lock so a dream cycle on conv A doesn't block
+    # pre_request on conv B.
+    async with _get_session_lock(sid or ""):
         try:
             tcmm = instance.tcmm
             archive_count = len(tcmm.archive)
