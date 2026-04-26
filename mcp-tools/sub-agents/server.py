@@ -575,15 +575,30 @@ if __name__ == "__main__":
         import asyncio
         from starlette.routing import WebSocketRoute
 
+        # Wrap a handler so it short-circuits with 401/503 unless the
+        # caller presents a valid X-Internal-Secret. Used to protect the
+        # observability endpoints (stats / tasks / scratchpad / daemons /
+        # teams) which return user-typed content (task descriptions,
+        # scratchpad file bodies, daemon task strings). The /api/client/*
+        # admin handlers gate themselves inline with the same helper.
+        def _gated(handler):
+            async def wrapper(request):
+                rej = _check_internal_secret(request)
+                if rej is not None:
+                    return rej
+                return await handler(request)
+            wrapper.__name__ = f"gated_{getattr(handler, '__name__', 'handler')}"
+            return wrapper
+
         routes = [
             Route("/sse", endpoint=handle_sse),
             Mount("/messages/", app=sse.handle_post_message),
             Route("/trigger/{name}", endpoint=handle_trigger, methods=["POST"]),
-            Route("/api/stats", endpoint=api_stats),
-            Route("/api/tasks", endpoint=api_tasks),
-            Route("/api/scratchpad", endpoint=api_scratchpad),
-            Route("/api/daemons", endpoint=api_daemons),
-            Route("/api/teams", endpoint=api_teams),
+            Route("/api/stats", endpoint=_gated(api_stats)),
+            Route("/api/tasks", endpoint=_gated(api_tasks)),
+            Route("/api/scratchpad", endpoint=_gated(api_scratchpad)),
+            Route("/api/daemons", endpoint=_gated(api_daemons)),
+            Route("/api/teams", endpoint=_gated(api_teams)),
             Route("/api/client/status", endpoint=api_client_status),
             Route("/api/client/install", endpoint=api_client_install),
             Route("/api/client/register", endpoint=api_client_register),
