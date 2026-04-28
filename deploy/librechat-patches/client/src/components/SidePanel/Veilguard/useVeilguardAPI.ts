@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useAuthContext } from '~/hooks/AuthContext';
 
 // Route all dashboard traffic through LibreChat's authenticated proxy
 // (api/server/routes/veilguardClient.js). The proxy validates the user's
@@ -11,6 +12,12 @@ import { useState, useEffect, useCallback } from 'react';
 // /api/sub-agents/* (and /api/tcmm/*) at the edge because those paths
 // were leaking unauthenticated user content. The previous TODO
 // ("Once those endpoints are scoped...") is what this change fulfills.
+//
+// 2026-04-28 fix: requireJwtAuth on the LibreChat side reads the JWT
+// from the Authorization: Bearer header (passport-jwt's default).
+// useAuthContext keeps the short-lived token in memory; we pass it on
+// every request. Without it, every endpoint 401s -- which is exactly
+// what happened the first time we shipped the proxy refactor.
 const AGENT_PROXY =
   ((window as any).__VEILGUARD_CONFIG__ || {}).agentProxyUrl ||
   '/api/veilguard-client';
@@ -20,9 +27,24 @@ const TCMM_HEALTH_URL =
   ((window as any).__VEILGUARD_CONFIG__ || {}).tcmmHealthUrl ||
   '/api/veilguard-client/tcmm-health';
 
-async function fetchJSON<T>(url: string, fallback: T): Promise<T> {
+function authHeaders(token: string | null | undefined): Record<string, string> {
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function fetchJSON<T>(
+  url: string,
+  fallback: T,
+  token: string | null | undefined,
+): Promise<T> {
+  // No token yet (auth context still hydrating, or user logged out):
+  // bail without firing a request. Returning the fallback keeps the UI
+  // showing its empty state instead of flashing an error.
+  if (!token) return fallback;
   try {
-    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const resp = await fetch(url, {
+      headers: authHeaders(token),
+      signal: AbortSignal.timeout(5000),
+    });
     if (!resp.ok) return fallback;
     return await resp.json();
   } catch {
@@ -53,13 +75,16 @@ export interface AgentStats {
 
 export function useAgentStats(interval = 5000) {
   const [stats, setStats] = useState<AgentStats | null>(null);
+  const { token } = useAuthContext();
 
   useEffect(() => {
-    const load = () => fetchJSON<AgentStats | null>(`${AGENT_PROXY}/stats`, null).then(setStats);
+    if (!token) return;
+    const load = () =>
+      fetchJSON<AgentStats | null>(`${AGENT_PROXY}/stats`, null, token).then(setStats);
     load();
     const id = setInterval(load, interval);
     return () => clearInterval(id);
-  }, [interval]);
+  }, [interval, token]);
 
   return stats;
 }
@@ -93,13 +118,16 @@ export interface TasksResponse {
 
 export function useTasks(interval = 3000) {
   const [tasks, setTasks] = useState<TasksResponse>({ background_tasks: [], managed_tasks: [] });
+  const { token } = useAuthContext();
 
   useEffect(() => {
-    const load = () => fetchJSON<TasksResponse>(`${AGENT_PROXY}/tasks`, tasks).then(setTasks);
+    if (!token) return;
+    const load = () =>
+      fetchJSON<TasksResponse>(`${AGENT_PROXY}/tasks`, tasks, token).then(setTasks);
     load();
     const id = setInterval(load, interval);
     return () => clearInterval(id);
-  }, [interval]);
+  }, [interval, token]);
 
   return tasks;
 }
@@ -115,16 +143,20 @@ export interface ScratchpadFile {
 
 export function useScratchpad(interval = 10000) {
   const [files, setFiles] = useState<ScratchpadFile[]>([]);
+  const { token } = useAuthContext();
 
   useEffect(() => {
+    if (!token) return;
     const load = () =>
-      fetchJSON<{ files: ScratchpadFile[] }>(`${AGENT_PROXY}/scratchpad`, { files: [] }).then((d) =>
-        setFiles(d.files),
-      );
+      fetchJSON<{ files: ScratchpadFile[] }>(
+        `${AGENT_PROXY}/scratchpad`,
+        { files: [] },
+        token,
+      ).then((d) => setFiles(d.files));
     load();
     const id = setInterval(load, interval);
     return () => clearInterval(id);
-  }, [interval]);
+  }, [interval, token]);
 
   return files;
 }
@@ -144,16 +176,20 @@ export interface DaemonInfo {
 
 export function useDaemons(interval = 5000) {
   const [daemons, setDaemons] = useState<DaemonInfo[]>([]);
+  const { token } = useAuthContext();
 
   useEffect(() => {
+    if (!token) return;
     const load = () =>
-      fetchJSON<{ daemons: DaemonInfo[] }>(`${AGENT_PROXY}/daemons`, { daemons: [] }).then((d) =>
-        setDaemons(d.daemons),
-      );
+      fetchJSON<{ daemons: DaemonInfo[] }>(
+        `${AGENT_PROXY}/daemons`,
+        { daemons: [] },
+        token,
+      ).then((d) => setDaemons(d.daemons));
     load();
     const id = setInterval(load, interval);
     return () => clearInterval(id);
-  }, [interval]);
+  }, [interval, token]);
 
   return daemons;
 }
@@ -170,13 +206,16 @@ export interface TCMMHealth {
 
 export function useTCMMHealth(interval = 10000) {
   const [health, setHealth] = useState<TCMMHealth | null>(null);
+  const { token } = useAuthContext();
 
   useEffect(() => {
-    const load = () => fetchJSON<TCMMHealth | null>(TCMM_HEALTH_URL, null).then(setHealth);
+    if (!token) return;
+    const load = () =>
+      fetchJSON<TCMMHealth | null>(TCMM_HEALTH_URL, null, token).then(setHealth);
     load();
     const id = setInterval(load, interval);
     return () => clearInterval(id);
-  }, [interval]);
+  }, [interval, token]);
 
   return health;
 }
@@ -190,8 +229,10 @@ export interface ServiceStatus {
 
 export function useServiceHealth(interval = 15000) {
   const [services, setServices] = useState<ServiceStatus[]>([]);
+  const { token } = useAuthContext();
 
   useEffect(() => {
+    if (!token) return;
     const check = async () => {
       // Services we can reach directly from the browser (have CORS)
       const directTargets = [
@@ -202,7 +243,10 @@ export function useServiceHealth(interval = 15000) {
       const directResults: ServiceStatus[] = await Promise.all(
         directTargets.map(async ({ name, url }) => {
           try {
-            const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
+            const resp = await fetch(url, {
+              headers: authHeaders(token),
+              signal: AbortSignal.timeout(3000),
+            });
             return { name, url, status: resp.ok ? ('up' as const) : ('down' as const) };
           } catch {
             return { name, url, status: 'down' as const };
@@ -229,7 +273,7 @@ export function useServiceHealth(interval = 15000) {
     check();
     const id = setInterval(check, interval);
     return () => clearInterval(id);
-  }, [interval]);
+  }, [interval, token]);
 
   return services;
 }
@@ -277,30 +321,24 @@ export interface TokenStats {
   }>;
 }
 
-export function useTokenStats(interval = 3000) {
-  const [data, setData] = useState<TokenStats | null>(null);
-
-  useEffect(() => {
-    const load = () =>
-      fetchJSON<TokenStats | null>(`${TCMM_URL}/api/token_stats`, null).then(setData);
-    load();
-    const id = setInterval(load, interval);
-    return () => clearInterval(id);
-  }, [interval]);
-
-  return data;
+// useTokenStats and useMemoryHeatmap previously fetched directly from
+// TCMM via /api/tcmm/api/token_stats and /api/tcmm/api/memory_heatmap.
+// The 2026-04-24 spear-phish lockdown sealed those routes at the
+// Caddy edge -- /api/memory_heatmap was THE leak: it returned raw
+// chat content from any active session unauthenticated. Re-exposing
+// it through a JWT-gated proxy is feasible but incomplete: every
+// authenticated user would see every other user's heatmap because
+// TCMM isn't user-scoped on this endpoint yet. Until that's fixed
+// these hooks return null so the panel renders its empty-state UI
+// instead of stale data or proxy errors.
+//
+// TODO: add per-user scoping to TCMM /api/memory_heatmap and
+// /api/token_stats, then add /api/veilguard-client/tcmm-heatmap and
+// /api/veilguard-client/tcmm-token-stats proxies and re-enable.
+export function useTokenStats(_interval = 3000) {
+  return null as TokenStats | null;
 }
 
-export function useMemoryHeatmap(interval = 5000) {
-  const [data, setData] = useState<MemoryHeatmapData | null>(null);
-
-  useEffect(() => {
-    const load = () =>
-      fetchJSON<MemoryHeatmapData | null>(`${TCMM_URL}/api/memory_heatmap`, null).then(setData);
-    load();
-    const id = setInterval(load, interval);
-    return () => clearInterval(id);
-  }, [interval]);
-
-  return data;
+export function useMemoryHeatmap(_interval = 5000) {
+  return null as MemoryHeatmapData | null;
 }
