@@ -15,7 +15,25 @@ Usage:
 # remote version is higher, the client downloads the new installer,
 # runs it silently, and exits so Inno Setup can replace files.
 # Semver: MAJOR.MINOR.PATCH. 3-part only; pre-release tags not supported.
-__version__ = "0.2.1"
+#
+# 0.2.2 (2026-04-26): self-heal on revoked credentials. When the WS
+# server returns "Invalid token" or "Missing user_id" the daemon now
+# wipes the stored token+user_id from ~/.veilguard/config.yaml,
+# launches the setup page at http://localhost:9090/, and waits for the
+# user to paste a fresh QR-blob from the LibreChat cowork panel. Pre-
+# 0.2.2 daemons just looped forever on auth failure, requiring the
+# user to manually delete config.yaml and reinstall — that's what bit
+# us during the spear-phish-incident token rotation on 2026-04-24.
+__version__ = "0.2.2"
+
+
+class CredentialsRevokedError(Exception):
+    """Raised by ``run_daemon`` when the WS server explicitly rejects
+    our credentials. ``main()`` catches this, wipes the stored token /
+    user_id, re-runs the setup UI, then restarts the daemon loop with
+    the freshly pasted credentials. Treat distinct from network errors
+    (which we want to keep retrying with backoff)."""
+    pass
 
 import argparse
 import asyncio
@@ -673,6 +691,20 @@ async def run_daemon(config: dict):
                 resp = json.loads(await ws.recv())
                 if "error" in resp:
                     logger.error(f"Auth failed: {resp['error']}")
+                    # Distinguish "credentials are bad" from "network /
+                    # server hiccup". The first one isn't recoverable by
+                    # retrying — looping forever just spams logs and
+                    # masks the real problem from the user. Bail out so
+                    # main() can wipe + relaunch setup.
+                    err = resp.get("error") or {}
+                    msg = (err.get("message") or "").lower()
+                    if (
+                        "invalid token" in msg
+                        or "missing user_id" in msg
+                        or "missing user-id" in msg
+                        or "user_id" in msg and "missing" in msg
+                    ):
+                        raise CredentialsRevokedError(err.get("message", ""))
                     await asyncio.sleep(current_delay)
                     continue
 
@@ -917,43 +949,118 @@ def main():
     if args.no_auto_update:
         config["auto_update"] = False
 
-    # If no token configured (and no CLI override), launch setup UI
-    if not config.get("token"):
-        print("""
-    Veilguard Client Daemon — First Run Setup
-    Opening setup page in your browser...
-    Scan the QR code from LibreChat to connect.
-        """)
-        from setup_server import run_setup_server, open_setup_page
+    # If no token / no user_id configured (or one was just wiped after
+    # CredentialsRevokedError), launch setup UI before entering the
+    # daemon loop. After the user pastes the new QR-blob, the setup
+    # callback returns the fresh config dict.
+    if not config.get("token") or not config.get("user_id"):
+        config = _run_first_run_setup()
 
-        setup_done = asyncio.Event()
-        setup_config = {}
-
-        def on_setup(cfg):
-            nonlocal setup_config
-            setup_config = cfg
-            # Signal the main thread
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(setup_done.set)
-
-        run_setup_server(on_complete=on_setup)
-        open_setup_page()
-
-        # Wait for setup to complete
-        async def wait_for_setup():
-            await setup_done.wait()
-            return setup_config
-
-        config = asyncio.run(wait_for_setup())
-
-    print(f"""
+    # Recovery loop. ``run_daemon`` raises CredentialsRevokedError when
+    # the cloud rejects our token (e.g. after a security rotation). On
+    # that, we wipe the bad creds, run setup so the user can paste a
+    # fresh QR-blob, and restart the daemon. Any other exception (or
+    # clean return) drops out of the loop. Network-level reconnects are
+    # already handled inside run_daemon's own while-True.
+    while True:
+        print(f"""
     Veilguard Client Daemon
     Server:       {config['server']}
     Client ID:    {config.get('client_id', 'unknown')}
     Project Root: {os.path.realpath(config.get('project_root', '.'))}
     """)
+        try:
+            asyncio.run(run_daemon(config))
+            break
+        except CredentialsRevokedError as exc:
+            print(f"""
+    [REPAIR] The Veilguard server rejected your access token: {exc}
+    [REPAIR] Wiping the stored token from {args.config or '~/.veilguard/config.yaml'}.
+    [REPAIR] Opening the setup page so you can paste a fresh QR-blob from
+    [REPAIR] the LibreChat 'Workspace' panel.
+            """)
+            _wipe_credentials_in_config(args.config)
+            config = _run_first_run_setup()
+            # Loop back and re-enter run_daemon with the new config.
 
-    asyncio.run(run_daemon(config))
+
+def _wipe_credentials_in_config(config_path: str) -> None:
+    """Strip ``token`` and ``user_id`` from the on-disk config so a
+    subsequent ``load_config`` returns empties and the setup UI fires.
+
+    Falls back to deleting the file if YAML parsing or rewrite fails —
+    a missing file is the strongest possible signal of "first run" and
+    setup_server handles it identically.
+    """
+    if not config_path:
+        config_path = os.path.join(
+            os.path.expanduser("~"), ".veilguard", "config.yaml"
+        )
+    if not os.path.exists(config_path):
+        return
+    try:
+        if yaml:
+            with open(config_path, "r") as f:
+                data = yaml.safe_load(f) or {}
+            data.pop("token", None)
+            data.pop("user_id", None)
+            with open(config_path, "w") as f:
+                yaml.dump(data, f, default_flow_style=False)
+        else:
+            # No yaml -> rewrite as JSON-style yaml minus the bad keys.
+            with open(config_path, "r") as f:
+                lines = f.readlines()
+            kept = [
+                ln for ln in lines
+                if not ln.startswith("token:") and not ln.startswith("user_id:")
+            ]
+            with open(config_path, "w") as f:
+                f.writelines(kept)
+    except Exception as e:
+        logger.warning(
+            f"Could not rewrite config to drop creds ({e}); deleting it instead"
+        )
+        try:
+            os.remove(config_path)
+        except Exception:
+            pass
+
+
+def _run_first_run_setup() -> dict:
+    """Spin up the local setup HTTP server and block until the user
+    pastes a fresh QR-blob. Returns the new config dict.
+
+    Used both for genuine first-runs (no config.yaml on disk) and for
+    post-rotation recovery (CredentialsRevokedError caught above).
+    """
+    print("""
+    Veilguard Client Daemon — Pairing Setup
+    Opening setup page in your browser at http://localhost:9090/
+
+    1. Open https://veilguard.phishield.com/ in another tab and log in.
+    2. Click the 'Workspace' side-panel.
+    3. Click the grey 'Click to copy' connection-string button.
+    4. Paste it into the setup page above.
+    """)
+    from setup_server import run_setup_server, open_setup_page
+
+    setup_done = asyncio.Event()
+    setup_config: dict = {}
+
+    def on_setup(cfg):
+        nonlocal setup_config
+        setup_config = cfg
+        loop = asyncio.get_event_loop()
+        loop.call_soon_threadsafe(setup_done.set)
+
+    run_setup_server(on_complete=on_setup)
+    open_setup_page()
+
+    async def wait_for_setup():
+        await setup_done.wait()
+        return setup_config
+
+    return asyncio.run(wait_for_setup())
 
 
 if __name__ == "__main__":

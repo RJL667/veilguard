@@ -13,7 +13,7 @@
 
 [Setup]
 AppName=Veilguard Client
-AppVersion=0.2.1
+AppVersion=0.2.2
 AppPublisher=Phishield
 AppPublisherURL=https://phishield.ai
 DefaultDirName={localappdata}\Veilguard
