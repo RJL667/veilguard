@@ -24,7 +24,16 @@ Usage:
 # 0.2.2 daemons just looped forever on auth failure, requiring the
 # user to manually delete config.yaml and reinstall — that's what bit
 # us during the spear-phish-incident token rotation on 2026-04-24.
-__version__ = "0.2.2"
+#
+# 0.2.3 (2026-04-28): fix the 0.2.2 self-heal that NEVER actually
+# fired. The `except Exception` clause in run_daemon's connect loop
+# was swallowing CredentialsRevokedError before main() could catch
+# it, so the daemon just logged "Unexpected error: " and reconnected
+# forever. Now CredentialsRevokedError is caught explicitly and
+# re-raised. Caught by 0.2.2's smoke test on PJ's machine: he
+# upgraded to 0.2.2, the cloud rejected his rotated token, and 0.2.2
+# still didn't show the setup page.
+__version__ = "0.2.3"
 
 
 class CredentialsRevokedError(Exception):
@@ -814,6 +823,15 @@ async def run_daemon(config: dict):
                 finally:
                     hb_task.cancel()
 
+        except CredentialsRevokedError:
+            # Don't swallow this -- main() needs to wipe creds and run
+            # the setup UI. The catch-all `except Exception` below would
+            # otherwise treat it as a transient hiccup and loop forever.
+            # This was the actual bug behind "0.2.2 fresh install does
+            # not show QR screen" on PJ's machine: self-heal raised, the
+            # broad except logged "Unexpected error: ", slept, retried,
+            # and the user never saw the setup page.
+            raise
         except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as e:
             logger.warning(f"Disconnected: {e}. Reconnecting in {current_delay}s...")
             await asyncio.sleep(current_delay)
@@ -1032,6 +1050,16 @@ def _run_first_run_setup() -> dict:
 
     Used both for genuine first-runs (no config.yaml on disk) and for
     post-rotation recovery (CredentialsRevokedError caught above).
+
+    Threading model: setup_server runs in a worker thread. When the
+    user POSTs the new credentials, our on_setup callback runs in
+    that thread and needs to wake the main thread up. Using an
+    ``asyncio.Event`` for this was a 0.2.2 bug -- on Python 3.12
+    ``asyncio.get_event_loop()`` from a non-main thread raises, so
+    the signal silently dropped and main blocked forever even though
+    config.yaml had been written. ``threading.Event`` is the
+    cross-thread-safe primitive; we don't need asyncio for a flow
+    that's just "block until callback fires."
     """
     print("""
     Veilguard Client Daemon — Pairing Setup
@@ -1042,25 +1070,21 @@ def _run_first_run_setup() -> dict:
     3. Click the grey 'Click to copy' connection-string button.
     4. Paste it into the setup page above.
     """)
+    import threading
     from setup_server import run_setup_server, open_setup_page
 
-    setup_done = asyncio.Event()
+    setup_done = threading.Event()
     setup_config: dict = {}
 
     def on_setup(cfg):
         nonlocal setup_config
         setup_config = cfg
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(setup_done.set)
+        setup_done.set()
 
     run_setup_server(on_complete=on_setup)
     open_setup_page()
-
-    async def wait_for_setup():
-        await setup_done.wait()
-        return setup_config
-
-    return asyncio.run(wait_for_setup())
+    setup_done.wait()
+    return setup_config
 
 
 if __name__ == "__main__":
