@@ -98,3 +98,13 @@ Veilguard_Health_Report_*.pdf
 /verify-endpoints.js
 /verify-new-user.js
 pii-proxy/migrate_audit_log.py
+
+# Local scratch / dev artifacts (untracked 2026-05-06)
+.githooks/
+CherryRain_CostEfficiency_Model.xlsx
+subagent_test*.txt
+scripts/tcmm_perf_trend.py
+scripts/tcmm_stats.py
+scripts/tcmm_test_aistudio_ingest.sh
+scripts/veilguard-tcmm-*.service
+scripts/veilguard-tcmm-*.timer
