@@ -17,17 +17,57 @@ mcp = FastMCP(
     instructions="Image tools for inspecting, resizing, converting images and creating charts.",
 )
 
+import re as _re
+
 WORKSPACE = os.environ.get("WORKSPACE_ROOT", "/workspace")
+
+# Windows absolute path pattern, e.g. ``C:\Users\foo``, ``D:/data``.
+# We run on Linux inside a docker container so a Path() over a string
+# like this is interpreted as a relative POSIX filename — Path.is_absolute()
+# returns False, the workspace prefix gets prepended, and you end up
+# trying to write to ``/workspace/C:\Users\foo`` which fails with EACCES.
+_WINDOWS_ABS_PATH_RE = _re.compile(r'^[A-Za-z]:[\\/]')
 
 
 def _safe_path(path: str) -> Path:
-    """Resolve path relative to workspace, prevent escape."""
+    """Resolve a tool path relative to the workspace and prevent escape.
+
+    The workspace lives at $WORKSPACE_ROOT (default /workspace) inside
+    the docker container. LibreChat agents sometimes echo the user's
+    Windows desktop paths verbatim ("C:\\Users\\...\\foo.png") into
+    tool calls — that path doesn't exist in the container, and silently
+    re-rooting it under /workspace produces a nonsense filename that
+    fails with a confusing "Permission denied". Reject it with a clear
+    error so the LLM (and the user) can correct course.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("Path is required")
+    if _WINDOWS_ABS_PATH_RE.match(path):
+        suggestion = _WINDOWS_ABS_PATH_RE.sub("", path).replace("\\", "/")
+        raise ValueError(
+            f"Path {path!r} looks like a Windows absolute path, but this "
+            f"server runs in a Linux container with workspace at "
+            f"{WORKSPACE}. The container does not mirror the user's "
+            f"Windows filesystem. Pass a workspace-relative path instead, "
+            f"e.g. {suggestion!r} (lands at {WORKSPACE}/{suggestion}). "
+            f"For files that must end up on the user's Windows host, use "
+            f"the host-exec server's host_file_write tool instead."
+        )
+    if "\\" in path:
+        raise ValueError(
+            f"Path {path!r} contains backslashes (Windows separators). "
+            f"Use forward slashes — try {path.replace(chr(92), '/')!r}."
+        )
     p = Path(path)
     if not p.is_absolute():
         p = Path(WORKSPACE) / p
     resolved = p.resolve()
     workspace_resolved = Path(WORKSPACE).resolve()
-    if not str(resolved).startswith(str(workspace_resolved)):
+    # is_relative_to (3.9+) avoids the str.startswith adjacent-name bug
+    # that would have allowed e.g. /workspace2 to pass the old check.
+    try:
+        resolved.relative_to(workspace_resolved)
+    except ValueError:
         raise ValueError(f"Access denied: path must be within {WORKSPACE}")
     return resolved
 

@@ -25,6 +25,7 @@ from core.llm import call_llm, resolve_backend
 from core.agentic import agentic_loop, AGENT_TOOLS, EFFORT_LEVELS
 from core.request_ctx import spawn_scope as _spawn_scope, capture_context as _capture_ctx
 from utils.helpers import short_id, elapsed
+from utils.tool_timing import resolve_timeout, record_duration, format_hint
 
 logger = logging.getLogger("veilguard.tasks")
 
@@ -109,7 +110,9 @@ def register(mcp):
         bg.asyncio_task = asyncio.create_task(_run())
         hint = ""
         if tools and max_turns > 1:
-            hint = f" Agentic worker — expect ~{max_turns}min; use `wait_for_tasks('[\"{task_id}\"]', timeout=600)` to block until done."
+            hint = (f" Agentic worker — expect ~{max_turns}min; use "
+                    f"`wait_for_tasks('[\"{task_id}\"]')` to block until done "
+                    f"(timeout auto-picks from history).")
         return f"Background task `{task_id}` started (tools={tools}, max_turns={max_turns}).{hint}"
 
     @mcp.tool()
@@ -122,7 +125,8 @@ def register(mcp):
         elif t.status == TaskStatus.FAILED: lines.append(f"\nError: {t.error}")
         elif t.status == TaskStatus.RUNNING:
             lines.append(f"\nStill running. Agentic workers typically take 5-10 min. "
-                         f"Use `wait_for_tasks('[\"{task_id}\"]', timeout=600)` to block.")
+                         f"Use `wait_for_tasks('[\"{task_id}\"]')` to block "
+                         f"(timeout auto-picks from history).")
         return "\n".join(lines)
 
     @mcp.tool()
@@ -134,7 +138,8 @@ def register(mcp):
             return (
                 f"Task `{task_id}` still {t.status.value} "
                 f"(elapsed {elapsed(t.created_at)}). Agentic workers take 5-10 min — "
-                f"use `wait_for_tasks('[\"{task_id}\"]', timeout=600)` to block until it's done."
+                f"use `wait_for_tasks('[\"{task_id}\"]')` to block until it's done "
+                f"(timeout auto-picks from history)."
             )
         if t.status == TaskStatus.FAILED: return f"Task `{task_id}` FAILED: {t.error}"
         if t.status == TaskStatus.CANCELLED: return f"Task `{task_id}` was cancelled."
@@ -233,6 +238,15 @@ def register(mcp):
         as ``start_task``. Set ``tools=False`` / ``max_turns=1`` for
         the old single-shot behaviour when the task doesn't need
         web or memory lookups.
+
+        wait_seconds:
+          - 0 (default): fire-and-forget. Spawn the task, return
+            immediately. Use ``check_task`` / ``get_result`` to follow up.
+          - -1: block until done with an auto-picked timeout. The
+            system uses the role and your past wait history to choose
+            a sensible value. Use this when you want to wait without
+            guessing a number.
+          - >0: explicit max-wait seconds, clamped to [1, 900].
         """
         if system_prompt:
             sys_prompt, role_name = system_prompt, "Custom Agent"
@@ -268,33 +282,68 @@ def register(mcp):
         # 5-10 min to complete (vs ~15s for the old single-shot
         # ``call_llm`` path). Raised the cap from 90s → 900s so
         # ``wait_seconds`` can actually wait for an agentic run.
-        # Callers that don't want to block still pass 0 (default).
-        wait = min(max(wait_seconds, 0), 900)
-        if wait > 0:
-            deadline = time.time() + wait
-            while time.time() < deadline:
-                if bg.status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED): break
-                await asyncio.sleep(1)
-            if bg.status == TaskStatus.DONE:
-                runtime = elapsed(bg.started_at, bg.finished_at)
-                return f"# Task `{task_id}` — {role_name} (done in {runtime})\n\n{bg.result}"
-            elif bg.status == TaskStatus.FAILED:
-                return f"Task `{task_id}` FAILED: {bg.error}"
-            return f"Task `{task_id}` still running. Use `check_task(\"{task_id}\")` to poll."
-        return f"Background task `{task_id}` started. Est ~{est}s."
+        #
+        # wait_seconds semantics:
+        #   0  → don't wait, return after spawn (fire-and-forget; the
+        #        backwards-compat default that most callers use).
+        #   -1 → auto-pick: use derived/history defaults via the
+        #        smart-timeout layer (see utils.tool_timing).
+        #   >0 → explicit timeout, clamped to [1, 900].
+        if wait_seconds == 0:
+            return f"Background task `{task_id}` started. Est ~{est}s."
+
+        # Both -1 (auto) and explicit values flow through resolve_timeout.
+        # Keying by role_xN matches wait_for_tasks's convention so the
+        # two tools share a history bucket per (role, count=1).
+        timing_key = f"{role_name}_x1"
+        resolved = resolve_timeout(
+            tool_name="smart_task",
+            key=timing_key,
+            explicit=wait_seconds if wait_seconds > 0 else None,
+            derived_default=lambda: 600 if (tools and max_turns > 1) else 120,
+            hard_min=1, hard_max=900, fallback=300,
+        )
+
+        wait_start = time.time()
+        deadline = wait_start + resolved.timeout_seconds
+        while time.time() < deadline:
+            if bg.status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED):
+                break
+            await asyncio.sleep(1)
+
+        wait_elapsed = time.time() - wait_start
+        settled = bg.status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED)
+        record_duration("smart_task", timing_key, wait_elapsed, success=settled)
+
+        if bg.status == TaskStatus.DONE:
+            runtime = elapsed(bg.started_at, bg.finished_at)
+            body = f"# Task `{task_id}` — {role_name} (done in {runtime})\n\n{bg.result}"
+            return body + format_hint(resolved, actual_elapsed=wait_elapsed,
+                                       param_name="wait_seconds")
+        if bg.status == TaskStatus.FAILED:
+            return (f"Task `{task_id}` FAILED: {bg.error}"
+                    + format_hint(resolved, actual_elapsed=wait_elapsed,
+                                  param_name="wait_seconds"))
+        # Timeout fired before task settled.
+        return (f"Task `{task_id}` still running. Use `check_task(\"{task_id}\")` to poll."
+                + format_hint(resolved, hit_timeout=True,
+                              param_name="wait_seconds"))
 
     @mcp.tool()
-    async def wait_for_tasks(task_ids: str, timeout: int = 600) -> str:
+    async def wait_for_tasks(task_ids: str, timeout: int = 0) -> str:
         """Wait for multiple tasks to complete, then return all results.
 
-        Default timeout raised to 600s (10 min) with a cap of 1200s
-        (20 min) to match agentic workers — each one makes ~20 tool
-        calls over up to 7 turns and typically takes 5-10 min. The
-        old cap of 120s timed out mid-loop, forcing the planner to
-        fall back to doing its own searches in parallel while the
-        workers silently ran to completion. Callers that want a
-        fast probe can still pass a short timeout (e.g. ``timeout=5``)
+        Hard cap is 1200s (20 min) — agentic workers make ~20 tool calls
+        over up to 7 turns and typically take 5-10 min. Callers that
+        want a fast probe can pass a short timeout (e.g. ``timeout=5``)
         and poll ``get_result`` themselves.
+
+        Args:
+            task_ids: JSON array (e.g. ``'["t1","t2"]'``) or comma list.
+            timeout: Max wait seconds. Pass 0 (default) for "auto-pick" —
+                the system uses the task role/concurrency and your past
+                wait-history to pick a sensible default. Pass an explicit
+                value only when you have a specific reason. Capped at 1200s.
         """
         if task_ids.startswith("["):
             ids = json.loads(task_ids)
@@ -302,11 +351,53 @@ def register(mcp):
             ids = [t.strip() for t in task_ids.split(",") if t.strip()]
         for tid in ids:
             if tid not in state.tasks: return f"Error: Unknown task ID '{tid}'"
-        deadline = time.time() + min(max(timeout, 1), 1200)
+
+        # Smart-default the timeout. Key on (role, count) so a fleet of
+        # agentic workers tracks separately from a single quick-summary
+        # task. Mixed-role waits get a coarser bucket — we lose precision
+        # but the system still learns roughly.
+        roles = {state.tasks[tid].role_name for tid in ids}
+        if len(roles) == 1:
+            key = f"{next(iter(roles))}_x{len(ids)}"
+        else:
+            key = f"mixed_x{len(ids)}"
+
+        # Tool-derived default: agentic workers (max_turns > 1) get
+        # 600s, single-shot tasks 120s. Use the max across the set —
+        # the wait completes when the slowest one finishes.
+        def _derived():
+            longest = 120
+            for tid in ids:
+                t = state.tasks[tid]
+                # max_turns lives on BackgroundTask if the task was started
+                # via the agentic spawner; default to 1 if absent.
+                turns = getattr(t, "max_turns", 1) or 1
+                est = 600 if turns > 1 else 120
+                longest = max(longest, est)
+            return longest
+
+        resolved = resolve_timeout(
+            tool_name="wait_for_tasks",
+            key=key,
+            explicit=timeout if timeout > 0 else None,
+            derived_default=_derived,
+            hard_min=1, hard_max=1200, fallback=600,
+        )
+
+        wait_start = time.time()
+        deadline = wait_start + resolved.timeout_seconds
         while time.time() < deadline:
             if all(state.tasks[tid].status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED) for tid in ids):
                 break
             await asyncio.sleep(1)
+
+        all_settled = all(
+            state.tasks[tid].status in (TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED)
+            for tid in ids
+        )
+        elapsed_s = time.time() - wait_start
+        record_duration("wait_for_tasks", key, elapsed_s, success=all_settled)
+
         output = [f"# Results for {len(ids)} tasks\n"]
         for tid in ids:
             t = state.tasks[tid]
@@ -316,4 +407,7 @@ def register(mcp):
                 output.append(f"## `{tid}` — FAILED\n{t.error}\n")
             else:
                 output.append(f"## `{tid}` — {t.status.value}\n")
-        return "\n---\n".join(output)
+        body = "\n---\n".join(output)
+        if all_settled:
+            return body + format_hint(resolved, actual_elapsed=elapsed_s, param_name="timeout")
+        return body + format_hint(resolved, hit_timeout=True, param_name="timeout")

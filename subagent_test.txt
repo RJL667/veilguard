@@ -1,0 +1,4 @@
+Veilguard sub-agent test
+Created by: spawned sub-agent
+Purpose: end-to-end smoke test of file write capability from a child agent
+Owner: Rudolph Lamprecht

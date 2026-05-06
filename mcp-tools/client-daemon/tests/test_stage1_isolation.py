@@ -241,14 +241,39 @@ async def main():
         )
 
     # ── Download URL still serves the installer ────────────────────
+    # Resolve the current installer URL via the manifest rather than
+    # hardcoding a filename. Post-0.2.5 the .exe is version-stamped
+    # (VeilguardSetup-X.Y.Z.exe), so the only stable way to find it
+    # is via /api/client/latest, which is what the daemon uses too.
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.head(f"{SUB_AGENTS}/download/VeilguardSetup.exe")
-        record(
-            "Installer download URL returns 200 + attachment",
-            resp.status_code == 200
-            and "attachment" in (resp.headers.get("Content-Disposition") or ""),
-            f"status={resp.status_code} cd={resp.headers.get('Content-Disposition')}",
-        )
+        manifest_resp = await client.get(f"{SUB_AGENTS}/api/client/latest")
+        installer_url = ""
+        if manifest_resp.status_code == 200:
+            try:
+                manifest = manifest_resp.json()
+                url = manifest.get("url", "")
+                if url.startswith("/"):
+                    installer_url = f"{SUB_AGENTS}{url}"
+                elif url.startswith(("http://", "https://")):
+                    installer_url = url
+            except Exception:
+                pass
+
+        if not installer_url:
+            record(
+                "Installer download URL returns 200 + attachment",
+                False,
+                f"manifest unreadable: status={manifest_resp.status_code}",
+            )
+        else:
+            resp = await client.head(installer_url)
+            record(
+                "Installer download URL returns 200 + attachment",
+                resp.status_code == 200
+                and "attachment" in (resp.headers.get("Content-Disposition") or ""),
+                f"url={installer_url} status={resp.status_code} "
+                f"cd={resp.headers.get('Content-Disposition')}",
+            )
 
     # ── Summary ────────────────────────────────────────────────────
     passed = sum(1 for _, p, _ in RESULTS if p)

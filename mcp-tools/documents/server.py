@@ -5,26 +5,77 @@ Tools: read_pdf, create_pdf, read_docx, create_docx, read_xlsx, create_xlsx, rea
 
 import json
 import os
+import pathlib
+import sys
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+
+# Pull in shared MCP helpers (caching, offload, error hints, cost). These
+# live under mcp-tools/_shared/ so every server can import them with a
+# 2-line shim. Stdlib only — no extra requirements.txt entries needed.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "_shared"))
+from tool_caching import cached_with_mtime  # noqa: E402
+from result_offload import auto_offload  # noqa: E402
+from error_hints import enrich_error  # noqa: E402
 
 mcp = FastMCP(
     "documents",
     instructions="Document tools for reading and creating PDF, Word, Excel, and PowerPoint files.",
 )
 
+import re as _re
+
 WORKSPACE = os.environ.get("WORKSPACE_ROOT", "/workspace")
+
+# Windows absolute path pattern, e.g. ``C:\Users\foo``, ``D:/data``.
+# We run on Linux inside a docker container so a Path() over a string
+# like this is interpreted as a relative POSIX filename — Path.is_absolute()
+# returns False, the workspace prefix gets prepended, and you end up
+# trying to write to ``/workspace/C:\Users\foo`` which fails with EACCES.
+# Catch it explicitly and tell the LLM what to do instead.
+_WINDOWS_ABS_PATH_RE = _re.compile(r'^[A-Za-z]:[\\/]')
 
 
 def _safe_path(path: str) -> Path:
-    """Resolve path relative to workspace, prevent escape."""
+    """Resolve a tool path relative to the workspace and prevent escape.
+
+    The workspace lives at $WORKSPACE_ROOT (default /workspace) inside
+    the docker container. LibreChat agents sometimes echo the user's
+    Windows desktop paths verbatim ("C:\\Users\\...\\foo.xlsx") into
+    tool calls — that path doesn't exist in the container, and silently
+    re-rooting it under /workspace produces a nonsense filename that
+    fails with a confusing "Permission denied". Reject it with a clear
+    error so the LLM (and the user) can correct course.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("Path is required")
+    if _WINDOWS_ABS_PATH_RE.match(path):
+        suggestion = _WINDOWS_ABS_PATH_RE.sub("", path).replace("\\", "/")
+        raise ValueError(
+            f"Path {path!r} looks like a Windows absolute path, but this "
+            f"server runs in a Linux container with workspace at "
+            f"{WORKSPACE}. The container does not mirror the user's "
+            f"Windows filesystem. Pass a workspace-relative path instead, "
+            f"e.g. {suggestion!r} (lands at {WORKSPACE}/{suggestion}). "
+            f"For files that must end up on the user's Windows host, use "
+            f"the host-exec server's host_file_write tool instead."
+        )
+    if "\\" in path:
+        raise ValueError(
+            f"Path {path!r} contains backslashes (Windows separators). "
+            f"Use forward slashes — try {path.replace(chr(92), '/')!r}."
+        )
     p = Path(path)
     if not p.is_absolute():
         p = Path(WORKSPACE) / p
     resolved = p.resolve()
     workspace_resolved = Path(WORKSPACE).resolve()
-    if not str(resolved).startswith(str(workspace_resolved)):
+    # is_relative_to (3.9+) avoids the str.startswith adjacent-name bug
+    # that would have allowed e.g. /workspace2 to pass the old check.
+    try:
+        resolved.relative_to(workspace_resolved)
+    except ValueError:
         raise ValueError(f"Access denied: path must be within {WORKSPACE}")
     return resolved
 
@@ -33,6 +84,8 @@ def _safe_path(path: str) -> Path:
 
 
 @mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
+@auto_offload(threshold=50_000)
 def read_pdf(path: str, pages: str = "") -> str:
     """Extract text from a PDF file.
 
@@ -69,7 +122,8 @@ def read_pdf(path: str, pages: str = "") -> str:
         doc.close()
         return "\n".join(output)
     except Exception as e:
-        return f"Error reading PDF: {e}"
+        return enrich_error("read_pdf", f"Error reading PDF: {e}",
+                              context={"path": path})
 
 
 @mcp.tool()
@@ -328,6 +382,8 @@ def pdf_add_watermark(path: str, text: str = "CONFIDENTIAL", opacity: float = 0.
 
 
 @mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
+@auto_offload(threshold=50_000)
 def read_docx(path: str) -> str:
     """Extract text from a Word document.
 
@@ -367,7 +423,8 @@ def read_docx(path: str) -> str:
 
         return "\n".join(output)
     except Exception as e:
-        return f"Error reading DOCX: {e}"
+        return enrich_error("read_docx", f"Error reading DOCX: {e}",
+                              context={"path": path})
 
 
 @mcp.tool()
@@ -416,6 +473,8 @@ def create_docx(path: str, content: str, title: str = "") -> str:
 
 
 @mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
+@auto_offload(threshold=50_000)
 def read_xlsx(path: str, sheet: str = "", max_rows: int = 500) -> str:
     """Read an Excel spreadsheet as text.
 
@@ -455,7 +514,8 @@ def read_xlsx(path: str, sheet: str = "", max_rows: int = 500) -> str:
         wb.close()
         return "\n".join(output)
     except Exception as e:
-        return f"Error reading XLSX: {e}"
+        return enrich_error("read_xlsx", f"Error reading XLSX: {e}",
+                              context={"path": path})
 
 
 @mcp.tool()
@@ -509,7 +569,8 @@ def create_xlsx(path: str, data: str, sheet_name: str = "Sheet1") -> str:
     except json.JSONDecodeError:
         return "Error: 'data' must be a valid JSON string (list of dicts or list of lists)"
     except Exception as e:
-        return f"Error creating XLSX: {e}"
+        return enrich_error("create_xlsx", f"Error creating XLSX: {e}",
+                             context={"path": path})
 
 
 # ── Excel Edit ────────────────────────────────────────────────────────────────
@@ -658,6 +719,8 @@ def edit_docx(path: str, old_text: str, new_text: str, replace_all: bool = False
 
 
 @mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
+@auto_offload(threshold=50_000)
 def read_pptx(path: str) -> str:
     """Extract text from a PowerPoint presentation.
 
@@ -688,7 +751,8 @@ def read_pptx(path: str) -> str:
 
         return "\n".join(output)
     except Exception as e:
-        return f"Error reading PPTX: {e}"
+        return enrich_error("read_pptx", f"Error reading PPTX: {e}",
+                              context={"path": path})
 
 
 @mcp.tool()

@@ -1,0 +1,13 @@
+[Unit]
+Description=Weekly LanceDB maintenance for TCMM
+
+[Timer]
+# Sunday 03:00 local time. ~10-30s downtime once a week.
+OnCalendar=Sun 03:00
+# If the VM was off when the timer was due, run on next boot.
+Persistent=true
+# Random jitter so a fleet of VMs doesn't all hit at the exact same second.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

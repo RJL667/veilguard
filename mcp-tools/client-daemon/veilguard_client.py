@@ -33,7 +33,18 @@ Usage:
 # re-raised. Caught by 0.2.2's smoke test on PJ's machine: he
 # upgraded to 0.2.2, the cloud rejected his rotated token, and 0.2.2
 # still didn't show the setup page.
-__version__ = "0.2.3"
+#
+# 0.2.4 (2026-04-28): installer hardening — no daemon code change.
+# Bumping is purely to give the new VeilguardSetup.exe correct
+# embedded version metadata (FileVersion / ProductVersion) and to
+# anchor a stable AppId GUID for upgrade detection. Sarel hit a
+# confusion where 0.2.3's installer had no FileVersion resource AND
+# Inno's upgrade prompt cited the existing-installed version, so
+# users couldn't tell what version of the installer they had until
+# they finished installing. From 0.2.4 onwards, right-click ->
+# Properties -> Details on VeilguardSetup.exe shows the version
+# directly, and the AppId pin makes the upgrade flow predictable.
+__version__ = "0.2.4"
 
 
 class CredentialsRevokedError(Exception):

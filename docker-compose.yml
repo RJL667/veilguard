@@ -38,6 +38,14 @@ services:
       - librechat-logs:/app/api/logs
       # Custom Veilguard frontend (built from librechat-src fork)
       - ./librechat-src/client/dist:/app/client/dist
+      # Custom Veilguard backend routes (authenticated proxy for the
+      # client-daemon install flow).  Only the specific files we added
+      # or modified — mounting the whole api/ directory would shadow
+      # everything in the stock image.
+      - ./librechat-src/api/server/routes/veilguardClient.js:/app/api/server/routes/veilguardClient.js:ro
+      - ./librechat-src/api/server/routes/index.js:/app/api/server/routes/index.js:ro
+      - ./librechat-src/api/server/experimental.js:/app/api/server/experimental.js:ro
+      - ./librechat-src/api/server/index.js:/app/api/server/index.js:ro
 
   # === MongoDB ===
   mongodb:
@@ -69,6 +77,12 @@ services:
     volumes:
       - ./pii-proxy/app:/app/app
       - ./logs:/app/logs
+      # Mount the TCMM Lance directory so audit_db.py can write to the
+      # pii_audit table alongside TCMM's archive/sparse/dream tables.
+      # We speak raw LanceDB here — no TCMM package code ever runs in
+      # this container — but we share the on-disk store so ops only
+      # has to back up one directory for both services.
+      - ./tcmm-data:/tcmm-data
     env_file:
       - .env
     environment:
@@ -83,6 +97,10 @@ services:
       - MIN_SCORE=${MIN_SCORE:-0.7}
       - TCMM_ENABLED=${TCMM_ENABLED:-false}
       - TCMM_URL=${TCMM_URL:-http://host.docker.internal:8811}
+      # Where audit_db.py writes the pii_audit table.  Must be the
+      # same Lance directory TCMM opens on the host so rows live next
+      # to archive / sparse / dream data.
+      - VEILGUARD_AUDIT_DB_PATH=${VEILGUARD_AUDIT_DB_PATH:-/tcmm-data/veilguard/tcmm.db}
     restart: always
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health')"]

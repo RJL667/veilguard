@@ -1,14 +1,66 @@
-# Extends the stock LibreChat image with Python + MCP tool dependencies
-FROM ghcr.io/danny-avila/librechat-dev:latest
+# Veilguard LibreChat image — builds from the LOCAL fork at ./librechat-src/
+# so our patches to packages/api/src/utils/env.ts (MCP header substitution
+# diagnostics) and any other fork-level edits land in the compiled JS.
+# Previously we extended the upstream published image and patched the
+# compiled JS with sed (see patch-api.sh). That works for tiny targeted
+# edits but rots fast — switched to a proper multi-stage build so our
+# TypeScript patches get compiled normally.
+
+# ─── Stage 1: build the LibreChat fork ────────────────────────────────
+# Mirrors librechat-src/Dockerfile but scoped to our context root so we
+# can layer MCP tools on top without a second build.
+FROM node:20-alpine AS librechat-build
+
+RUN apk upgrade --no-cache \
+    && apk add --no-cache jemalloc python3 py3-pip uv
+
+# Add Astral's uv/uvx for extended MCP support (matches upstream)
+COPY --from=ghcr.io/astral-sh/uv:0.9.5-python3.12-alpine /usr/local/bin/uv /usr/local/bin/uvx /bin/
+
+ENV LD_PRELOAD=/usr/lib/libjemalloc.so.2
+ARG NODE_MAX_OLD_SPACE_SIZE=6144
+
+RUN mkdir -p /app && chown node:node /app
+WORKDIR /app
+USER node
+
+# Copy package manifests first for layer caching on unchanged deps.
+COPY --chown=node:node librechat-src/package.json librechat-src/package-lock.json ./
+COPY --chown=node:node librechat-src/api/package.json ./api/package.json
+COPY --chown=node:node librechat-src/client/package.json ./client/package.json
+COPY --chown=node:node librechat-src/packages/data-provider/package.json ./packages/data-provider/package.json
+COPY --chown=node:node librechat-src/packages/data-schemas/package.json ./packages/data-schemas/package.json
+COPY --chown=node:node librechat-src/packages/api/package.json ./packages/api/package.json
+
+RUN touch .env \
+    && mkdir -p /app/client/public/images /app/logs /app/uploads \
+    && npm config set fetch-retry-maxtimeout 600000 \
+    && npm config set fetch-retries 5 \
+    && npm config set fetch-retry-mintimeout 15000 \
+    && npm ci --no-audit
+
+# Copy the rest of the fork. .dockerignore in librechat-src/ excludes
+# node_modules, dist, .git, logs, etc. Our local patches
+# (packages/api/src/utils/env.ts diagnostic logging, etc.) land here.
+COPY --chown=node:node librechat-src/ .
+
+RUN NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}" npm run frontend \
+    && npm prune --production \
+    && npm cache clean --force
+
+EXPOSE 3080
+ENV HOST=0.0.0.0
+
+
+# ─── Stage 2: layer Veilguard MCP tool deps on the fork image ─────────
+FROM librechat-build AS veilguard
 
 USER root
 
-# Install Python + system deps for MCP tool servers (Alpine-based image)
-RUN apk add --no-cache python3 py3-pip \
-    jpeg-dev zlib-dev freetype-dev \
+# Python + image libs needed by MCP tool subprocesses
+RUN apk add --no-cache python3 py3-pip jpeg-dev zlib-dev freetype-dev \
     && ln -sf /usr/bin/python3 /usr/bin/python
 
-# Install MCP tool dependencies
 COPY mcp-tools/filesystem/requirements.txt /tmp/fs-reqs.txt
 COPY mcp-tools/code-exec/requirements.txt /tmp/exec-reqs.txt
 COPY mcp-tools/web/requirements.txt /tmp/web-reqs.txt
@@ -21,11 +73,11 @@ RUN pip install --no-cache-dir --break-system-packages \
     -r /tmp/doc-reqs.txt \
     -r /tmp/img-reqs.txt
 
-# Patch: Add conversationId to Anthropic API requests
-# This is a two-part patch on the compiled JS:
-# 1. In metadata: add conversation_id field
-# 2. In modelOptions: add conversationId from req.body
-COPY patch-api.sh /tmp/patch-api.sh
-RUN chmod +x /tmp/patch-api.sh && sh /tmp/patch-api.sh
+# The old patch-api.sh sed'd compiled JS for conversationId metadata
+# forwarding. Those edits now live in the fork source so the sed patch
+# is retired — keep this comment as a tombstone so anyone hunting for
+# it knows why it vanished. If a future upstream merge drops our
+# source-level edit, restore the source patch, not the sed.
 
 USER node
+CMD ["npm", "run", "backend"]

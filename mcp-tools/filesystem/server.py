@@ -5,10 +5,18 @@ Tools: read_file, write_file, list_directory, search_files, grep
 
 import fnmatch
 import os
+import pathlib
 import re
+import sys
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
+
+# Pull in shared MCP helpers (caching, offload, error hints, cost). These
+# live under mcp-tools/_shared/ so every server can import them with a
+# 2-line shim. Stdlib only — no extra requirements.txt entries needed.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "_shared"))
+from tool_caching import cached_with_mtime  # noqa: E402
 
 mcp = FastMCP("filesystem", instructions="File system tools for reading, writing, listing, searching, and grepping files.")
 
@@ -16,20 +24,59 @@ mcp = FastMCP("filesystem", instructions="File system tools for reading, writing
 WORKSPACE = os.environ.get("WORKSPACE_ROOT", "/workspace")
 
 
+# Windows absolute path pattern, e.g. ``C:\Users\foo``, ``D:/data``.
+# We run on Linux inside a docker container so a Path() over a string
+# like this is interpreted as a relative POSIX filename — Path.is_absolute()
+# returns False, the workspace prefix gets prepended, and you end up
+# trying to write to ``/workspace/C:\Users\foo`` which fails with EACCES.
+_WINDOWS_ABS_PATH_RE = re.compile(r'^[A-Za-z]:[\\/]')
+
+
 def _safe_path(path: str) -> Path:
-    """Resolve path relative to workspace, prevent escape."""
+    """Resolve a tool path relative to the workspace and prevent escape.
+
+    The workspace lives at $WORKSPACE_ROOT (default /workspace) inside
+    the docker container. LibreChat agents sometimes echo the user's
+    Windows desktop paths verbatim ("C:\\Users\\...\\foo.txt") into
+    tool calls — that path doesn't exist in the container, and silently
+    re-rooting it under /workspace produces a nonsense filename that
+    fails with a confusing "Permission denied". Reject it with a clear
+    error so the LLM (and the user) can correct course.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("Path is required")
+    if _WINDOWS_ABS_PATH_RE.match(path):
+        suggestion = _WINDOWS_ABS_PATH_RE.sub("", path).replace("\\", "/")
+        raise ValueError(
+            f"Path {path!r} looks like a Windows absolute path, but this "
+            f"server runs in a Linux container with workspace at "
+            f"{WORKSPACE}. The container does not mirror the user's "
+            f"Windows filesystem. Pass a workspace-relative path instead, "
+            f"e.g. {suggestion!r} (lands at {WORKSPACE}/{suggestion}). "
+            f"For files that must end up on the user's Windows host, use "
+            f"the host-exec server's host_file_write tool instead."
+        )
+    if "\\" in path:
+        raise ValueError(
+            f"Path {path!r} contains backslashes (Windows separators). "
+            f"Use forward slashes — try {path.replace(chr(92), '/')!r}."
+        )
     p = Path(path)
     if not p.is_absolute():
         p = Path(WORKSPACE) / p
     resolved = p.resolve()
-    # Restrict to workspace — prevent directory traversal
     workspace_resolved = Path(WORKSPACE).resolve()
-    if not str(resolved).startswith(str(workspace_resolved)):
+    # is_relative_to (3.9+) avoids the str.startswith adjacent-name bug
+    # that would have allowed e.g. /workspace2 to pass the old check.
+    try:
+        resolved.relative_to(workspace_resolved)
+    except ValueError:
         raise ValueError(f"Access denied: path must be within {WORKSPACE}")
     return resolved
 
 
 @mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
 def read_file(path: str, offset: int = 0, limit: int = 500) -> str:
     """Read the contents of a file.
 
@@ -424,6 +471,7 @@ def grep(pattern: str, path: str = ".", file_pattern: str = "*", max_results: in
 
 
 @mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
 def parse_csv(path: str, delimiter: str = ",", max_rows: int = 200) -> str:
     """Read a CSV file and return as formatted text table.
 
@@ -474,6 +522,7 @@ def parse_csv(path: str, delimiter: str = ",", max_rows: int = 200) -> str:
 
 
 @mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
 def parse_json(path: str, max_depth: int = 5) -> str:
     """Read and pretty-print a JSON file.
 
@@ -622,6 +671,7 @@ def transform_csv(path: str, operations: str, output_path: str = "") -> str:
 
 
 @mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
 def json_query(path: str, expression: str) -> str:
     """Query a JSON file using JMESPath expressions.
 
@@ -654,6 +704,148 @@ def json_query(path: str, expression: str) -> str:
         return f"Error: Invalid JMESPath expression: {e}"
     except Exception as e:
         return f"Error querying JSON: {e}"
+
+
+# ─── Jupyter notebook tools ───────────────────────────────────────────────
+# .ipynb files are JSON, so read_file/edit_file would technically work — but
+# they'd dump the whole structure as opaque text and any edit risks
+# corrupting the JSON shape (cell id collisions, missing required keys).
+# Use a real parser. nbformat is the canonical lib and round-trips cleanly.
+
+def _load_notebook(path: str):
+    """Parse a notebook + return (path, nbformat.NotebookNode) or raise ValueError."""
+    p = _safe_path(path)
+    if not p.exists():
+        raise ValueError(f"Notebook not found: {p}")
+    if p.suffix != ".ipynb":
+        raise ValueError(f"Not a notebook (.ipynb required): {p.name}")
+    try:
+        import nbformat
+    except ImportError as e:
+        raise ValueError("nbformat library required — pip install nbformat") from e
+    return p, nbformat.read(str(p), as_version=4)
+
+
+@mcp.tool()
+def notebook_read(path: str) -> str:
+    """Read a Jupyter notebook (.ipynb) as a structured cell listing.
+
+    Use this to inspect a notebook's cells before editing — read_file would
+    just dump the raw JSON. Returns each cell's id, type, and source so you
+    can target a specific cell with notebook_edit.
+
+    Args:
+        path: Notebook path (absolute or relative to workspace).
+    """
+    try:
+        p, nb = _load_notebook(path)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    out = [f"# {p.name} ({len(nb.cells)} cells)\n"]
+    for i, cell in enumerate(nb.cells):
+        cid = cell.get("id", "(no-id)")
+        ctype = cell.get("cell_type", "?")
+        src = cell.get("source", "")
+        if isinstance(src, list):
+            src = "".join(src)
+        out.append(f"## [{i}] {ctype} — id: `{cid}`")
+        out.append("```")
+        out.append(src.rstrip() or "(empty)")
+        out.append("```")
+        # For code cells, include execution count and a truncated text-output preview.
+        if ctype == "code":
+            ec = cell.get("execution_count")
+            out.append(f"_execution_count: {ec}_")
+            text_out = []
+            for o in cell.get("outputs", []):
+                if "text" in o:
+                    t = o["text"]
+                    text_out.append(t if isinstance(t, str) else "".join(t))
+                elif "data" in o and "text/plain" in o["data"]:
+                    t = o["data"]["text/plain"]
+                    text_out.append(t if isinstance(t, str) else "".join(t))
+            if text_out:
+                joined = "".join(text_out).rstrip()
+                if len(joined) > 400:
+                    joined = joined[:400] + "\n...(truncated)"
+                out.append(f"_output:_\n```\n{joined}\n```")
+        out.append("")
+    return "\n".join(out)
+
+
+@mcp.tool()
+def notebook_edit(path: str, new_source: str = "", cell_id: str = "",
+                  cell_index: int = -1, cell_type: str = "code",
+                  edit_mode: str = "replace") -> str:
+    """Edit, insert, or delete a cell in a Jupyter notebook (.ipynb).
+
+    For replace and insert, provide new_source. For delete, new_source is
+    ignored. Inserts go AFTER the target cell. For replace on a code cell,
+    existing outputs and execution_count are cleared (they're stale once
+    the source changes).
+
+    Use notebook_read first to find cell ids — they're more stable than
+    cell indices, which shift when cells are inserted/deleted.
+
+    Args:
+        path: Notebook path (.ipynb).
+        new_source: New cell source (replace or insert mode). Ignored for delete.
+        cell_id: Target cell's id (preferred over cell_index).
+        cell_index: 0-indexed position; used only if cell_id is empty.
+        cell_type: "code" or "markdown" — only relevant for insert mode.
+        edit_mode: "replace" (default), "insert", or "delete".
+    """
+    try:
+        p, nb = _load_notebook(path)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    if edit_mode not in ("replace", "insert", "delete"):
+        return f"Error: edit_mode must be 'replace', 'insert', or 'delete'; got '{edit_mode}'"
+    if edit_mode in ("replace", "insert") and not new_source:
+        return f"Error: new_source is required for edit_mode='{edit_mode}'"
+    if cell_type not in ("code", "markdown"):
+        return f"Error: cell_type must be 'code' or 'markdown'; got '{cell_type}'"
+
+    # Resolve target cell.
+    target_index = -1
+    if cell_id:
+        for i, cell in enumerate(nb.cells):
+            if cell.get("id") == cell_id:
+                target_index = i
+                break
+        if target_index < 0:
+            available = [c.get("id", "(no-id)") for c in nb.cells]
+            return f"Error: cell_id '{cell_id}' not found. Cells: {available}"
+    elif cell_index >= 0:
+        if cell_index >= len(nb.cells):
+            return (f"Error: cell_index {cell_index} out of range "
+                    f"(notebook has {len(nb.cells)} cells)")
+        target_index = cell_index
+    else:
+        return "Error: must provide either cell_id or cell_index >= 0"
+
+    import nbformat
+    if edit_mode == "delete":
+        removed_id = nb.cells[target_index].get("id", "(no-id)")
+        nb.cells.pop(target_index)
+        msg = f"Deleted cell {target_index} (id: `{removed_id}`)"
+    elif edit_mode == "insert":
+        new_cell = (nbformat.v4.new_code_cell(new_source) if cell_type == "code"
+                    else nbformat.v4.new_markdown_cell(new_source))
+        nb.cells.insert(target_index + 1, new_cell)
+        msg = (f"Inserted new {cell_type} cell at index {target_index + 1} "
+               f"(id: `{new_cell.get('id', '?')}`)")
+    else:  # replace
+        nb.cells[target_index]["source"] = new_source
+        if nb.cells[target_index].get("cell_type") == "code":
+            nb.cells[target_index]["outputs"] = []
+            nb.cells[target_index]["execution_count"] = None
+        msg = f"Replaced source of cell {target_index} (id: `{nb.cells[target_index].get('id', '?')}`)"
+
+    nbformat.write(nb, str(p))
+    return f"{msg} in {p.name}"
 
 
 if __name__ == "__main__":

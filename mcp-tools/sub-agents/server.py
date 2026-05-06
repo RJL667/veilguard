@@ -143,13 +143,30 @@ if __name__ == "__main__":
                     _ctx_user_id.reset(user_tok)
                     _ctx_conv_id.reset(conv_tok)
 
+        # SSE endpoint — Starlette 1.0 made route handlers strictly
+        # required to return a Response: the dispatcher now does
+        # ``response = await f(request); await response(scope, receive,
+        # send)``. The MCP SDK's connect_sse() context manager streams
+        # to the client itself and the handler has nothing meaningful
+        # to return — pre-1.0 the implicit None worked; in 1.0 it
+        # crashes with "TypeError: 'NoneType' object is not callable".
+        #
+        # Mounting a raw ASGI callable would also work but Mount on a
+        # bare path (``/sse``) issues a 307 redirect to ``/sse/`` and
+        # LibreChat's MCP client doesn't follow redirects. So we keep
+        # the Route and return a callable Response: Starlette invokes
+        # ``await sse_response(scope, receive, send)`` which dispatches
+        # straight into our SSE handling. Best of both worlds.
+        class _SseResponse:
+            """Minimal Response shim that owns the SSE stream lifecycle."""
+            async def __call__(self, scope, receive, send):
+                async with sse.connect_sse(scope, receive, send) as (read, write):
+                    await mcp._mcp_server.run(
+                        read, write, mcp._mcp_server.create_initialization_options()
+                    )
+
         async def handle_sse(request):
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send
-            ) as (read, write):
-                await mcp._mcp_server.run(
-                    read, write, mcp._mcp_server.create_initialization_options()
-                )
+            return _SseResponse()
 
         async def handle_trigger(request):
             """Webhook trigger endpoint — fires a daemon or one-shot agent."""
@@ -278,13 +295,38 @@ if __name__ == "__main__":
             return f"{scheme}://{host}/ws/client"
 
         def _public_download_url(request) -> str:
+            """Build the absolute installer URL the cowork panel hands to users.
+
+            Reads the current installer filename from version.json (written
+            by publish_release.py alongside the .exe). Pre-0.2.5 this was
+            hardcoded to ``VeilguardSetup.exe``, but that filename is now
+            version-stamped (``VeilguardSetup-X.Y.Z.exe``) so we look it
+            up at request time. Falls back to the legacy static name only
+            if the manifest is unreadable, which keeps the panel working
+            during a half-deployed state.
+            """
             override = os.environ.get("VEILGUARD_PUBLIC_DOWNLOAD_URL", "").strip()
             if override:
                 return override
             xfh = request.headers.get("x-forwarded-host", "").strip()
             host = xfh or request.headers.get("host", "localhost:8809")
             scheme = "https" if request.url.scheme == "https" or xfh else "http"
-            return f"{scheme}://{host}/download/VeilguardSetup.exe"
+
+            filename = "VeilguardSetup.exe"  # legacy fallback
+            try:
+                import json as _json
+                manifest_file = _DEFAULT_DOWNLOADS / "version.json"
+                if manifest_file.is_file():
+                    manifest = _json.loads(manifest_file.read_text(encoding="utf-8"))
+                    fn = manifest.get("filename", "").strip()
+                    # Defensive: reject any path-like value so a malformed
+                    # manifest can never produce a URL that escapes /download/.
+                    if fn and "/" not in fn and "\\" not in fn:
+                        filename = fn
+            except Exception:
+                pass
+
+            return f"{scheme}://{host}/download/{filename}"
 
         async def api_client_install(request):
             """Return the daemon installer URL for the calling user."""
@@ -609,7 +651,31 @@ if __name__ == "__main__":
             WebSocketRoute("/ws/client", endpoint=ws_client),
         ]
 
-        app = Starlette(routes=routes)
+        # Persistent state was loaded from disk in the bootstrap above,
+        # but the asyncio loop wasn't running yet — daemon + scheduler
+        # background tasks have to be started after uvicorn brings the
+        # loop up. Starlette's lifespan hook fires once the loop is
+        # live; the post-yield half gives us a graceful save before the
+        # process dies (otherwise up to 5 LLM calls of state can be lost
+        # between the periodic save_session() ticks).
+        #
+        # Note: we use the lifespan asynccontextmanager pattern rather
+        # than the older ``on_startup=[...]`` / ``on_shutdown=[...]``
+        # kwargs — newer Starlette (>= 0.36-ish) drops the kwarg form
+        # and requires lifespan. Lifespan also works on every Starlette
+        # since 0.13, so it's the safer cross-version choice.
+        from contextlib import asynccontextmanager
+        from storage.session import start_persistent_loops, save_session
+
+        @asynccontextmanager
+        async def _veilguard_lifespan(app):
+            await start_persistent_loops()
+            try:
+                yield
+            finally:
+                save_session()
+
+        app = Starlette(routes=routes, lifespan=_veilguard_lifespan)
 
         # Populate per-request (user_id, conversation_id) contextvars.
         app = RequestContextMiddleware(app)

@@ -155,3 +155,44 @@ mcpServers:
     command: python
     args:
       - "/app/mcp-tools/web/server.py"
+
+  # ─── SharePoint connector — OAuth-aware SSE transport ────────────────
+  #
+  # Per-user OAuth via Microsoft Identity Platform. LibreChat runs the
+  # standard /api/mcp/sharepoint/oauth/initiate flow against the
+  # endpoints below, stores the resulting token via MCPTokenStorage,
+  # then injects `Authorization: Bearer <token>` on every SSE request
+  # to the SharePoint MCP server (running locally on port 8812).
+  #
+  # The SharePoint MCP server (mcp-tools/connectors/sharepoint/server.py)
+  # also reads tokens via the internal credential endpoint
+  # (/api/mcp/internal/oauth/token/...) for in-process recall fan-out
+  # — see mcp-tools/connectors/_base/credentials.py.
+  #
+  # ── Operator setup (uncomment + configure to enable) ───────────────
+  # 1. Register an Azure AD app at https://entra.microsoft.com:
+  #      Redirect URI: <YOUR_LIBRECHAT_BASE>/api/mcp/sharepoint/oauth/callback
+  #      API permissions: Sites.Read.All, Files.Read.All, offline_access
+  #                       (delegated, NOT application)
+  #      Grant admin consent if your tenant requires it.
+  # 2. Set env vars on the LibreChat container:
+  #      SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET,
+  #      VEILGUARD_INTERNAL_SECRET (also on the SharePoint server side)
+  # 3. Run the SharePoint MCP server:
+  #      SHAREPOINT_TRANSPORT=sse SHAREPOINT_PORT=8812 \
+  #      python mcp-tools/connectors/sharepoint/server.py
+  # 4. Uncomment the block below.
+  # 5. Restart LibreChat.
+  #
+  # sharepoint:
+  #   type: sse
+  #   url: "http://host.docker.internal:8812/sse"
+  #   headers:
+  #     x-conversation-id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+  #     x-user-id: "{{LIBRECHAT_USER_ID}}"
+  #   oauth:
+  #     authorization_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+  #     token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+  #     client_id: "${SHAREPOINT_CLIENT_ID}"
+  #     client_secret: "${SHAREPOINT_CLIENT_SECRET}"
+  #     scope: "Sites.Read.All Files.Read.All offline_access"
