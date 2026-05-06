@@ -20,7 +20,8 @@ from typing import Optional
 # users saw ``LinkedIn5`` / ``Jun Hirata1`` in their chat (23 Apr 2026).
 _REF_TOKEN_RE = re.compile(
     r"\bREF_(?:PERSON|EMAIL|PHONE|IP|LOCATION|URL|CREDIT_CARD|"
-    r"SA_ID|SA_PHONE|IBAN|ORG|DATE|API_KEY|CARD)_\d+\b"
+    r"ID|IBAN_CODE|IBAN|ORG|DATE|API_KEY|CARD|BANK_ACCOUNT|"
+    r"SA_ID|SA_PHONE)_\d+\b"
 )
 
 

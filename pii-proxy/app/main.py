@@ -533,6 +533,94 @@ def _extract_tool_pair(messages: list) -> list:
     return items
 
 
+# ── Veilguard provenance envelope stripping ─────────────────────────────────
+#
+# Connectors (SharePoint, Slack, ...) wrap their tool output in this shape
+# so the TCMM ingest path can extract acl/tool_ref/etag/title metadata::
+#
+#     {
+#       "content": "<LLM-visible text>",
+#       "_veilguard": {connector, tool_ref, acl, etag, title}
+#     }
+#
+# By the time the gateway is about to forward the request to the LLM, TCMM
+# ingest has already pulled the metadata via its own parser (in
+# `veilguard_adapter.ingest_turn`). We strip the envelope here so the LLM
+# only ever sees the inner `content` — the `_veilguard` block is internal
+# infrastructure.
+#
+# Strip is unconditional on every chat-completion request: tool_result
+# blocks from prior turns also carry envelopes (LibreChat re-sends history
+# every turn), and the LLM never benefits from seeing them.
+#
+# The parser is a permissive mirror of the ones in
+# mcp-tools/connectors/_base/envelope.py and TCMM's veilguard_adapter.py.
+# Plain text, malformed JSON, or JSON without `_veilguard` all pass through
+# untouched.
+
+_VEILGUARD_ENV_KEY = "_veilguard"
+
+
+def _strip_envelope_from_str(text: str) -> str | None:
+    """Return inner ``content`` if ``text`` is a `_veilguard` envelope.
+
+    Returns ``None`` when the input is not an envelope — caller keeps
+    the original text unchanged.
+    """
+    if not isinstance(text, str) or not text or not text.lstrip().startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict) or _VEILGUARD_ENV_KEY not in parsed:
+        return None
+    inner = parsed.get("content", "")
+    return inner if isinstance(inner, str) else str(inner)
+
+
+def _strip_veilguard_envelopes_from_messages(messages: list) -> int:
+    """Strip `_veilguard` envelopes from every tool_result content block
+    in ``messages``. Mutates the messages list in place.
+
+    Tool_result content can be a string OR a list of sub-blocks
+    (Anthropic supports text/image sub-blocks). Both cases are handled.
+
+    Returns the number of envelopes stripped, for logging.
+    """
+    if not isinstance(messages, list):
+        return 0
+    stripped_count = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        # Anthropic puts tool_results in role=user messages with content blocks
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not isinstance(blk, dict) or blk.get("type") != "tool_result":
+                continue
+            blk_content = blk.get("content", "")
+            if isinstance(blk_content, str):
+                inner = _strip_envelope_from_str(blk_content)
+                if inner is not None:
+                    blk["content"] = inner
+                    stripped_count += 1
+            elif isinstance(blk_content, list):
+                for sub in blk_content:
+                    if not isinstance(sub, dict):
+                        continue
+                    if sub.get("type") == "text":
+                        inner = _strip_envelope_from_str(sub.get("text", ""))
+                        if inner is not None:
+                            sub["text"] = inner
+                            stripped_count += 1
+    return stripped_count
+
+
 def _is_chat_completion(remaining_path: str, method: str) -> bool:
     """Check if this is a chat completions request (the path TCMM should intercept)."""
     if method != "POST":
@@ -1588,6 +1676,19 @@ async def gateway(request: Request, path: str):
                         f"{_stripped} oldest to stay within Anthropic's limit of "
                         f"{_ANTHROPIC_CACHE_LIMIT}"
                     )
+
+                # Strip Veilguard provenance envelopes from tool_result
+                # blocks before the LLM sees them. TCMM ingest (run above)
+                # has already pulled the metadata — the LLM only needs the
+                # inner content.
+                _vg_messages = data.get("messages")
+                if isinstance(_vg_messages, list):
+                    _stripped_envelopes = _strip_veilguard_envelopes_from_messages(_vg_messages)
+                    if _stripped_envelopes:
+                        logger.info(
+                            f"  [VG-ENV] stripped {_stripped_envelopes} "
+                            f"_veilguard envelope(s) from tool_result content"
+                        )
 
                 # Redact PII
                 redacted = redactor.redact_json(data, pii_session_id)

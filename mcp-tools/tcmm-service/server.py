@@ -72,6 +72,132 @@ logger.info(f"Data directory: {DATA_DIR}")
 from adapters.veilguard_adapter import VeilguardTCMM
 
 
+# ── Connector framework (optional: gated on env) ─────────────────────────────
+#
+# The connector framework lives alongside this service in
+# ``mcp-tools/connectors/``. We add it to sys.path with the same
+# pattern the documents/filesystem MCP servers use for ``_shared/``,
+# then import the recall + rendering helpers we need.
+#
+# If the framework directory is missing or imports fail, the recall
+# step degrades to "TCMM only" — no fan-out, no shadow blocks. This
+# keeps the service runnable on minimal deployments.
+_CONNECTORS_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "connectors")
+)
+if os.path.isdir(_CONNECTORS_DIR) and _CONNECTORS_DIR not in sys.path:
+    sys.path.insert(0, _CONNECTORS_DIR)
+
+try:
+    from _base import (  # type: ignore[import-not-found]
+        SHADOW_BLOCK_SYSTEM_PROMPT,
+        UserContext as _ConnectorUserContext,
+        default_registry as _connector_registry,
+        gather_hints as _gather_connector_hints,
+        render_shadow_blocks as _render_shadow_blocks,
+    )
+    _CONNECTORS_AVAILABLE = True
+except ImportError as _e:
+    logger.info(f"Connector framework unavailable ({_e}) — recall stays TCMM-only")
+    _CONNECTORS_AVAILABLE = False
+    SHADOW_BLOCK_SYSTEM_PROMPT = ""
+    _ConnectorUserContext = None  # type: ignore[assignment, misc]
+    _connector_registry = None  # type: ignore[assignment]
+    _gather_connector_hints = None  # type: ignore[assignment]
+    _render_shadow_blocks = None  # type: ignore[assignment]
+
+
+def _connectors_enabled() -> bool:
+    """Master gate for connector recall fan-out.
+
+    Default off — explicit opt-in via env var lets us ship the
+    framework without changing live request behavior. Once a real
+    connector ships and is paired with a PII-proxy preamble that
+    teaches the LLM about shadow blocks, this flips to on by default.
+    """
+    if not _CONNECTORS_AVAILABLE:
+        return False
+    flag = os.environ.get("VEILGUARD_CONNECTORS_ENABLED", "").lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def _connector_hint_deadline_ms() -> int:
+    try:
+        return int(os.environ.get("VEILGUARD_CONNECTOR_HINT_DEADLINE_MS", "300"))
+    except ValueError:
+        return 300
+
+
+def _snippet_to_hit_dict(snippet) -> dict:
+    """Convert a Snippet (from `gather_hints`) into the dict shape that
+    `render_shadow_blocks` consumes — same shape produced by
+    `VeilguardTCMM.recall_structured()`. Single conversion site so
+    rendering has one input contract regardless of source."""
+    return {
+        "text": snippet.content,
+        "score": snippet.score,
+        "source": snippet.source,
+        "title": snippet.title,
+        "etag": snippet.etag,
+        "last_modified": snippet.last_modified,
+        "tool_ref": {
+            "connector": snippet.ref.connector,
+            "tool": snippet.ref.tool,
+            "args": dict(snippet.ref.args),
+        },
+    }
+
+
+async def _augment_with_connector_hints(
+    prompt: str,
+    user_message: str,
+    user_id: str,
+    tenant_id: str,
+) -> tuple[str, int]:
+    """If connectors are enabled and registered, fan out hint() calls,
+    render shadow blocks, and append them to ``prompt``. Returns
+    ``(augmented_prompt, n_blocks_emitted)``.
+
+    The shadow-block system-prompt fragment is appended once per
+    augmentation so the LLM knows how to interpret the blocks even
+    without separate prompt-side wiring. When zero blocks survive
+    the fan-out, the original prompt is returned unchanged.
+    """
+    if not _connectors_enabled():
+        return prompt, 0
+
+    connectors = _connector_registry.all_hint_capable()
+    if not connectors:
+        return prompt, 0
+
+    user_ctx = _ConnectorUserContext(
+        tenant_id=tenant_id or "",
+        user_id=user_id or "",
+        principals=[],
+    )
+
+    snippets = await _gather_connector_hints(
+        connectors,
+        user_message,
+        user_ctx,
+        deadline_ms=_connector_hint_deadline_ms(),
+    )
+    if not snippets:
+        return prompt, 0
+
+    hits = [_snippet_to_hit_dict(s) for s in snippets]
+    shadow_text = _render_shadow_blocks(hits)
+    if not shadow_text:
+        return prompt, 0
+
+    augmented = (
+        f"{prompt}\n\n"
+        f"{SHADOW_BLOCK_SYSTEM_PROMPT}\n"
+        f"{shadow_text}"
+    )
+    return augmented, shadow_text.count("<shadow ")
+
+
 def _resolve_lineage_edge(parent_conv: str, user_id: str) -> tuple[int, int] | None:
     """Look up ``(root, parent_aid)`` for a child-namespace lineage stamp.
 
@@ -244,12 +370,17 @@ _shared_embedder = None
 def _init_shared_resources():
     """Load NLP adapter and embedder once, shared across all sessions.
 
-    Supports two backends:
-        NLP_BACKEND=local   → LocalNLPAdapter (Gemma E2B + SpaCy, needs GPU)
-        NLP_BACKEND=vertex  → VertexNLPAdapter (Gemini Flash API, no GPU)
+    NLP_BACKEND=local      → LocalNLPAdapter (Gemma E2B + SpaCy, needs GPU)
+    NLP_BACKEND=vertex     → VertexNLPAdapter via Vertex AI (project + ADC)
+    NLP_BACKEND=ai_studio  → VertexNLPAdapter routed at AI Studio
+                             (generativelanguage.googleapis.com + API key).
+                             The adapter already supports both modes; the
+                             selector below picks which one by passing
+                             either ``project_id`` (Vertex) or ``api_key``
+                             (AI Studio) — never both.
 
-        EMBED_BACKEND=local  → LocalEmbeddingAdapter (SentenceTransformer, needs GPU)
-        EMBED_BACKEND=vertex → VertexEmbeddingAdapter (text-embedding-005 API, no GPU)
+    EMBED_BACKEND=local    → LocalEmbeddingAdapter (SentenceTransformer, GPU)
+    EMBED_BACKEND=vertex   → VertexEmbeddingAdapter (text-embedding-005)
     """
     global _shared_nlp, _shared_embedder
 
@@ -257,12 +388,44 @@ def _init_shared_resources():
     embed_backend = os.environ.get("EMBED_BACKEND", "local").lower()
     vertex_project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
     vertex_region = os.environ.get("VERTEX_REGION", "us-central1")
+    nlp_model = os.environ.get("NLP_MODEL", "gemini-2.5-flash")
 
     # NLP adapter
-    if nlp_backend == "vertex":
+    if nlp_backend == "ai_studio":
         from adapters.vertex_nlp_adapter import VertexNLPAdapter
-        logger.info(f"Loading Vertex AI NLP adapter (Gemini Flash, project={vertex_project})...")
-        _shared_nlp = VertexNLPAdapter(project_id=vertex_project, region=vertex_region)
+        # Adapter env-var fallback chain is VERTEX_API_KEY → GEMINI_API_KEY,
+        # but our prod env stores the key as GOOGLE_API_KEY. Pull it
+        # explicitly here so the adapter receives it via constructor and
+        # the env-var fallback never has to fire.
+        api_key = (
+            os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("VERTEX_API_KEY")
+            or ""
+        )
+        if not api_key:
+            raise RuntimeError(
+                "NLP_BACKEND=ai_studio but no API key found "
+                "(checked GOOGLE_API_KEY, GEMINI_API_KEY, VERTEX_API_KEY)"
+            )
+        logger.info(f"Loading NLP adapter via AI Studio (model={nlp_model})...")
+        # project_id="" forces the adapter into its AI Studio code path.
+        _shared_nlp = VertexNLPAdapter(
+            project_id="",
+            api_key=api_key,
+            model=nlp_model,
+        )
+    elif nlp_backend == "vertex":
+        from adapters.vertex_nlp_adapter import VertexNLPAdapter
+        logger.info(
+            f"Loading Vertex AI NLP adapter (model={nlp_model}, "
+            f"project={vertex_project})..."
+        )
+        _shared_nlp = VertexNLPAdapter(
+            project_id=vertex_project,
+            region=vertex_region,
+            model=nlp_model,
+        )
     else:
         from adapters.nlp_adapter import LocalNLPAdapter
         logger.info("Loading local NLP adapter (Gemma E2B + SpaCy)...")
@@ -279,6 +442,55 @@ def _init_shared_resources():
         _shared_embedder = LocalEmbeddingAdapter()
 
     logger.info(f"Shared resources ready (nlp={nlp_backend}, embed={embed_backend})")
+
+    # ── Embedder compatibility check ─────────────────────────────────────────
+    # Vectors built with one embedder are not comparable with vectors built
+    # with another (different model, different backend, even different
+    # dimensions). If the configured embedder doesn't match the one that
+    # built the existing index, recall silently breaks. Refuse to start on
+    # mismatch unless TCMM_ALLOW_EMBEDDER_SWAP=1 (operator has accepted that
+    # they must re-embed).
+    storage_backend_now = os.environ.get("TCMM_STORAGE", "lance").lower()
+    if storage_backend_now in ("lance", "lancedb"):
+        from core.providers.lance import check_embedder_compatibility
+        lance_db_name_now = os.environ.get("TCMM_LANCE_DB", "veilguard")
+        shared_data_dir = os.path.join(DATA_DIR, lance_db_name_now)
+        os.makedirs(shared_data_dir, exist_ok=True)
+        allow_swap = os.environ.get("TCMM_ALLOW_EMBEDDER_SWAP", "").lower() in (
+            "1", "true", "yes",
+        )
+        result = check_embedder_compatibility(
+            db_path=shared_data_dir,
+            backend=_shared_embedder.backend,
+            model_name=_shared_embedder.model_name,
+            dim=_shared_embedder.dimension,
+            allow_swap=allow_swap,
+        )
+        status = result["status"]
+        if status == "ok":
+            logger.info(
+                f"Embedder verified against persisted metadata "
+                f"(backend={_shared_embedder.backend}, "
+                f"model={_shared_embedder.model_name}, "
+                f"dim={_shared_embedder.dimension})"
+            )
+        elif status == "first_run":
+            logger.info(
+                f"Persisted embedder metadata for first run "
+                f"(backend={_shared_embedder.backend}, "
+                f"model={_shared_embedder.model_name}, "
+                f"dim={_shared_embedder.dimension})"
+            )
+        elif status == "swap_allowed":
+            logger.warning(
+                f"Embedder swap accepted via TCMM_ALLOW_EMBEDDER_SWAP. "
+                f"Existing vectors are incomparable with new ones; "
+                f"re-embed required for correct recall. "
+                f"Detail: {result['message']}"
+            )
+        elif status == "mismatch":
+            logger.error(f"FATAL: {result['message']}")
+            raise RuntimeError(result["message"])
 
 
 # ── Per-Session Stats ────────────────────────────────────────────────────────
@@ -377,6 +589,31 @@ class SessionPool:
                 vector_store=VECTOR_BACKEND,
                 sparse_store=SPARSE_BACKEND,
             )
+
+            # Pre-warm the user archive + FTS index at session creation
+            # so the first recall in this session doesn't pay the
+            # one-time setup cost (~7s for FTS + node cache + vector
+            # index warmup). Subsequent recalls already share these
+            # caches via the LanceStorageProvider instance held by
+            # this session.
+            try:
+                _arch = getattr(instance.tcmm, "archive", None)
+                if _arch is not None and hasattr(_arch, "bulk_warm_user_archive"):
+                    _arch.bulk_warm_user_archive()
+                    instance.tcmm._last_user_warm_ts = time.time()
+                # Trigger FTS index creation now (one-shot per session).
+                _sparse = getattr(instance.tcmm, "archive_sparse_index", None)
+                if _sparse is not None and hasattr(_sparse, "_ensure_fts_index"):
+                    _sparse._ensure_fts_index()
+                # Trigger vector index ensure (Lance lazy index build).
+                _vec = getattr(instance.tcmm, "archive_vector_index", None)
+                if _vec is not None and hasattr(_vec, "_ensure_index"):
+                    try:
+                        _vec._ensure_index()
+                    except Exception:
+                        pass
+            except Exception as _e:
+                logger.debug(f"[POOL] pre-warm skipped: {_e}")
 
             elapsed = time.time() - start
             status = instance.get_status()
@@ -627,8 +864,26 @@ async def pre_request(body: PreRequestBody):
                 if recalled_ids:
                     tcmm.stage_shadow_blocks(recalled_ids)
                 prompt = instance._build_memory_context(body.user_message)
-                logger.info(f"[RECALL-ONLY] session={sid} recalled={len(recalled_ids)} prompt={len(prompt)} chars")
-                return {"prompt": prompt, "stats": {"recalled": len(recalled_ids)}}
+                # Connector hints (env-gated) augment the recall-only path
+                # too, so sub-agent recall can surface SharePoint / Slack
+                # candidates alongside their own TCMM memory.
+                prompt, n_shadow = await _augment_with_connector_hints(
+                    prompt,
+                    body.user_message,
+                    user_id=body.user_id,
+                    tenant_id="",
+                )
+                logger.info(
+                    f"[RECALL-ONLY] session={sid} recalled={len(recalled_ids)} "
+                    f"connector_shadows={n_shadow} prompt={len(prompt)} chars"
+                )
+                return {
+                    "prompt": prompt,
+                    "stats": {
+                        "recalled": len(recalled_ids),
+                        "connector_shadows": n_shadow,
+                    },
+                }
 
             instance = pool.get(body.conversation_id, user_id=body.user_id)
             sess = pool.get_stats(body.conversation_id)
@@ -656,6 +911,18 @@ async def pre_request(body: PreRequestBody):
                 origin=body.origin or "user",
             )
             elapsed = time.time() - start
+
+            # Connector hint fan-out (env-gated). Adds a shadow-block
+            # section to the prompt with candidates from registered
+            # connectors. No-op when connectors are disabled, when
+            # nothing is registered, or when no connector returns
+            # results within its deadline.
+            prompt, _n_shadow_blocks = await _augment_with_connector_hints(
+                prompt,
+                body.user_message,
+                user_id=body.user_id,
+                tenant_id="",
+            )
 
             # Post-ingest stamp: any rows added during pre_request
             # (usually the user message) get their lineage wired.
@@ -776,6 +1043,7 @@ async def pre_request(body: PreRequestBody):
                     "input_tokens": tcmm_input_tokens,
                     "session_id": pool._normalize_id(body.conversation_id),
                     "user_ingest": "deferred" if has_pending else "skipped",
+                    "connector_shadows": _n_shadow_blocks,
                 },
             }
         except Exception as e:

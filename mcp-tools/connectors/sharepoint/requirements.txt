@@ -1,0 +1,13 @@
+mcp[cli]>=1.0.0
+httpx>=0.27.0
+
+# Shared parsing + chunking via the connector framework (_base/parsing.py).
+# llama-index-core: SentenceSplitter for chunking.
+# llama-index-readers-file: SimpleDirectoryReader auto-routes by file
+#   extension to PDFReader / DocxReader / PptxReader / PandasExcelReader /
+#   CSVReader / HTMLTagReader / EpubReader / IPYNBReader / image OCR / etc.
+#   Each reader pulls its own format-specific dep on demand
+#   (python-docx, pypdf, python-pptx, openpyxl, ...) so installing
+#   readers-file doesn't require the whole catalog up front.
+llama-index-core>=0.12.0
+llama-index-readers-file>=0.4.0

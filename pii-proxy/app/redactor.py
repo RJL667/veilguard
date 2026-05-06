@@ -9,7 +9,11 @@ from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
-from .recognizers import SouthAfricanIDRecognizer, SouthAfricanPhoneRecognizer
+from .recognizers import (
+    SouthAfricanBankAccountRecognizer,
+    SouthAfricanIDRecognizer,
+    SouthAfricanPhoneRecognizer,
+)
 from .session import pii_store
 
 logger = logging.getLogger("pii-proxy")
@@ -75,6 +79,7 @@ PII_ENTITIES = [
     "IP_ADDRESS",
     "SA_ID_NUMBER",
     "SA_PHONE_NUMBER",
+    "SA_BANK_ACCOUNT",
 ]
 
 # JSON keys containing user-authored content to scan
@@ -99,6 +104,7 @@ class PIIRedactor:
         registry.load_predefined_recognizers()
         registry.add_recognizer(SouthAfricanIDRecognizer())
         registry.add_recognizer(SouthAfricanPhoneRecognizer())
+        registry.add_recognizer(SouthAfricanBankAccountRecognizer())
 
         self.analyzer = AnalyzerEngine(registry=registry)
         self.anonymizer = AnonymizerEngine()

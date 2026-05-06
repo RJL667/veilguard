@@ -36,16 +36,29 @@ class SouthAfricanIDRecognizer(PatternRecognizer):
         )
 
     def validate_result(self, pattern_text):
-        """Validate using the Luhn algorithm."""
+        """Validate using the SA-ID Luhn variant.
+
+        Presidio treats ``True`` as confirmed, ``False`` as rejected,
+        and ``None`` as "not validated — keep with reduced score". We
+        used to return ``None`` on Luhn failure, which let bad-checksum
+        13-digit numbers through whenever a context word ("id", "id
+        no", etc.) was nearby — the +0.35 context boost pushed the
+        unvalidated 0.6 base score above the 0.7 redact threshold.
+        Returning ``False`` is the correct Presidio idiom for "this is
+        not a real SA ID, drop the match."
+        """
         if not pattern_text or len(pattern_text) != 13:
-            return None
+            return False
 
         try:
             digits = [int(d) for d in pattern_text]
         except ValueError:
-            return None
+            return False
 
-        # Luhn checksum
+        # SA-ID Luhn variant: sum odd-position digits, concatenate
+        # even-position digits and double the resulting number, then
+        # sum its digits. Check digit closes the total to a multiple
+        # of 10.
         odd_sum = sum(digits[i] for i in range(0, 12, 2))
         even_str = "".join(str(digits[i]) for i in range(1, 12, 2))
         even_doubled = int(even_str) * 2
@@ -53,6 +66,4 @@ class SouthAfricanIDRecognizer(PatternRecognizer):
         total = odd_sum + even_sum
         check = (10 - (total % 10)) % 10
 
-        if check == digits[12]:
-            return pattern_text
-        return None
+        return check == digits[12]
