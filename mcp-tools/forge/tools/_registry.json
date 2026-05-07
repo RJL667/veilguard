@@ -9,5 +9,28 @@
     "updated_at": 1774480490.7211657,
     "run_count": 2,
     "last_error": null
+  },
+  "fetch_url": {
+    "name": "fetch_url",
+    "description": "Fetch a URL and return text content using Python requests",
+    "args": {
+      "url": "URL to fetch"
+    },
+    "created_at": 1776777261.8852274,
+    "updated_at": 1776777261.8852277,
+    "run_count": 6,
+    "last_error": null
+  },
+  "fetch_text": {
+    "name": "fetch_text",
+    "description": "Fetch a URL and extract readable text by stripping HTML tags",
+    "args": {
+      "url": "URL to fetch",
+      "max_chars": "Max characters to return (default 5000)"
+    },
+    "created_at": 1776777302.6802204,
+    "updated_at": 1776777302.6802206,
+    "run_count": 19,
+    "last_error": null
   }
 }

@@ -156,7 +156,16 @@ class PIIRedactor:
             return text
 
     def redact_json(self, obj, conversation_id: str, depth: int = 0, in_user_content: bool = False):
-        """Recursively redact PII from JSON object."""
+        """Recursively redact PII from JSON object.
+
+        Special-case: a dict carrying ``"_skip_pii": True`` is returned
+        verbatim (with the sentinel field stripped). The sentinel is set
+        by the proxy on system blocks whose content is known-static and
+        contains no PII (e.g. the Veilguard preamble). Skipping these
+        blocks saves ~600ms per call by avoiding a Presidio scan on
+        ~18 KB of literal Python-string preamble that — by construction —
+        cannot ever contain PII.
+        """
         if depth > 20:
             return obj
 
@@ -167,6 +176,11 @@ class PIIRedactor:
         elif isinstance(obj, list):
             return [self.redact_json(item, conversation_id, depth + 1, in_user_content) for item in obj]
         elif isinstance(obj, dict):
+            # Sentinel: caller has guaranteed this block is PII-free.
+            # Return a copy with the sentinel stripped (Anthropic would
+            # 400 on an unknown field).
+            if obj.get("_skip_pii") is True:
+                return {k: v for k, v in obj.items() if k != "_skip_pii"}
             result = {}
             for key, value in obj.items():
                 if key in SKIP_KEYS:

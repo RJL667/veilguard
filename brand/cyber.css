@@ -1,0 +1,598 @@
+/* ─────────────────────────────────────────────────────────────────────────
+ * Veilguard "Cyber" theme overlay for LibreChat — v2
+ *
+ * Mirrors the design tokens of the admin dashboard
+ * (mcp-tools/admin-dashboard/templates/dashboard.html) so the chat UI
+ * and admin UI share one visual language.
+ *
+ * Loaded via a <link> tag in /app/client/dist/index.html. Edits on the
+ * host file at /home/rudol/veilguard/brand/cyber.css land in the
+ * container via docker cp + Ctrl-Shift-R in the browser. No restart
+ * needed (LibreChat's staticCache only caches index.html, not asset
+ * files like cyber.css).
+ *
+ * v2 changes vs v1:
+ *   • Targets LibreChat's actual class taxonomy (.bg-presentation,
+ *     .message-content, .bg-surface-chat, .bg-surface-submit, .nav,
+ *     .conversation-item-time, .from-presentation) instead of guessing
+ *     with substring matchers.
+ *   • Body grid moved to a fixed pseudo-element so it can't be hidden
+ *     by a child setting its own background-color.
+ *   • Gradient is now reserved for the send button + brand chip only.
+ *     Action buttons under messages (copy, edit, regen, like, dislike)
+ *     get neutral cyan-tinted styling, not the full cy→vi gradient.
+ *   • Message bubbles get a real glass-card frame via .message-content.
+ *   • Sidebar active conversation: left-border accent + soft cyan tint
+ *     (matches admin's row-clickable hover pattern), not the harsh
+ *     full-row gradient that v1's "from-presentation" override caused.
+ * ───────────────────────────────────────────────────────────────────────── */
+
+
+/* ── 1. Token palette — drive everything via CSS variables ─────────── */
+:root,
+.dark,
+html.dark,
+html[data-theme="dark"] {
+  /* LibreChat surface tokens — set to admin palette */
+  --presentation: #0a0e1a !important;
+  --surface-primary: #0c1120 !important;
+  --surface-primary-alt: #0f1530 !important;
+  --surface-primary-contrast: #d8dbe8 !important;
+  /* Surface tokens deliberately kept SOLID (no alpha) for everything
+   * except the chat region. Any utility class like `bg-surface-secondary`
+   * applied to a dialog or popover needs to fully obscure the chat
+   * content underneath; semi-transparent fills here caused the broken-
+   * looking settings modal where the composer bled through. */
+  --surface-secondary: #0c1430 !important;
+  --surface-secondary-alt: #11183a !important;
+  --surface-tertiary: #1a2240 !important;
+  --surface-tertiary-alt: #1f2a44 !important;
+  --surface-active: rgba(86, 214, 255, 0.12) !important;
+  --surface-active-alt: rgba(86, 214, 255, 0.18) !important;
+  --surface-chat: transparent !important;
+  --surface-hover: rgba(86, 214, 255, 0.08) !important;
+  --surface-hover-alt: rgba(86, 214, 255, 0.12) !important;
+  --surface-dialog: #0c1120 !important;
+  --bg-surface-hover: rgba(86, 214, 255, 0.06) !important;
+
+  /* Submit button — solid cyan, gradient applied via .bg-surface-submit
+     override below so we keep token semantics clean here. */
+  --surface-submit: #56d6ff !important;
+  --surface-submit-hover: #38c7f0 !important;
+
+  /* Text */
+  --text-primary: #d8dbe8 !important;
+  --text-secondary: #97a0c2 !important;
+  --text-secondary-alt: #b0b9d6 !important;
+  --text-tertiary: #5b6685 !important;
+  --text-warning: #fcb653 !important;
+
+  /* Header */
+  --header-primary: rgba(12, 17, 32, 0.85) !important;
+  --header-hover: rgba(86, 214, 255, 0.06) !important;
+  --header-button-hover: rgba(86, 214, 255, 0.10) !important;
+
+  /* Brand — cyan, with purple as secondary */
+  --brand-purple: #56d6ff !important;
+  --primary: #56d6ff !important;
+  --primary-foreground: #0c1120 !important;
+  --secondary: #1a2240 !important;
+  --secondary-foreground: #d8dbe8 !important;
+  --accent: rgba(86, 214, 255, 0.15) !important;
+  --accent-foreground: #56d6ff !important;
+  --ring: #56d6ff !important;
+  --ring-primary: #56d6ff !important;
+
+  /* Borders — subtle cyan-tinted greys */
+  --border: #1f2a44 !important;
+  --border-light: #1f2a44 !important;
+  --border-medium: #2a3b5d !important;
+  --border-medium-alt: #2a3b5d !important;
+  --border-heavy: #3b4f78 !important;
+  --border-xheavy: rgba(86, 214, 255, 0.4) !important;
+
+  /* Charts (tooltips etc.) */
+  --chart-1: #56d6ff !important;
+  --chart-2: #a78bfa !important;
+  --chart-3: #22d3a3 !important;
+  --chart-4: #fcb653 !important;
+  --chart-5: #ef4d6d !important;
+
+  /* Radix UI overlay */
+  --background: #0a0e1a !important;
+  --foreground: #d8dbe8 !important;
+  --card: #0c1120 !important;
+  --card-foreground: #d8dbe8 !important;
+}
+
+
+/* ── 2. Body background — grid pattern, behind everything ─────────── */
+html, body, #root {
+  background-color: #0a0e1a !important;
+  color: #d8dbe8 !important;
+}
+
+/* The grid lives on a fixed pseudo-element so it isn't covered by any
+ * child's background-color. z-index 0 keeps it under content but visible
+ * everywhere a parent surface is transparent or semi-transparent. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(86, 214, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(86, 214, 255, 0.05) 1px, transparent 1px);
+  background-size: 40px 40px;
+  z-index: 0;
+  pointer-events: none;
+}
+
+#root {
+  position: relative;
+  z-index: 1;
+}
+
+/* The chat conversation strip — paint the grid directly here.
+ * v2 made these transparent so the body::before grid would show
+ * through, but in practice LibreChat layers more solid surfaces
+ * (a transparent <main>, then a solid <div class="bg-presentation">)
+ * which still cover the body::before. Fix: emit the same grid
+ * pattern as a background-image on these surfaces themselves —
+ * background-image stacks ABOVE background-color on the same
+ * element, so the grid lands on top of the dark fill but below
+ * the chat content. Bg-size 40px matches admin's grid pitch. */
+.bg-presentation,
+.bg-surface-chat,
+main.bg-presentation,
+main[class*="presentation"],
+main {
+  background-color: #0a0e1a !important;
+  background-image:
+    linear-gradient(rgba(86, 214, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(86, 214, 255, 0.05) 1px, transparent 1px) !important;
+  background-size: 40px 40px !important;
+  background-attachment: fixed !important;
+}
+
+
+/* ── 3. Sidebar — glass with cyan border ──────────────────────────── */
+nav,
+.nav,
+[data-testid="nav"],
+[role="navigation"] {
+  background-color: rgba(15, 21, 48, 0.78) !important;
+  backdrop-filter: blur(10px) !important;
+  -webkit-backdrop-filter: blur(10px) !important;
+  border-right: 1px solid #1f2a44 !important;
+}
+
+.nav-open-button,
+.nav-close-button {
+  color: #97a0c2 !important;
+}
+.nav-open-button:hover,
+.nav-close-button:hover {
+  background-color: rgba(86, 214, 255, 0.10) !important;
+  color: #56d6ff !important;
+}
+
+/* Sidebar conversation rows — refined hover + active state.
+ * v1's `[class*="from-presentation"]` selector accidentally matched
+ * the gradient on the active-row indicator, painting the entire row
+ * with the bright cy→vi gradient. v2 removes that and uses a soft
+ * left-border accent like the admin's row-clickable pattern. */
+nav a, nav li, nav button,
+[role="navigation"] a,
+[role="navigation"] li {
+  border-radius: 8px !important;
+}
+
+nav a:hover, nav li:hover {
+  background-color: rgba(86, 214, 255, 0.06) !important;
+}
+
+nav a[aria-current="page"],
+nav a.active,
+nav li[aria-selected="true"],
+nav [data-active="true"] {
+  background-color: rgba(86, 214, 255, 0.10) !important;
+  border-left: 2px solid #56d6ff !important;
+  padding-left: 10px !important;
+}
+
+/* Kill the overactive cy→vi gradient on the active-row block. The
+ * default LibreChat dark theme uses a `from-presentation` gradient
+ * fragment for that block; on our palette it's the wrong colour and
+ * over-saturated. Force its background to a flat soft tint. */
+nav .from-presentation,
+nav [class*="from-presentation"],
+nav [class*="bg-gradient"] {
+  background-image: none !important;
+  background-color: transparent !important;
+}
+
+/* Conversation timestamp dot */
+.conversation-item-time:before {
+  background-color: #56d6ff !important;
+}
+
+
+/* ── 4. Message bubbles — glass-card frame ────────────────────────── */
+/* Message bubbles — heavily transparent glass so the grid pattern
+ * from .bg-presentation reads clearly THROUGH the bubble itself,
+ * not just at the edges.
+ *
+ * Tuning history:
+ *   v2: 0.45 alpha, 4px blur — solid, grid hidden
+ *   v3: 0.22 alpha, 6px blur — grid faint at edges only
+ *   v4: 0.08 alpha, 2px blur — grid reads through the bubble body
+ *
+ * The cyan border at 0.22 alpha is the main visual containment
+ * device now; the fill is barely there. A tiny 2px blur softens
+ * the high-frequency grid lines under the text just enough to
+ * keep body copy readable, without becoming a frosted pane that
+ * hides the pattern. */
+.message-content {
+  background-color: rgba(15, 21, 48, 0.08) !important;
+  border: 1px solid rgba(86, 214, 255, 0.22) !important;
+  border-radius: 12px !important;
+  padding: 14px 16px !important;
+  backdrop-filter: blur(2px) !important;
+  -webkit-backdrop-filter: blur(2px) !important;
+  box-shadow: 0 4px 20px -10px rgba(0, 0, 0, 0.4) !important;
+}
+
+.text-message {
+  color: #d8dbe8 !important;
+}
+
+/* User-side messages: faintly cyan-tinted, same near-transparent
+ * fill so grid shows as cleanly here as in assistant bubbles. */
+[data-message-role="user"] .message-content,
+[class*="UserMessage"] .message-content {
+  background-color: rgba(86, 214, 255, 0.05) !important;
+  border-color: rgba(86, 214, 255, 0.28) !important;
+}
+
+
+/* ── 5. Chat input box — glass-card composer ──────────────────────── */
+textarea,
+input[type="text"],
+input[type="search"],
+input[type="email"],
+input[type="password"],
+[contenteditable="true"] {
+  background-color: rgba(15, 21, 48, 0.6) !important;
+  color: #d8dbe8 !important;
+  border-color: #2a3b5d !important;
+  caret-color: #56d6ff !important;
+}
+
+textarea::placeholder,
+input::placeholder,
+[contenteditable="true"]:empty::before {
+  color: #5b6685 !important;
+}
+
+textarea:focus,
+input:focus,
+[contenteditable="true"]:focus {
+  border-color: #56d6ff !important;
+  box-shadow:
+    0 0 0 1px rgba(86, 214, 255, 0.4),
+    0 0 16px rgba(86, 214, 255, 0.18) !important;
+  outline: none !important;
+}
+
+/* The composer container at the bottom — exactly ONE glass card.
+ *
+ * Iteration history:
+ *   v3: rounded the textarea AND its wrapper → 2 rounded rects.
+ *   v4: zeroed the textarea border, kept the wrapper rules → STILL
+ *       2 rounded rects, because a <div> sits between the <form>
+ *       and the <textarea> and matched `div:has(> textarea[…])`.
+ *   v4b (this): pin the rounded frame to the OUTER <form> only,
+ *       and explicitly strip border/radius/bg/shadow from every
+ *       descendant container inside it. Single ring, guaranteed.
+ *
+ * Also semi-transparent (0.5 alpha) so the grid shows through. */
+form:has(> textarea[placeholder*="Message" i]),
+form:has(textarea[placeholder*="Message" i]),
+form[class*="form" i]:has(textarea),
+[role="form"]:has(textarea[placeholder*="Message" i]) {
+  background-color: rgba(12, 17, 32, 0.5) !important;
+  border: 1px solid rgba(86, 214, 255, 0.22) !important;
+  border-radius: 28px !important;
+  backdrop-filter: blur(10px) !important;
+  -webkit-backdrop-filter: blur(10px) !important;
+  box-shadow: 0 8px 28px -10px rgba(86, 214, 255, 0.18) !important;
+  overflow: hidden;
+}
+
+/* Strip every NESTED visual frame inside the composer.
+ *
+ * LibreChat wraps the textarea in 1-2 div layers (for the focus
+ * ring / file-attachment row / submit-button row). Each layer can
+ * inherit Tailwind border/rounded classes. Force them all flat so
+ * the OUTER form is the only visible boundary.
+ *
+ * Note we deliberately do NOT include `:not([class*="bg-surface-submit"])`
+ * here — the send button is a <button>, not a <div>, so it's
+ * unaffected. */
+form:has(textarea[placeholder*="Message" i]) div,
+form:has(textarea[placeholder*="Message" i]) > * {
+  background-color: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+}
+
+/* Textarea itself: same flat treatment, regardless of focus state. */
+form textarea[placeholder*="Message" i],
+form textarea[placeholder*="Message" i]:focus {
+  background-color: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  outline: none !important;
+  resize: none !important;
+}
+
+/* Focus ring lives ONLY on the outer form. */
+form:has(textarea[placeholder*="Message" i]:focus) {
+  border-color: rgba(86, 214, 255, 0.6) !important;
+  box-shadow:
+    0 0 0 1px rgba(86, 214, 255, 0.4),
+    0 8px 28px -10px rgba(86, 214, 255, 0.4) !important;
+}
+
+
+/* ── 6. Buttons — narrow gradient to send button + primary actions ── */
+
+/* SEND button — the cyan→purple gradient. This is the only place we
+ * use the full gradient. Targets LibreChat's .bg-surface-submit class. */
+.bg-surface-submit {
+  background-image: linear-gradient(135deg, #56d6ff 0%, #a78bfa 100%) !important;
+  background-color: transparent !important;
+  color: #0c1120 !important;
+}
+.bg-surface-submit:hover {
+  filter: brightness(1.1) !important;
+  box-shadow: 0 0 18px rgba(86, 214, 255, 0.4) !important;
+}
+.text-surface-submit { color: #0c1120 !important; }
+
+/* All OTHER buttons — neutral icon styling.
+ * v1 painted every button with the gradient; this fixes the
+ * over-bright copy/edit/regenerate/like/dislike row under each
+ * assistant message. */
+button:not(.bg-surface-submit):not([class*="submit" i]):not([class*="primary" i]) {
+  background-color: transparent !important;
+  color: #97a0c2 !important;
+}
+
+button:not(.bg-surface-submit):not([class*="submit" i]):not([class*="primary" i]):hover {
+  background-color: rgba(86, 214, 255, 0.08) !important;
+  color: #56d6ff !important;
+}
+
+
+/* ── 7. Model picker / brand chip — gradient pill ─────────────────── */
+/* The model dropdown trigger at the top of the chat: keep the gradient
+ * because it doubles as the "currently selected model" indicator. */
+button[aria-label*="model" i],
+button[aria-haspopup="menu"]:has(img),
+[class*="model-select" i] > button {
+  background-image: linear-gradient(135deg,
+    rgba(86, 214, 255, 0.15) 0%,
+    rgba(167, 139, 250, 0.15) 100%) !important;
+  border: 1px solid rgba(86, 214, 255, 0.25) !important;
+  color: #d8dbe8 !important;
+}
+
+
+/* ── 8. Code blocks ───────────────────────────────────────────────── */
+pre,
+.message-content pre,
+[class*="code-block" i],
+[class*="CodeBlock" i] {
+  background-color: #0a0e1a !important;
+  border: 1px solid #1f2a44 !important;
+  border-radius: 8px !important;
+}
+pre, pre * { color: #d8dbe8 !important; }
+pre code { background: transparent !important; border: none !important; }
+
+/* Inline code chip */
+:not(pre) > code {
+  background-color: rgba(86, 214, 255, 0.08) !important;
+  color: #56d6ff !important;
+  padding: 1px 5px !important;
+  border-radius: 4px !important;
+  border: 1px solid rgba(86, 214, 255, 0.18) !important;
+  font-family: "Roboto Mono", ui-monospace, monospace !important;
+}
+
+
+/* ── 9. Headers, dialogs, dropdowns — glass blur ──────────────────── */
+header,
+[role="banner"],
+[class*="header" i]:not(table):not(thead):not(th) {
+  background-color: rgba(12, 17, 32, 0.85) !important;
+  backdrop-filter: blur(10px) !important;
+  -webkit-backdrop-filter: blur(10px) !important;
+  border-bottom: 1px solid #1f2a44 !important;
+}
+
+/* ── Settings / dialogs / menus — high-specificity solid fill ──────
+ *
+ * The settings panel was rendering with a transparent background in
+ * v3-v4: the chat composer below and the message bubbles bled
+ * through, making the modal look broken. Three problems combined:
+ *
+ *   1. Selector specificity. LibreChat's Tailwind utility classes
+ *      (.bg-surface-secondary etc.) had higher specificity than
+ *      bare `[role=dialog]`. Fix: layer multiple matching selectors
+ *      and use `:where()` where we want neutral specificity.
+ *   2. Token alpha. v3 set --surface-dialog to 0.94 alpha; even at
+ *      94% opacity, against the bright cyan grid background, the
+ *      chat underneath was visibly readable. Fix: drop alpha
+ *      entirely on dialog tokens (handled in the :root block above).
+ *   3. Missing Tailwind class targets. LibreChat emits utility
+ *      classes like `bg-surface-tertiary` and `bg-surface-secondary`
+ *      directly on the dialog content, not just `[role=dialog]`. We
+ *      target both forms below.
+ *
+ * The result: settings opens as a fully-opaque dark glass panel
+ * with a dim blurred backdrop, no chat bleed-through. */
+
+/* Solid fill on every dialog / popover / menu wrapper. We list the
+ * permutations Radix and LibreChat use across versions so future
+ * upgrades that rename internals keep matching at least one. */
+html [role="dialog"],
+html [role="dialog"][data-state="open"],
+html dialog,
+html [class*="Dialog" i]:not(form):not(textarea):not(table):not(button):not(input),
+html [class*="Modal" i]:not(form):not(textarea):not(table):not(button):not(input),
+html [data-radix-popper-content-wrapper] > *,
+html [data-state="open"][class*="content" i],
+.bg-surface-secondary[role="dialog"],
+.bg-surface-tertiary[role="dialog"],
+.bg-surface-dialog,
+[class*="bg-surface-dialog"] {
+  background-color: #0c1120 !important;
+  border: 1px solid rgba(86, 214, 255, 0.18) !important;
+  border-radius: 12px !important;
+  box-shadow:
+    0 0 0 1px rgba(86, 214, 255, 0.10),
+    0 24px 60px -16px rgba(0, 0, 0, 0.85) !important;
+}
+
+/* Backdrop overlay — the dimming layer Radix renders as a SIBLING
+ * of the dialog content. v3 missed this entirely, which is why the
+ * chat behind was fully readable. Now: a dark heavily-blurred mask. */
+html [data-radix-dialog-overlay],
+html [class*="DialogOverlay" i],
+html [class*="overlay" i][data-state="open"],
+html [data-state="open"][class*="overlay"],
+html .radix-dialog-overlay {
+  background-color: rgba(5, 8, 18, 0.78) !important;
+  backdrop-filter: blur(10px) !important;
+  -webkit-backdrop-filter: blur(10px) !important;
+  position: fixed !important;
+  inset: 0 !important;
+}
+
+/* Inside-the-dialog: left nav (settings tablist) */
+[role="dialog"] [role="tablist"],
+[role="dialog"] aside,
+[role="dialog"] nav,
+[role="dialog"] [class*="sidebar" i] {
+  background-color: rgba(15, 21, 48, 0.55) !important;
+  border-right: 1px solid rgba(86, 214, 255, 0.12) !important;
+}
+
+/* Tab items inside the dialog — clean hover + active state */
+[role="dialog"] [role="tab"] {
+  border-radius: 8px !important;
+}
+[role="dialog"] [role="tab"]:hover {
+  background-color: rgba(86, 214, 255, 0.08) !important;
+}
+[role="dialog"] [role="tab"][data-state="active"],
+[role="dialog"] [role="tab"][aria-selected="true"] {
+  background-color: rgba(86, 214, 255, 0.14) !important;
+  color: #56d6ff !important;
+}
+
+/* Inputs and select triggers inside the dialog (Theme: System
+ * dropdown, Language: en-ZA, etc.) need their own bg-fill so they
+ * read against the now-solid dialog body. */
+[role="dialog"] select,
+[role="dialog"] [role="combobox"],
+[role="dialog"] button[role="combobox"],
+[role="dialog"] [class*="select" i] button {
+  background-color: rgba(26, 34, 64, 0.8) !important;
+  border: 1px solid #2a3b5d !important;
+  border-radius: 8px !important;
+  color: #d8dbe8 !important;
+}
+
+/* ── Hide the "LibreChat v0.8.4 — Every AI for Everyone" footer ─────
+ * That string sits below the composer and clashes with the cyber
+ * vibe. LibreChat renders it as a small <a> inside a <div> with
+ * version text; safest to hide via the link's exact label. */
+a[href*="librechat.ai" i],
+a[href*="github.com/danny-avila/LibreChat" i] {
+  display: none !important;
+}
+/* And the parent container that holds the version + link, if any.
+ * LibreChat tags it with various class names per release; match by
+ * any element whose text content starts with "LibreChat v" via the
+ * :has + descendant selector. */
+div:has(> a[href*="librechat.ai" i]),
+footer:has(> a[href*="librechat.ai" i]) {
+  display: none !important;
+}
+
+
+/* ── 10. Selection + caret + scrollbar ────────────────────────────── */
+::selection {
+  background: rgba(86, 214, 255, 0.30);
+  color: #ffffff;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #0a0e1a; }
+::-webkit-scrollbar-thumb {
+  background: #2a3b5d;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(86, 214, 255, 0.55); }
+* { scrollbar-color: #2a3b5d #0a0e1a; scrollbar-width: thin; }
+
+
+/* ── 11. Links + spinners ─────────────────────────────────────────── */
+a, [role="link"] { color: #56d6ff !important; }
+a:hover, [role="link"]:hover {
+  color: #a78bfa !important;
+  text-shadow: 0 0 4px rgba(86, 214, 255, 0.4);
+}
+
+[class*="spinner" i] svg,
+[role="progressbar"] svg,
+.animate-spin {
+  color: #56d6ff !important;
+  stroke: #56d6ff !important;
+}
+
+
+/* ── 12. Welcome / empty-state hero — soft cyan glow ──────────────── */
+[class*="welcome" i] h1,
+[class*="welcome" i] h2,
+[class*="hero" i] h1,
+[class*="empty" i] h2 {
+  background: linear-gradient(135deg, #56d6ff 0%, #a78bfa 100%) !important;
+  -webkit-background-clip: text !important;
+  background-clip: text !important;
+  -webkit-text-fill-color: transparent !important;
+  color: transparent !important;
+}
+
+
+/* ── 13. Tables (settings panels, etc.) ────────────────────────────── */
+table {
+  background-color: rgba(15, 21, 48, 0.5) !important;
+  border: 1px solid #1f2a44 !important;
+  border-radius: 8px !important;
+  overflow: hidden !important;
+}
+thead, th {
+  background-color: rgba(12, 17, 32, 0.8) !important;
+  color: #97a0c2 !important;
+  text-transform: uppercase;
+  font-size: 11px !important;
+  letter-spacing: 0.05em;
+}
+tbody tr:hover { background-color: rgba(86, 214, 255, 0.04) !important; }
+td { border-color: rgba(31, 42, 68, 0.4) !important; }

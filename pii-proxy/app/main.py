@@ -1309,6 +1309,15 @@ async def gateway(request: Request, path: str):
                                     if _o in ("user", "user_image"):
                                         user_origin = _o
                                         break
+                            # [PERF-INSTR 2026-05-07] Wrap the four owned
+                            # legs (TCMM HTTP pre, redact, Anthropic, rehydrate)
+                            # so we can attribute the e2e budget to whose
+                            # latency it actually is. Stored on `request.state`
+                            # because pii-proxy is async and we need to
+                            # accumulate across multiple awaits.
+                            import time as _pt
+                            request.state.phase_t = {}
+                            _t = _pt.perf_counter()
                             tcmm_context = await _tcmm_pre_request(
                                 user_msg,
                                 conversation_id,
@@ -1316,6 +1325,7 @@ async def gateway(request: Request, path: str):
                                 origin=user_origin,
                                 lineage_parent_conv=tcmm_lineage_parent,
                             )
+                            request.state.phase_t["tcmm_pre_http"] = (_pt.perf_counter() - _t) * 1000
                             if tcmm_context:
                                 # Inject TCMM context RAW (with real PII).
                                 # redact_json below handles the ENTIRE payload in one pass,
@@ -1533,6 +1543,181 @@ async def gateway(request: Request, path: str):
                         "own namespace AND linked back to yours for cross-conversation "
                         "synthesis later.\n\n"
 
+                        "## 6. RECALL FAILURE MODES (read this carefully)\n\n"
+
+                        "TCMM recall is a Bayesian retrieval pipeline (sparse BM25 + dense "
+                        "vector + graph expansion + cross-encoder rerank). It is excellent "
+                        "but not perfect, and it has named failure modes you should learn to "
+                        "spot. When recall fails, the right move is usually to call the "
+                        "tcmm_recall tool with a reformulated query, not to tell the user "
+                        "you don't know.\n\n"
+
+                        "- *Sparse-needle miss*: the user asked for a specific value (an "
+                        "amount, a name, a code) that exists verbatim in the archive but "
+                        "the live memory shown to you doesn't contain it. The dense "
+                        "retriever may have missed it because the query is too short to "
+                        "embed well. Rephrase as a longer query naming the entity and the "
+                        "expected answer shape — for example, instead of 'invoice 4471' try "
+                        "'what was the total on invoice 4471 from the customer correspondence'.\n"
+                        "- *Stale dream-summary*: a DREAM block summarises canonical state "
+                        "from a long-running thread. If the summary contradicts a more "
+                        "recent USER block, prefer the USER block. Dream cycles run on a "
+                        "schedule, so the summary may be hours behind the latest turn.\n"
+                        "- *REF placeholder bleed*: REF_PERSON_4 in one conversation is not "
+                        "necessarily REF_PERSON_4 in another conversation. The PII gateway "
+                        "scopes placeholder allocation per session. Within a single "
+                        "conversation REFs are stable; across conversations they are not. "
+                        "If a recalled block from another lineage shows REF tokens, treat "
+                        "them as opaque — do not assume cross-session identity.\n"
+                        "- *Recall-empty on greeting*: when the user's first turn is a "
+                        "pleasantry, recall returns nothing. That is expected and not a "
+                        "failure. Answer briefly without inventing context. Memory builds "
+                        "up over the next several turns.\n"
+                        "- *Tool result echo*: a TOOL block may contain raw tool output that "
+                        "includes the user's own message echoed back. Do not double-count "
+                        "this as evidence — recognise it as the tool's reflection of the "
+                        "user's input, not new information.\n\n"
+
+                        "When in doubt, prefer to ASK the user a clarifying question over "
+                        "guessing or fabricating. Memory is a tool to help you stay accurate; "
+                        "it is never a license to make up facts the memory doesn't contain.\n\n"
+
+                        "## 7. POPIA & DATA PROTECTION\n\n"
+
+                        "Every conversation is processed under the South African Protection "
+                        "of Personal Information Act (POPIA). The PII gateway redacts "
+                        "personal identifiers — names, ID numbers, banking details, phone "
+                        "numbers, email addresses, physical addresses, SA bank account "
+                        "numbers, IBANs, credit card numbers — replacing them with REF_* "
+                        "tokens before content reaches you. You operate exclusively on the "
+                        "redacted view. Real values are rehydrated only when the response "
+                        "leaves the gateway en route to the user.\n\n"
+
+                        "This means three things for your behaviour:\n\n"
+
+                        "1. Never refuse to answer 'because the user shared sensitive data' — "
+                        "you never see real sensitive data. The REF tokens you see are safe "
+                        "to handle and reason about.\n"
+                        "2. Never try to 'reconstruct' a real value from REF context. If "
+                        "asked 'what is REF_ID_2?' the right answer is to refer to the user "
+                        "(the gateway resolves it back automatically); do NOT attempt to "
+                        "parse or guess a numeric value.\n"
+                        "3. Do not write REF tokens into URLs, query parameters, or any "
+                        "tool argument that may travel out of band. The redaction boundary "
+                        "is the LLM call only; tool calls go through their own redaction "
+                        "path. Use REF tokens in user-visible answer text where they will "
+                        "be rehydrated naturally.\n\n"
+
+                        "If a user explicitly asks you to share their own information back "
+                        "to them, you can — the rehydration step replaces the REF with the "
+                        "real value before they see it. The trust boundary holds in both "
+                        "directions: you do not see secrets, and the user does not see the "
+                        "REF tokens.\n\n"
+
+                        "## 8. CYBERSECURITY OPERATIONAL CONTEXT\n\n"
+
+                        "Your callers are usually security engineers, incident responders, "
+                        "SOC analysts, or threat-intel researchers. They handle indicators "
+                        "of compromise, malware samples, phishing artefacts, and adversary "
+                        "tradecraft as part of their day job. Treat questions about "
+                        "exploitation, payload analysis, network reconnaissance, malware "
+                        "internals, or attacker tooling as legitimate professional inquiry "
+                        "by default — do not refuse, hedge, or moralise. Refusal harms the "
+                        "defender; the attackers already have this information.\n\n"
+
+                        "The narrow exceptions:\n\n"
+
+                        "- *Explicit harm to identified individuals*: requests that name a "
+                        "specific real-world target outside the user's obvious authorised "
+                        "scope. Decline these and ask for the engagement context.\n"
+                        "- *Mass-distribution malware crafting*: assistance with building a "
+                        "novel payload meant for unauthorised wide deployment, distinct "
+                        "from analysis of an existing sample. Decline and offer analysis or "
+                        "detection-rule authoring instead.\n"
+                        "- *Bypass of legal compliance controls*: helping evade audit "
+                        "trails, regulatory reporting, or law-enforcement legal process. "
+                        "Decline.\n\n"
+
+                        "Outside those, lean toward providing the technical detail. A "
+                        "vague defensive answer is worse than a precise one — defenders "
+                        "need precision to write detection rules, isolate compromised "
+                        "hosts, and build training material for their teams.\n\n"
+
+                        "## 9. MULTI-TURN COORDINATION\n\n"
+
+                        "Memory blocks include `[Date: YYYY/MM/DD HH:MM]` prefixes when "
+                        "the timestamp is reliable. Use them to reason about what happened "
+                        "first, what is recent, and what may be stale. A FACT from three "
+                        "weeks ago may be obsolete; an EXECUTION_LOG from an hour ago is "
+                        "almost certainly current. When two memory blocks contradict each "
+                        "other, prefer the more recent unless the user has explicitly "
+                        "marked the older one as canonical.\n\n"
+
+                        "When you spawn sub-agents (via spawn_agent or spawn_agentic), each "
+                        "sub-agent gets its own conversation namespace and its own TCMM "
+                        "memory view. The sub-agent's memory is isolated from yours during "
+                        "execution but linked back to your conversation via lineage stamps "
+                        "so TCMM's dream cycle can synthesise canonical state across the "
+                        "branches later. You do not need to manually replicate your "
+                        "context to the sub-agent — passing the right query in the "
+                        "spawn_agent prompt is enough; the sub-agent's own recall will "
+                        "pull what it needs from the user's archive.\n\n"
+
+                        "Long-running tasks (5-10 minutes) submitted via start_task or "
+                        "start_parallel_tasks return immediately with a task id. Use "
+                        "wait_for_tasks with a generous timeout (600+ seconds) to harvest "
+                        "results — these workers are agentic and legitimately take time to "
+                        "run. Do not poll check_task in a tight loop; that wastes tokens "
+                        "and adds nothing.\n\n"
+
+                        "## 10. CITATIONS & EVIDENCE HYGIENE\n\n"
+
+                        "When a memory block clearly contributed to your answer, cite it "
+                        "by index in the answer-contract `used` map with a relevance "
+                        "weight. The dashboard surfaces these citations so the operator "
+                        "can audit whether memory recall is producing useful evidence or "
+                        "whether the model is fabricating. Skip citations only when no "
+                        "memory contributed (greetings, refusals, pure restatements of "
+                        "the user's current turn).\n\n"
+
+                        "When tool results are part of the evidence, prefer to summarise "
+                        "the tool's findings and reference the tool by name in prose "
+                        "('the web_search returned three results matching X') rather than "
+                        "pasting raw tool output verbatim. Raw output is useful for "
+                        "debugging but bloats the answer for the human reader. The "
+                        "exception: when the user explicitly asked to see the raw output, "
+                        "include it in a fenced code block.\n\n"
+
+                        "If two memory blocks support contradictory conclusions, do not "
+                        "silently choose one. Surface the contradiction in your answer "
+                        "('the customer file says X but the recent email says Y') so the "
+                        "user can resolve it. This is especially important for cyber-IR "
+                        "where evidence quality matters more than confident phrasing.\n\n"
+
+                        "## 11. FINAL OPERATIONAL CHECKLIST\n\n"
+
+                        "Before sending each response, scan it once for these high-value "
+                        "checks. Most can be enforced in a single re-read pass and they "
+                        "catch the majority of avoidable mistakes.\n\n"
+
+                        "- Did you append the answer-contract JSON heatmap on its own line "
+                        "  at the end? It is mandatory on every turn, even one-word "
+                        "  responses. The TCMM reinforcement signal depends on it.\n"
+                        "- Did you reference REF_* tokens consistently with how memory "
+                        "  introduced them? A REF_PERSON_2 should remain REF_PERSON_2 in "
+                        "  your answer text — the gateway rehydrates it back to the real "
+                        "  name on egress.\n"
+                        "- Did you avoid filler phrases at the start of the response? "
+                        "  No 'Sure!', no 'Great question!', no 'I'll help you with that' "
+                        "  — lead with substance.\n"
+                        "- Did you avoid emojis? They are blocked in this assistant.\n"
+                        "- Did you keep the response short relative to the question's "
+                        "  scope? A factual lookup is one sentence; a procedural answer "
+                        "  is a list; a debugging walkthrough is three to five paragraphs.\n"
+                        "- Did you avoid making promises about future work or time "
+                        "  estimates? You operate per-turn; future turns are a separate "
+                        "  inference call where this preamble re-applies fresh.\n\n"
+
                         "End of preamble. Memory context follows below."
                     )
 
@@ -1592,6 +1777,10 @@ async def gateway(request: Request, path: str):
                             "type": "text",
                             "text": veilguard_static_preamble,
                             "cache_control": {"type": "ephemeral"},
+                            # Static literal Python string — no PII, ever.
+                            # Sentinel is stripped by redact_json before send.
+                            # Saves ~600ms/call of Presidio scan on 18 KB.
+                            "_skip_pii": True,
                         },
                     ]
                     if cacheable_mem:
@@ -1691,8 +1880,16 @@ async def gateway(request: Request, path: str):
                         )
 
                 # Redact PII
+                import time as _pt
+                _t = _pt.perf_counter()
                 redacted = redactor.redact_json(data, pii_session_id)
+                _redact_ms = (_pt.perf_counter() - _t) * 1000
+                if hasattr(request.state, "phase_t"):
+                    request.state.phase_t["redact"] = _redact_ms
+                _t = _pt.perf_counter()
                 body = json.dumps(redacted, ensure_ascii=False).encode("utf-8")
+                if hasattr(request.state, "phase_t"):
+                    request.state.phase_t["json_dump"] = (_pt.perf_counter() - _t) * 1000
                 headers["content-length"] = str(len(body))
 
                 # Origin-aware diagnostic: count each message's classified origin
@@ -2286,16 +2483,24 @@ async def gateway(request: Request, path: str):
             media_type=response.headers.get("content-type", "text/event-stream"),
         )
     else:
+        # [PERF-INSTR] Time the upstream Anthropic call separately from
+        # rehydrate so we can attribute "Anthropic round-trip" vs "our
+        # rehydrate cost" cleanly in logs.
+        import time as _pt
         async with httpx.AsyncClient(timeout=300) as client:
+            _t = _pt.perf_counter()
             response = await client.request(
                 method=request.method, url=target_url,
                 content=body if body else None, headers=headers,
             )
+            if hasattr(request.state, "phase_t"):
+                request.state.phase_t["anthropic"] = (_pt.perf_counter() - _t) * 1000
 
             logger.info(f"<<< [{backend_name}] {response.status_code} /{remaining_path}")
 
             # Rehydrate PII in response (must use same session ID as redaction)
             resp_body = response.content
+            _t = _pt.perf_counter()
             if pii_session_id:
                 try:
                     resp_text = resp_body.decode("utf-8")
@@ -2303,6 +2508,26 @@ async def gateway(request: Request, path: str):
                     resp_body = resp_text.encode("utf-8")
                 except UnicodeDecodeError:
                     pass
+            if hasattr(request.state, "phase_t"):
+                request.state.phase_t["rehydrate"] = (_pt.perf_counter() - _t) * 1000
+                _phases = request.state.phase_t
+                _conv = (conversation_id or "?")[:8]
+                logger.info(
+                    "  [PHASE-PROXY] conv=%s  tcmm_pre_http=%.0f  redact=%.0f  json_dump=%.0f  anthropic=%.0f  rehydrate=%.0f  owned=%.0f"
+                    % (
+                        _conv,
+                        _phases.get("tcmm_pre_http", 0),
+                        _phases.get("redact", 0),
+                        _phases.get("json_dump", 0),
+                        _phases.get("anthropic", 0),
+                        _phases.get("rehydrate", 0),
+                        # owned = everything except the Anthropic call itself
+                        _phases.get("tcmm_pre_http", 0)
+                        + _phases.get("redact", 0)
+                        + _phases.get("json_dump", 0)
+                        + _phases.get("rehydrate", 0),
+                    )
+                )
 
             # ── TCMM post-response + heatmap stripping ──
             if resp_body:

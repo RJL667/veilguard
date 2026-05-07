@@ -1,0 +1,129 @@
+# Presidio allow_list — terms that are NEVER PII, even if spaCy NER
+# flags them as PERSON/ORG. One term per line. Case-sensitive (exact match).
+#
+# Add a term here when you see it showing up as REF_PERSON_* / REF_ORG_*
+# in the audit log but it's actually a technology / brand / product.
+#
+# This file is loaded once at pii-proxy container startup. To apply
+# changes: edit + restart the container (or sighup if hot-reload added).
+#
+# Ordering doesn't matter — Presidio does O(1) set lookup internally.
+
+# ─────────────────────────────────────────────────────────────────────
+# Our stack / products
+# ─────────────────────────────────────────────────────────────────────
+Veilguard
+Phishield
+LibreChat
+TCMM
+Avalear
+
+# ─────────────────────────────────────────────────────────────────────
+# Languages, runtimes, frameworks
+# ─────────────────────────────────────────────────────────────────────
+Python
+JavaScript
+TypeScript
+Node
+Node.js
+Bash
+PowerShell
+React
+Django
+Flask
+FastAPI
+Starlette
+Uvicorn
+Gunicorn
+Next.js
+
+# ─────────────────────────────────────────────────────────────────────
+# Infra / platforms
+# ─────────────────────────────────────────────────────────────────────
+Docker
+Kubernetes
+Helm
+Terraform
+Ansible
+GCE
+AWS
+Azure
+GCP
+Cloudflare
+Caddy
+Nginx
+Apache
+Redis
+MongoDB
+Postgres
+PostgreSQL
+MySQL
+SQLite
+LanceDB
+Elasticsearch
+Kafka
+
+# ─────────────────────────────────────────────────────────────────────
+# SaaS / tools
+# ─────────────────────────────────────────────────────────────────────
+Pipedrive
+Salesforce
+HubSpot
+Stripe
+PayPal
+Slack
+Teams
+Zoom
+Jira
+Linear
+Notion
+Confluence
+GitHub
+GitLab
+Bitbucket
+VSCode
+IntelliJ
+JetBrains
+Figma
+
+# ─────────────────────────────────────────────────────────────────────
+# AI / ML providers + models
+# ─────────────────────────────────────────────────────────────────────
+Anthropic
+Claude
+OpenAI
+ChatGPT
+Gemini
+Vertex
+VertexAI
+Gemma
+Presidio
+LangChain
+LangGraph
+LlamaIndex
+HuggingFace
+Transformers
+PyTorch
+TensorFlow
+FlashRank
+spaCy
+Ollama
+
+# ─────────────────────────────────────────────────────────────────────
+# Security / threat-intel (common in Phishield conversations)
+# ─────────────────────────────────────────────────────────────────────
+CISA
+MITRE
+ATT&CK
+VirusTotal
+Shodan
+Censys
+
+# ─────────────────────────────────────────────────────────────────────
+# Cybersecurity actor groups (names look like PERSON to spaCy)
+# Add here as they come up — these are APT / threat-actor aliases
+# that should stay in plaintext so the LLM can reason about them.
+# ─────────────────────────────────────────────────────────────────────
+Lazarus
+Guacamaya
+SEDENA

@@ -1,0 +1,14 @@
+[Unit]
+Description=Snapshot TCMM + LanceDB stats every 5 minutes
+
+[Timer]
+# First snapshot 1 minute after boot (gives TCMM time to start), then
+# every 5 minutes thereafter.
+OnBootSec=60
+OnUnitActiveSec=5min
+# Don't backfill missed snapshots after a long downtime — the resulting
+# burst would be useless and just clog the log.
+Persistent=false
+
+[Install]
+WantedBy=timers.target
