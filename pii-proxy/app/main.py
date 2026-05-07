@@ -92,7 +92,25 @@ app = FastAPI(title="Veilguard PII Gateway")
 @app.on_event("startup")
 async def startup():
     logger.info("Loading Presidio NLP models...")
-    get_redactor(min_score=MIN_SCORE)
+    redactor_inst = get_redactor(min_score=MIN_SCORE)
+    # Pre-warm Presidio at startup. The first redact_text call would
+    # otherwise pay ~600-1300ms of one-time cost (spacy model load,
+    # NLP pipeline JIT-warm, allow_list compile) inside the user's
+    # first request. By burning a dummy scan here the very first
+    # real call already sees the warm path.
+    try:
+        import time as _pt
+        _t = _pt.time()
+        redactor_inst.redact_text(
+            "Pre-warm probe: Alice met Bob at +27 21 123 4567 to discuss "
+            "ID 8001015009087 and account 1234567890.",
+            "_warmup_session_",
+        )
+        logger.info(
+            f"Presidio pre-warm complete in {(_pt.time() - _t) * 1000:.0f}ms"
+        )
+    except Exception as e:
+        logger.warning(f"Presidio pre-warm failed (non-fatal): {e}")
     logger.info("=" * 50)
     logger.info(f"Veilguard PII Gateway ready on port {PORT}")
     for name, url in BACKENDS.items():
