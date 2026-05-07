@@ -54,8 +54,71 @@ EFFORT_LEVELS = {
 }
 
 
+_REF_TOKEN_PATTERN = re.compile(r"\bREF_[A-Z]+_\d+\b")
+
+
+async def _rehydrate_args(args: dict) -> dict:
+    """Replace REF_TYPE_N tokens in tool args with real values via the
+    pii-proxy ``/rehydrate`` endpoint.
+
+    The proxy's outbound streaming rehydration is best-effort: SSE
+    chunk boundaries can split a REF token mid-string, the regex
+    misses the split occurrence, and the broken token leaks into
+    ``tool_use.input``. By the time LibreChat extracts the tool call
+    and forwards it here the token is still raw — the search engine /
+    file system / shell would otherwise receive ``REF_PERSON_4``
+    instead of the real name.
+
+    This pass is the SECOND chance: walk every string value in the
+    args dict; if any contains ``REF_``, hit /rehydrate. Idempotent —
+    calling on already-rehydrated text is a no-op (no mapping match).
+    """
+    if not isinstance(args, dict) or not args:
+        return args
+    has_ref = any(
+        isinstance(v, str) and _REF_TOKEN_PATTERN.search(v)
+        for v in args.values()
+    )
+    if not has_ref:
+        return args
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            new_args = {}
+            changed = 0
+            for k, v in args.items():
+                if isinstance(v, str) and _REF_TOKEN_PATTERN.search(v):
+                    resp = await client.post(
+                        "http://localhost:4000/rehydrate",
+                        json={"text": v},
+                    )
+                    if resp.status_code == 200:
+                        rehy = resp.json().get("text", v)
+                        new_args[k] = rehy
+                        if rehy != v:
+                            changed += 1
+                    else:
+                        new_args[k] = v
+                else:
+                    new_args[k] = v
+            if changed:
+                logger.info(
+                    f"[REHYDRATE-ARGS] rehydrated {changed} field(s) of REF tokens "
+                    f"(proxy stream-rehydrate missed them across SSE boundaries)"
+                )
+            return new_args
+    except Exception as e:
+        logger.warning(f"[REHYDRATE-ARGS] failed: {e}; passing args through as-is")
+        return args
+
+
 async def handle_tool(name: str, args: dict) -> str:
     """Execute an agentic tool. Routes client-side tools through the bridge when not in local mode."""
+    # Backstop rehydration: turn any REF_PERSON_N / REF_EMAIL_N etc.
+    # tokens that survived the proxy's streaming rehydration into the
+    # original PII values. Without this, REF placeholders end up in
+    # web_search queries / file paths / shell commands and tools fail.
+    args = await _rehydrate_args(args)
+
     # Check if this tool should be routed to the client daemon
     from utils.tool_location import is_client_tool
     import server as _srv
