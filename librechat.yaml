@@ -81,6 +81,30 @@ endpoints:
   # noise on the other built-ins.  Leaving a key off is the supported
   # way to hide it.)
 
+  # xAI Grok via the same PII proxy.  Uses the LibreChat custom-endpoint
+  # shape (NOT the openai endpoint — different Zod schema, custom
+  # accepts apiKey/modelDisplayLabel/iconURL which the OpenAI/Anthropic
+  # schemas reject).  xAI's API is OpenAI-compatible: Bearer auth,
+  # /v1/chat/completions.  The pii-proxy forwards /xai/v1/* to
+  # api.x.ai/v1/* with PII redaction; no Anthropic cache_control
+  # plumbing runs on this path because _is_anthropic_format gates it.
+  custom:
+    - name: "xAI"
+      apiKey: "${XAI_API_KEY}"
+      baseURL: "http://pii-proxy:4000/xai/v1"
+      models:
+        # Keep curated; do NOT fetch from upstream because xAI's real
+        # /v1/models returns the full catalogue (grok-imagine, 4.20
+        # variants, etc.) and would pollute the dropdown.  The proxy
+        # also serves a whitelisted /xai/v1/models stub as belt-and-
+        # suspenders.
+        default:
+          - "grok-4.3"
+        fetch: false
+      titleConvo: true
+      titleModel: "grok-4.3"
+      modelDisplayLabel: "Grok"
+
   # Agents endpoint: LibreChat's built-in tool-using runtime. This is
   # what exposes MCP server tools in the UI — without it, the tool
   # picker is empty even when MCP servers are healthy on the backend.

@@ -65,6 +65,41 @@ services:
     volumes:
       - meili-data:/meili_data
 
+  # === Admin Dashboard (read-only ops console) ===
+  admin:
+    build: ./mcp-tools/admin-dashboard
+    ports:
+      - "8820:8820"
+    depends_on:
+      mongodb:
+        condition: service_started
+    # TCMM runs as a bare Python process on the host; reach it via the
+    # docker host gateway just like api/ and pii-proxy/ do.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/LibreChat
+      - MONGO_DB=LibreChat
+      - TCMM_URL=http://host.docker.internal:8811
+      - ADMIN_LANCE_DIR=/tcmm-data/veilguard/tcmm.db
+      - ADMIN_HOST=0.0.0.0
+      - ADMIN_PORT=8820
+    volumes:
+      # Bind-mount source so edits hot-reload without rebuild
+      - ./mcp-tools/admin-dashboard:/app
+      # Lance directory (TCMM + PII audit live here). Mounted RW because
+      # lancedb's `connect()` opens version + lock files even on a
+      # read-only query — :ro causes "Read-only file system" errors.
+      - ./tcmm-data:/tcmm-data
+      # Host /proc for CPU + memory metrics. Read-only, no privileged.
+      # On Docker Desktop the "host" is the LinuxKit VM, so numbers
+      # will reflect that VM rather than Windows itself; that's fine
+      # for dev and exactly right for prod (the VM == the box).
+      - /proc:/host/proc:ro
+    restart: unless-stopped
+
   # === Veilguard PII Gateway (FastAPI + Presidio) ===
   pii-proxy:
     build: ./pii-proxy
@@ -89,9 +124,11 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - XAI_API_KEY=${XAI_API_KEY:-}
       - ANTHROPIC_API_URL=${ANTHROPIC_API_URL:-https://api.anthropic.com}
       - OPENAI_API_URL=${OPENAI_API_URL:-https://api.openai.com}
       - GEMINI_API_URL=${GEMINI_API_URL:-https://generativelanguage.googleapis.com}
+      - XAI_API_URL=${XAI_API_URL:-https://api.x.ai}
       - PII_PROXY_PORT=4000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MIN_SCORE=${MIN_SCORE:-0.7}

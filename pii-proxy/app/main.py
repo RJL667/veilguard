@@ -7,6 +7,7 @@ Routes:
   /anthropic/*  → https://api.anthropic.com/*
   /openai/*     → https://api.openai.com/*
   /gemini/*     → https://generativelanguage.googleapis.com/*
+  /xai/*        → https://api.x.ai/*
 
 All user-authored content is scanned for PII before forwarding.
 All responses are rehydrated (PII tokens → original values) before returning.
@@ -15,6 +16,7 @@ LibreChat config:
   ANTHROPIC_BASE_URL=http://pii-proxy:4000/anthropic
   OPENAI_BASE_URL=http://pii-proxy:4000/openai/v1
   (Google: custom endpoint with baseURL http://pii-proxy:4000/gemini)
+  (xAI:    custom endpoint with baseURL http://pii-proxy:4000/xai/v1)
 """
 
 import json
@@ -84,6 +86,13 @@ BACKENDS = {
     "anthropic": os.environ.get("ANTHROPIC_API_URL", "https://api.anthropic.com"),
     "openai": os.environ.get("OPENAI_API_URL", "https://api.openai.com"),
     "gemini": os.environ.get("GEMINI_API_URL", "https://generativelanguage.googleapis.com"),
+    # xAI is OpenAI-compatible (Bearer auth, /v1/chat/completions shape).
+    # Prompt caching is automatic server-side prefix caching — no client-side
+    # cache_control markers like Anthropic. The Anthropic-specific cache
+    # plumbing (_apply_anthropic_cache, extended-TTL beta header, two-tier
+    # split) is correctly gated by _is_anthropic_format and never runs on
+    # xAI requests. See https://docs.x.ai/developers/models/grok-4.3
+    "xai": os.environ.get("XAI_API_URL", "https://api.x.ai"),
 }
 
 app = FastAPI(title="Veilguard PII Gateway")
@@ -684,6 +693,104 @@ _MIN_CACHE_CHARS = 9200  # ~2300 tokens. Empirically verified 23 Apr 2026
 # and actual-minimum. Preamble is now expanded to >9200B to clear the floor.
 
 
+# Phase 7 marker constants — TCMM adapter emits these to delimit the
+# two-tier cache layout. Module-level so tests can import them and the
+# adapter side can stay in sync.
+TCMM_STABLE_BOUNDARY = "--- END STABLE MEMORY ---"
+TCMM_LIVE_BOUNDARY = "--- END LIVE MEMORY ---"
+
+
+def _split_tcmm_memory_into_tiers(tcmm_memory: str) -> tuple[str, str, str]:
+    """Split a TCMM-rendered memory blob into (stable, working, volatile).
+
+    Recognised layouts:
+      Phase-7 two-tier:
+          <L0 + L1a> ___ END STABLE MEMORY ___\n<L1b> ___ END LIVE MEMORY ___\n<L2 + L3>
+      Phase-6 single-boundary (back-compat):
+          <L0 + L1>  ___ END LIVE MEMORY ___\n<L2 + L3>
+      No markers (oldest path):
+          <everything>      → all goes into the "working" bucket so
+                              it still gets at least one cache_control.
+
+    Splits include the marker line in the tier it terminates — that's
+    intentional so the marker's bytes are inside the cached region and
+    can be diffed across turns in logs.
+    """
+    if not tcmm_memory:
+        return ("", "", "")
+    stable_idx = tcmm_memory.find(TCMM_STABLE_BOUNDARY)
+    live_idx = tcmm_memory.find(TCMM_LIVE_BOUNDARY)
+    if stable_idx >= 0 and live_idx > stable_idx:
+        sb_nl = tcmm_memory.find("\n", stable_idx)
+        sb_split = sb_nl if sb_nl >= 0 else stable_idx + len(TCMM_STABLE_BOUNDARY)
+        stable_mem = tcmm_memory[:sb_split]
+        lb_nl = tcmm_memory.find("\n", live_idx)
+        lb_split = lb_nl if lb_nl >= 0 else live_idx + len(TCMM_LIVE_BOUNDARY)
+        working_mem = tcmm_memory[sb_split:lb_split]
+        volatile_tail = tcmm_memory[lb_split:]
+        return (stable_mem, working_mem, volatile_tail)
+    if live_idx >= 0:
+        lb_nl = tcmm_memory.find("\n", live_idx)
+        lb_split = lb_nl if lb_nl >= 0 else live_idx + len(TCMM_LIVE_BOUNDARY)
+        return ("", tcmm_memory[:lb_split], tcmm_memory[lb_split:])
+    return ("", tcmm_memory, "")
+
+
+def _assemble_system_blocks_for_tiers(
+    *,
+    veilguard_static_preamble: str,
+    tcmm_memory: str,
+    cache_circuit_strip: bool,
+    min_cache_chars: int,
+) -> tuple[list[dict], bool]:
+    """Build the Anthropic ``system`` block list for the two-tier cache layout.
+
+    Returns ``(system_blocks, used_extended_ttl)`` where:
+      * ``system_blocks`` is the list of text blocks to put in
+        ``data["system"]`` — between 1 and 3 entries.
+      * ``used_extended_ttl`` is True iff a 1h-TTL marker was actually
+        placed (caller must then attach the extended-cache-ttl beta
+        header). False when the circuit breaker stripped cache_control.
+
+    Pure function — no logging, no I/O, no global mutation. Safe to call
+    from tests with synthetic inputs.
+
+    Policy:
+      • Block 1 (preamble + L1a stable): always emitted. 1h TTL unless
+        the circuit breaker is tripped. We do NOT size-gate the preamble
+        block — it's intentionally padded above _MIN_CACHE_CHARS so it
+        always caches on its own.
+      • Block 2 (L1b working): emitted only when working_mem is non-empty.
+        5m TTL only when len(working_mem) >= min_cache_chars (otherwise
+        a sub-floor marker would trigger Anthropic's total-rejection
+        failure mode — verified 23 Apr 2026).
+      • Block 3 (L2 shadow + L3 answer contract): emitted only when
+        volatile_tail is non-empty. No cache_control.
+    """
+    stable_mem, working_mem, volatile_tail = _split_tcmm_memory_into_tiers(tcmm_memory)
+
+    preamble_blk: dict = {
+        "type": "text",
+        "text": veilguard_static_preamble + stable_mem,
+    }
+    if not cache_circuit_strip:
+        preamble_blk["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+    used_extended_ttl = not cache_circuit_strip
+
+    system_blocks: list[dict] = [preamble_blk]
+
+    if working_mem:
+        wblk: dict = {"type": "text", "text": working_mem}
+        if not cache_circuit_strip and len(working_mem) >= min_cache_chars:
+            wblk["cache_control"] = {"type": "ephemeral"}
+        system_blocks.append(wblk)
+
+    if volatile_tail:
+        system_blocks.append({"type": "text", "text": volatile_tail})
+
+    return system_blocks, used_extended_ttl
+
+
 def _split_for_cache(prompt: str, marker: str | None = None) -> tuple[str | None, str]:
     """Split a prompt at a boundary marker for KV-cache reuse.
 
@@ -994,10 +1101,44 @@ VEILGUARD_CLAUDE_MODELS = [
     "claude-haiku-4-5",
 ]
 
+# Canonical xAI lineup surfaced in LibreChat's dropdown.  Grok 4.3 is
+# the current frontier xAI model (released 2026-04-30): 1M-token
+# context, $1.25 in / $2.50 out per M tokens, $0.20/M cached input
+# (automatic server-side prefix caching, no client markers).  Reasoning
+# is built-in and controllable via the ``reasoning_effort`` request
+# param (none/low/medium/high; default low) — passes through this proxy
+# unchanged because we don't strip unknown fields.
+VEILGUARD_XAI_MODELS = [
+    "grok-4.3",
+]
+
 # Anthropic beta header that unlocks the 1M-token context window on
 # Opus 4.7.  Appended to the request's ``anthropic-beta`` header (if
 # any) when the synthetic ``-1m`` alias is used.
 CLAUDE_1M_BETA = "context-1m-2025-08-07"
+
+# Anthropic beta header that enables the 1-hour TTL on cache_control
+# blocks. Without it, the server treats {"ttl": "1h"} as a no-op and the
+# block silently falls back to the default 5-minute TTL. We attach this
+# whenever the Phase-7 two-tier cache split places a 1h-TTL marker on
+# the stable region.
+EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
+
+
+def _ensure_extended_cache_ttl_beta(data: dict, headers: dict) -> None:
+    """Idempotently add the 1h-TTL beta header to the outgoing request.
+
+    Mutates ``headers`` in place (and normalises Anthropic-Beta casing).
+    Safe to call multiple times — the header is a comma-separated list
+    and we de-dup on add.
+    """
+    existing = headers.get("anthropic-beta") or headers.get("Anthropic-Beta") or ""
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    if EXTENDED_CACHE_TTL_BETA not in parts:
+        parts.append(EXTENDED_CACHE_TTL_BETA)
+    headers["anthropic-beta"] = ",".join(parts)
+    # Strip alternate-casing variant so we don't double-send.
+    headers.pop("Anthropic-Beta", None)
 
 
 def _rewrite_claude_1m_alias(data: dict, headers: dict) -> None:
@@ -1046,6 +1187,29 @@ async def anthropic_models():
     }
 
 
+# Stub for xAI model listing.  xAI's real /v1/models returns the full
+# catalogue (including grok-imagine, grok-4.20 variants, etc.) — we
+# whitelist just the IDs Veilguard supports so the LibreChat dropdown
+# stays curated.  LibreChat's custom-endpoint config uses ``fetch:
+# false`` to skip discovery entirely, but the stub is here for any
+# OpenAI-SDK client that probes /models.
+@app.get("/xai/v1/models")
+async def xai_models():
+    """Return available xAI models (stub for LibreChat model discovery)."""
+    return {
+        "data": [
+            {
+                "id": mid,
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "xai",
+            }
+            for mid in VEILGUARD_XAI_MODELS
+        ],
+        "object": "list",
+    }
+
+
 @app.get("/health")
 async def health():
     return {
@@ -1053,6 +1217,38 @@ async def health():
         "service": "veilguard-pii-gateway",
         "presidio": "active",
         "backends": list(BACKENDS.keys()),
+    }
+
+
+@app.get("/cache/stats")
+async def cache_stats(
+    tenant_id: str | None = None,
+    window_seconds: float | None = None,
+):
+    """Per-tenant cache telemetry (Phase 7 step 2).
+
+    Query params:
+      tenant_id:        if set, returns stats for that tenant only.
+                        Omit to return every tracked tenant.
+      window_seconds:   if set, restricts aggregation to samples newer
+                        than now - window_seconds. Omit for the full
+                        rolling window (default 1000 most recent).
+
+    Returned `hit_rate`, `write_rate`, `effective_token_multiplier`
+    are normalised over total input tokens (cache_read + cache_create +
+    uncached input). `write_amplification` is cache_create / cache_read
+    — useful for spotting tenants where caching costs more than it
+    saves (>= 1.0 means strictly worse than no caching).
+
+    Useful operational queries:
+      • GET /cache/stats                              — overview
+      • GET /cache/stats?tenant_id=...&window_seconds=86400 — last day
+    """
+    from app import cache_metrics
+    if tenant_id is not None:
+        return cache_metrics.get_tenant_stats(tenant_id, window_seconds=window_seconds)
+    return {
+        "tenants": cache_metrics.get_all_stats(window_seconds=window_seconds),
     }
 
 
@@ -1745,34 +1941,25 @@ async def gateway(request: Request, path: str):
                     existing_system = data.get("system", "")
                     tcmm_memory = existing_system.strip() if existing_system else ""
 
-                    # TCMM renders memory as:
-                    #   <L0 header + instructions>
-                    #   <L1 live blocks — stable, cacheable>
-                    #   --- END LIVE MEMORY ---    ← cache boundary
-                    #   <L2 shadow blocks — volatile>
-                    #   <L3 answer contract — volatile>
-                    #
-                    # We extend the cacheable region by including the Veilguard
-                    # preamble + L0 + L1 (up to and including the END-LIVE-MEMORY
-                    # line) in the FIRST content block with cache_control. Everything
-                    # below the boundary goes in a second block with no cache_control.
-                    _LIVE_BOUNDARY = "--- END LIVE MEMORY ---"
-                    if tcmm_memory:
-                        idx = tcmm_memory.find(_LIVE_BOUNDARY)
-                        if idx >= 0:
-                            # Split so the marker line goes in the cached region.
-                            nl = tcmm_memory.find("\n", idx)
-                            split_at = nl if nl >= 0 else idx + len(_LIVE_BOUNDARY)
-                            cacheable_mem = tcmm_memory[:split_at]
-                            volatile_tail = tcmm_memory[split_at:]
-                        else:
-                            # Older TCMM without Phase-6 marker — entire memory
-                            # goes in the cached block (as before).
-                            cacheable_mem = tcmm_memory
-                            volatile_tail = ""
-                    else:
-                        cacheable_mem = ""
-                        volatile_tail = ""
+                    # Phase 7 step 6: cache-thrash circuit breaker.
+                    # If this tenant has historically poor cache economics
+                    # over the rolling window, omit cache_control entirely
+                    # so they pay 1.0× input instead of perpetually paying
+                    # the 1.25×/2× write premium for cache reads that
+                    # never come. Re-evaluated every request — recovers
+                    # automatically when the pattern improves.
+                    _cache_circuit_strip = False
+                    try:
+                        from app import cache_metrics as _cm
+                        _strip, _why = _cm.is_cache_thrashing(tcmm_user_id or "")
+                        _cache_circuit_strip = bool(_strip)
+                        if _strip:
+                            logger.info(
+                                f"  [CACHE-CIRCUIT] tripped tenant={(tcmm_user_id or '')[:8]} "
+                                f"{_why} — stripping cache_control for this request"
+                            )
+                    except Exception as _e:
+                        logger.warning(f"[cache_metrics] circuit check failed: {_e}")
 
                     # Assemble the system field using TWO cache_control
                     # markers:
@@ -1830,25 +2017,45 @@ async def gateway(request: Request, path: str):
                             "text": volatile_tail,
                         })
                     data["system"] = system_blocks
+                    # Extract per-tier slices for the diagnostic log
+                    # below. The helper internally calls
+                    # _split_tcmm_memory_into_tiers; we call it again
+                    # here so the log can show byte counts/hashes that
+                    # align with what the helper emitted.
+                    stable_mem, working_mem, volatile_tail = _split_tcmm_memory_into_tiers(tcmm_memory)
+                    if _used_extended_ttl:
+                        # Phase 7: ensure the 1h TTL beta header is on the
+                        # outgoing request. Skipped when the circuit
+                        # breaker stripped the 1h marker.
+                        _ensure_extended_cache_ttl_beta(data, headers)
 
-                    # Diagnostic: per-block SHA-256 prefix + byte length.
-                    # Across turns in the same conversation, the preamble
-                    # hash MUST stay constant (it's a literal).  The
-                    # memory hash changing indicates TCMM isn't
-                    # append-only and is the real cause of cache-miss
-                    # churn.  Hashes live in logs; diff them by conv_id
-                    # to confirm which block is drifting.
+                    # Diagnostic: per-block SHA-256 prefix + byte length
+                    # for each tier. Across turns in the same conversation:
+                    #   preamble — literal constant, hash MUST stay equal.
+                    #   stable   — should stay equal across many turns;
+                    #              a change means a stable-tier block got
+                    #              demoted, evicted, or had its bytes
+                    #              mutated (silent invalidator).
+                    #   working  — expected to drift turn-to-turn as
+                    #              shadow blocks promote and the working
+                    #              set churns; that's why it lives in
+                    #              the 5m tier instead of the 1h tier.
+                    # Diff hashes by conv_id to identify drift causes.
                     import hashlib as _hashlib
                     _pre_hash = _hashlib.sha256(
                         veilguard_static_preamble.encode("utf-8")
                     ).hexdigest()[:10]
-                    _mem_hash = _hashlib.sha256(
-                        cacheable_mem.encode("utf-8")
-                    ).hexdigest()[:10] if cacheable_mem else "(empty)"
+                    _stable_hash = _hashlib.sha256(
+                        stable_mem.encode("utf-8")
+                    ).hexdigest()[:10] if stable_mem else "(empty)"
+                    _work_hash = _hashlib.sha256(
+                        working_mem.encode("utf-8")
+                    ).hexdigest()[:10] if working_mem else "(empty)"
                     logger.info(
                         f"  [CACHE] conv={conversation_id[:8]} "
                         f"preamble={_pre_hash}/{len(veilguard_static_preamble)}B  "
-                        f"memory={_mem_hash}/{len(cacheable_mem)}B  "
+                        f"stable={_stable_hash}/{len(stable_mem)}B  "
+                        f"working={_work_hash}/{len(working_mem)}B  "
                         f"volatile={len(volatile_tail)}B"
                     )
 
@@ -2240,6 +2447,21 @@ async def gateway(request: Request, path: str):
                 except Exception as _e:
                     logger.warning(f"[audit_db] FROM_LLM record failed: {_e}")
 
+                # Phase 7 step 2: per-tenant rolling cache-metrics rollup.
+                # Feeds the /cache/stats endpoint and the circuit breaker
+                # decision in step 6. Fire-and-forget — failures here
+                # must not break the response stream.
+                try:
+                    from app import cache_metrics as _cache_metrics
+                    _cache_metrics.record_from_usage(
+                        _cache_usage,
+                        tenant_id=tcmm_user_id or "",
+                        conv_id=conversation_id or "",
+                        model=_from_model,
+                    )
+                except Exception as _e:
+                    logger.warning(f"[cache_metrics] record failed: {_e}")
+
                 # Feed full content (WITH heatmap) to TCMM for learning.
                 # We MUST rehydrate before ingest — per-chunk rehydrate at
                 # line ~1408 misses tokens that straddle chunk boundaries
@@ -2574,29 +2796,42 @@ async def gateway(request: Request, path: str):
                     if raw_content:
                         # Audit log
                         audit_log("FROM_LLM", conversation_id, raw_content or "(empty)", "stream=false")
+
+                        # Non-streaming responses carry usage in the
+                        # response body — extract it so FROM_LLM
+                        # audit rows actually have token metrics.
+                        # Previously this call site had no token
+                        # fields, which is why audit-log token
+                        # coverage was only ~18% (only anthropic
+                        # streaming was populating them).
+                        #
+                        # Hoisted ABOVE the audit_db try-block so the
+                        # downstream cache_metrics call (~30 lines
+                        # below) sees these bindings even when
+                        # audit_db's import itself raises (e.g. when
+                        # the container is missing lancedb). Before
+                        # the hoist, an audit_db import failure left
+                        # _usage / _model_from_resp unbound, and
+                        # cache_metrics.record() then died with an
+                        # UnboundLocalError — surfacing as a noisy
+                        # warning on every non-anthropic 200 response.
+                        _usage = resp_json.get("usage", {}) or {}
+                        _model_from_resp = resp_json.get("model") or (
+                            _model_id if _model_id and _model_id != "?" else None
+                        )
+                        if is_anthropic_resp:
+                            _tok_in  = _usage.get("input_tokens")
+                            _tok_out = _usage.get("output_tokens")
+                            _cc      = _usage.get("cache_creation_input_tokens")
+                            _cr      = _usage.get("cache_read_input_tokens")
+                        else:
+                            # OpenAI / xAI usage keys
+                            _tok_in  = _usage.get("prompt_tokens")
+                            _tok_out = _usage.get("completion_tokens")
+                            _cc, _cr = None, None
+
                         try:
                             from app import audit_db as _audit_db
-                            # Non-streaming responses carry usage in the
-                            # response body — extract it so FROM_LLM
-                            # audit rows actually have token metrics.
-                            # Previously this call site had no token
-                            # fields, which is why audit-log token
-                            # coverage was only ~18% (only anthropic
-                            # streaming was populating them).
-                            _usage = resp_json.get("usage", {}) or {}
-                            _model_from_resp = resp_json.get("model") or (
-                                _model_id if _model_id and _model_id != "?" else None
-                            )
-                            if is_anthropic_resp:
-                                _tok_in  = _usage.get("input_tokens")
-                                _tok_out = _usage.get("output_tokens")
-                                _cc      = _usage.get("cache_creation_input_tokens")
-                                _cr      = _usage.get("cache_read_input_tokens")
-                            else:
-                                # OpenAI usage keys
-                                _tok_in  = _usage.get("prompt_tokens")
-                                _tok_out = _usage.get("completion_tokens")
-                                _cc, _cr = None, None
                             _audit_db.record(
                                 direction="FROM_LLM",
                                 conversation_id=conversation_id or "",
@@ -2611,6 +2846,18 @@ async def gateway(request: Request, path: str):
                             )
                         except Exception as _e:
                             logger.warning(f"[audit_db] FROM_LLM record failed: {_e}")
+
+                        # Phase 7 step 2: non-streaming path rollup.
+                        try:
+                            from app import cache_metrics as _cache_metrics
+                            _cache_metrics.record_from_usage(
+                                _usage if is_anthropic_resp else None,
+                                tenant_id=tcmm_user_id or "",
+                                conv_id=conversation_id or "",
+                                model=_model_from_resp,
+                            )
+                        except Exception as _e:
+                            logger.warning(f"[cache_metrics] record failed: {_e}")
 
                         # Feed REAL content to TCMM (no redaction — private local storage)
                         if tcmm_active:

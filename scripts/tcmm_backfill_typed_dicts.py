@@ -108,7 +108,7 @@ def reextract_via_ai_studio(text: str, model) -> tuple[list, list]:
     block's text. Returns (topic_dicts, entity_dicts) ready for
     merge_insert.
 
-    NOT going through TCMM's vertex_nlp_adapter on purpose — the user
+    NOT going through TCMM's ai_studio_nlp_adapter on purpose — the user
     asked us not to push TCMM code changes, and the adapter is set up
     for Vertex (ADC auth), not AI Studio (API key). This standalone
     call uses google-generativeai SDK directly with the API key from
@@ -117,7 +117,7 @@ def reextract_via_ai_studio(text: str, model) -> tuple[list, list]:
     if not text or not text.strip():
         return [], []
     # Trim to ~2000 chars (matches what the production adapter does at
-    # vertex_nlp_adapter.py:452). Long blocks blow the prompt budget
+    # ai_studio_nlp_adapter.py:452). Long blocks blow the prompt budget
     # and don't yield better extraction in practice.
     snippet = text[:2000]
     prompt = _AI_STUDIO_PROMPT.replace("{text}", snippet)
@@ -413,7 +413,7 @@ def main() -> int:
         return 0
 
     # Execute mode. The reextract path uses Google AI Studio directly
-    # (NOT TCMM's vertex_nlp_adapter, which would require Vertex ADC).
+    # (NOT TCMM's ai_studio_nlp_adapter, which would require Vertex ADC).
     # Standalone google-generativeai SDK call with the API key from
     # the VM's .env (GOOGLE_API_KEY).
     model = None

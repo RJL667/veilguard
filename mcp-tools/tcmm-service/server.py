@@ -17,6 +17,36 @@ import threading
 from collections import OrderedDict
 from typing import Dict, Optional
 
+# ── Suppress HuggingFace transformers' TF/Flax auto-probe ─────────────────────
+# Must be set BEFORE any import that might transitively pull in `transformers`
+# (sentence_transformers does, even if we end up not using it). Without these
+# guards, importing transformers triggers a 10-15s detection probe that loads
+# tensorflow + keras + tf_keras and spews deprecation warnings. We never use
+# TF in this stack — pin to PyTorch only.
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
+
+# ── Load .env early so NLP_BACKEND / EMBED_BACKEND / GOOGLE_* are visible ────
+# Two sources, in priority order (process env always wins via override=False):
+#   1. TCMM repo's .env  — adapter/backend selection + API keys
+#   2. Veilguard repo's .env — runtime + service URLs
+# Previously absent; backend selection silently fell back to "local" defaults
+# because launching `python server.py` from a bare shell didn't export these.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _TCMM_ROOT_FOR_ENV = os.environ.get(
+        "TCMM_ROOT",
+        r"C:\Users\rudol\.gemini\antigravity\tcmm\TCMM",
+    )
+    _load_dotenv(os.path.join(_TCMM_ROOT_FOR_ENV, ".env"), override=False)
+    _load_dotenv(
+        os.path.join(os.path.dirname(__file__), "..", "..", ".env"),
+        override=False,
+    )
+except ImportError:
+    # python-dotenv not installed — fall back to shell env only.
+    pass
+
 import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -370,29 +400,41 @@ _shared_embedder = None
 def _init_shared_resources():
     """Load NLP adapter and embedder once, shared across all sessions.
 
-    NLP_BACKEND=local      → LocalNLPAdapter (Gemma E2B + SpaCy, needs GPU)
-    NLP_BACKEND=vertex     → VertexNLPAdapter via Vertex AI (project + ADC)
-    NLP_BACKEND=ai_studio  → VertexNLPAdapter routed at AI Studio
-                             (generativelanguage.googleapis.com + API key).
-                             The adapter already supports both modes; the
-                             selector below picks which one by passing
-                             either ``project_id`` (Vertex) or ``api_key``
-                             (AI Studio) — never both.
+    NLP_BACKEND=ai_studio  → AIStudioNLPAdapter (production default).
+                             generativelanguage.googleapis.com + API key.
+                             Fast, cheap, no ADC, no GCP project.
+    NLP_BACKEND=local      → LocalNLPAdapter (Gemma E2B + SpaCy, GPU). Used
+                             only for offline testing — pulls heavy ML deps
+                             and a transitive TF probe; not for prod use.
 
-    EMBED_BACKEND=local    → LocalEmbeddingAdapter (SentenceTransformer, GPU)
-    EMBED_BACKEND=vertex   → VertexEmbeddingAdapter (text-embedding-005)
+    EMBED_BACKEND=local    → LocalEmbeddingAdapter (FastEmbed ONNX-int8 on
+                             CPU, snowflake/snowflake-arctic-embed-xs by
+                             default). Sole supported value.
+
+    Vertex AI was removed entirely from the codebase 2026-05-13 — the only
+    Google-API surface this service hits is AI Studio's Generative
+    Language API. ``NLP_BACKEND=vertex`` and ``EMBED_BACKEND=vertex`` now
+    raise RuntimeError on startup so any stale config fails loud rather
+    than silently regressing.
     """
     global _shared_nlp, _shared_embedder
 
-    nlp_backend = os.environ.get("NLP_BACKEND", "local").lower()
+    nlp_backend = os.environ.get("NLP_BACKEND", "ai_studio").lower()
     embed_backend = os.environ.get("EMBED_BACKEND", "local").lower()
-    vertex_project = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-    vertex_region = os.environ.get("VERTEX_REGION", "us-central1")
     nlp_model = os.environ.get("NLP_MODEL", "gemini-2.5-flash")
+
+    # Fail loud if someone tries to use the retired vertex NLP backend so
+    # they discover the rename instead of silently falling through to local.
+    if nlp_backend == "vertex":
+        raise RuntimeError(
+            "NLP_BACKEND=vertex is no longer supported. Use NLP_BACKEND=ai_studio "
+            "(same Gemini model, much faster, just needs an API key — "
+            "GOOGLE_API_KEY or GEMINI_API_KEY in env)."
+        )
 
     # NLP adapter
     if nlp_backend == "ai_studio":
-        from adapters.vertex_nlp_adapter import VertexNLPAdapter
+        from adapters.ai_studio_nlp_adapter import AIStudioNLPAdapter
         # Adapter env-var fallback chain is VERTEX_API_KEY → GEMINI_API_KEY,
         # but our prod env stores the key as GOOGLE_API_KEY. Pull it
         # explicitly here so the adapter receives it via constructor and
@@ -409,21 +451,8 @@ def _init_shared_resources():
                 "(checked GOOGLE_API_KEY, GEMINI_API_KEY, VERTEX_API_KEY)"
             )
         logger.info(f"Loading NLP adapter via AI Studio (model={nlp_model})...")
-        # project_id="" forces the adapter into its AI Studio code path.
-        _shared_nlp = VertexNLPAdapter(
-            project_id="",
+        _shared_nlp = AIStudioNLPAdapter(
             api_key=api_key,
-            model=nlp_model,
-        )
-    elif nlp_backend == "vertex":
-        from adapters.vertex_nlp_adapter import VertexNLPAdapter
-        logger.info(
-            f"Loading Vertex AI NLP adapter (model={nlp_model}, "
-            f"project={vertex_project})..."
-        )
-        _shared_nlp = VertexNLPAdapter(
-            project_id=vertex_project,
-            region=vertex_region,
             model=nlp_model,
         )
     else:
@@ -431,15 +460,24 @@ def _init_shared_resources():
         logger.info("Loading local NLP adapter (Gemma E2B + SpaCy)...")
         _shared_nlp = LocalNLPAdapter()
 
-    # Embedding adapter
+    # Embedding adapter — single path (FastEmbed ONNX-int8 on CPU).
+    # The legacy ``EMBED_BACKEND=vertex`` branch was retired 2026-05-13
+    # along with the rest of the Vertex AI surface; any value of
+    # EMBED_BACKEND now resolves to local FastEmbed. See
+    # adapters/local_adapter.py docstring for the model-selection bench.
     if embed_backend == "vertex":
-        from adapters.vertex_embedding_adapter import VertexEmbeddingAdapter
-        logger.info(f"Loading Vertex AI embedding adapter (text-embedding-005, project={vertex_project})...")
-        _shared_embedder = VertexEmbeddingAdapter(project_id=vertex_project, region=vertex_region)
-    else:
-        from adapters.local_adapter import LocalEmbeddingAdapter
-        logger.info("Loading local embedding adapter (SentenceTransformer)...")
-        _shared_embedder = LocalEmbeddingAdapter()
+        raise RuntimeError(
+            "EMBED_BACKEND=vertex is no longer supported. Vertex AI was "
+            "removed from the codebase 2026-05-13 — use EMBED_BACKEND=local "
+            "(FastEmbed CPU, snowflake/snowflake-arctic-embed-xs)."
+        )
+    from adapters.local_adapter import LocalEmbeddingAdapter
+    logger.info(
+        "Loading local embedding adapter "
+        "(FastEmbed ONNX-int8 on CPU — see adapters/local_adapter.py "
+        "docstring for the bench that drove model selection)..."
+    )
+    _shared_embedder = LocalEmbeddingAdapter()
 
     logger.info(f"Shared resources ready (nlp={nlp_backend}, embed={embed_backend})")
 
