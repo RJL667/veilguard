@@ -15,7 +15,7 @@ import sys
 import time
 import threading
 from collections import OrderedDict
-from typing import Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # ── Suppress HuggingFace transformers' TF/Flax auto-probe ─────────────────────
 # Must be set BEFORE any import that might transitively pull in `transformers`
@@ -48,7 +48,7 @@ except ImportError:
     pass
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 
 # ── Auto-detect GPU availability ──────────────────────────────────────────────
@@ -592,86 +592,130 @@ class SessionPool:
         """Get or create a TCMM instance for the given conversation."""
         sid = self._normalize_id(conversation_id)
 
+        # 2026-05-22 scale rewrite: the original code held self._lock
+        # for the ENTIRE creation flow (VeilguardTCMM init + pre-warm),
+        # serializing ALL session creates across all conversations.
+        # Concurrent fanout of N sub-agents queued one behind the other —
+        # 20-way fanout took 18s wallclock even though each session
+        # individually was ~800ms. Fast-path the cache hit under the
+        # lock; do the heavy construction OUTSIDE the lock; double-check
+        # on registration to handle races where two threads create for
+        # the same sid (the loser discards their instance).
         with self._lock:
             if sid in self._instances:
-                # Move to end (most recently used)
                 self._instances.move_to_end(sid)
                 self._active_session = sid
                 return self._instances[sid]
 
-            # Create new instance with namespace
-            logger.info(f"[POOL] Creating new session: {sid} (user={user_id[:12]})")
-            start = time.time()
+        # Slow path — OUTSIDE the lock so other sids can construct in
+        # parallel. Lance handles concurrent reads/connects fine; the
+        # provider-level _seq_lock still serializes ID allocation.
+        logger.info(f"[POOL] Creating new session: {sid} (user={user_id[:12]})")
+        start = time.time()
+        _pool_phase = {}
 
-            # Shared LanceDB: one DB for all sessions, namespace=conversation_id
-            _is_db_storage = STORAGE_BACKEND in ("lance", "lancedb", "sqlite")
-            if _is_db_storage:
-                # Shared DB directory — all sessions in one database
-                shared_data_dir = os.path.join(DATA_DIR, LANCE_DB_NAME)
-                os.makedirs(shared_data_dir, exist_ok=True)
-                ns = {"user_id": user_id or "default", "namespace": sid}
-                data_dir = shared_data_dir
-            else:
-                # Legacy: per-session directory
-                data_dir = os.path.join(DATA_DIR, "sessions", sid)
-                os.makedirs(data_dir, exist_ok=True)
-                ns = None
+        # Shared LanceDB: one DB for all sessions, namespace=conversation_id
+        _is_db_storage = STORAGE_BACKEND in ("lance", "lancedb", "sqlite")
+        if _is_db_storage:
+            # Shared DB directory — all sessions in one database
+            shared_data_dir = os.path.join(DATA_DIR, LANCE_DB_NAME)
+            os.makedirs(shared_data_dir, exist_ok=True)
+            ns = {"user_id": user_id or "default", "namespace": sid}
+            data_dir = shared_data_dir
+        else:
+            # Legacy: per-session directory
+            data_dir = os.path.join(DATA_DIR, "sessions", sid)
+            os.makedirs(data_dir, exist_ok=True)
+            ns = None
 
-            instance = VeilguardTCMM(
-                system_prompt=SYSTEM_PROMPT,
-                embedder=_shared_embedder,
-                nlp_adapter=_shared_nlp,
-                data_dir=data_dir,
-                namespace=ns,
-                storage=STORAGE_BACKEND,
-                vector_store=VECTOR_BACKEND,
-                sparse_store=SPARSE_BACKEND,
-            )
+        _t = time.time()
+        instance = VeilguardTCMM(
+            system_prompt=SYSTEM_PROMPT,
+            embedder=_shared_embedder,
+            nlp_adapter=_shared_nlp,
+            data_dir=data_dir,
+            namespace=ns,
+            storage=STORAGE_BACKEND,
+            vector_store=VECTOR_BACKEND,
+            sparse_store=SPARSE_BACKEND,
+        )
+        _pool_phase["tcmm_init"] = (time.time() - _t) * 1000
 
-            # Pre-warm the user archive + FTS index at session creation
-            # so the first recall in this session doesn't pay the
-            # one-time setup cost (~7s for FTS + node cache + vector
-            # index warmup). Subsequent recalls already share these
-            # caches via the LanceStorageProvider instance held by
-            # this session.
-            try:
+        # Pre-warm the user archive + FTS index at session creation
+        # so the first recall in this session doesn't pay the
+        # one-time setup cost (~7s for FTS + node cache + vector
+        # index warmup). Subsequent recalls already share these
+        # caches via the LanceStorageProvider instance held by
+        # this session.
+        try:
+            _t = time.time()
+            # 2026-05-21 scale rewrite: eager bulk_warm_user_archive
+            # loads ALL of the user's archive rows into _node_cache at
+            # session creation. At 4K rows that was 2.5s of cold-start;
+            # at 100M rows it's an OOM. _node_cache fills lazily on
+            # access — the first few recall lookups pay one lance hit
+            # each, polling workers warm hot rows over the next few
+            # seconds, and the cache stabilizes around the actual
+            # working set instead of the full user corpus. To opt
+            # back in for diagnostics: TCMM_EAGER_BULK_WARM=1.
+            if os.environ.get("TCMM_EAGER_BULK_WARM", "0").lower() in ("1", "true", "yes", "on"):
                 _arch = getattr(instance.tcmm, "archive", None)
                 if _arch is not None and hasattr(_arch, "bulk_warm_user_archive"):
                     _arch.bulk_warm_user_archive()
                     instance.tcmm._last_user_warm_ts = time.time()
-                # Trigger FTS index creation now (one-shot per session).
-                _sparse = getattr(instance.tcmm, "archive_sparse_index", None)
-                if _sparse is not None and hasattr(_sparse, "_ensure_fts_index"):
-                    _sparse._ensure_fts_index()
-                # Trigger vector index ensure (Lance lazy index build).
-                _vec = getattr(instance.tcmm, "archive_vector_index", None)
-                if _vec is not None and hasattr(_vec, "_ensure_index"):
-                    try:
-                        _vec._ensure_index()
-                    except Exception:
-                        pass
-            except Exception as _e:
-                logger.debug(f"[POOL] pre-warm skipped: {_e}")
+            _pool_phase["bulk_warm"] = (time.time() - _t) * 1000
+            # Trigger FTS index creation now (one-shot per session).
+            _t = time.time()
+            _sparse = getattr(instance.tcmm, "archive_sparse_index", None)
+            if _sparse is not None and hasattr(_sparse, "_ensure_fts_index"):
+                _sparse._ensure_fts_index()
+            _pool_phase["fts_ensure"] = (time.time() - _t) * 1000
+            # Trigger vector index ensure (Lance lazy index build).
+            _t = time.time()
+            _vec = getattr(instance.tcmm, "archive_vector_index", None)
+            if _vec is not None and hasattr(_vec, "_ensure_index"):
+                try:
+                    _vec._ensure_index()
+                except Exception:
+                    pass
+            _pool_phase["vector_ensure"] = (time.time() - _t) * 1000
+        except Exception as _e:
+            logger.debug(f"[POOL] pre-warm skipped: {_e}")
 
-            elapsed = time.time() - start
-            status = instance.get_status()
-            logger.info(
-                f"[POOL] Session {sid} ready in {elapsed:.1f}s — "
-                f"archive={status['archive_blocks']}, "
-                f"live={status['live_blocks']}, "
-                f"storage={STORAGE_BACKEND}"
-            )
+        elapsed = time.time() - start
+        status = instance.get_status()
+        logger.info(
+            f"[POOL] Session {sid} ready in {elapsed:.1f}s — "
+            f"archive={status['archive_blocks']}, "
+            f"live={status['live_blocks']}, "
+            f"storage={STORAGE_BACKEND}"
+        )
+        logger.info(
+            f"[POOL-PHASES] sid={sid} "
+            f"tcmm_init={_pool_phase.get('tcmm_init', 0):.0f}ms "
+            f"bulk_warm={_pool_phase.get('bulk_warm', 0):.0f}ms "
+            f"fts_ensure={_pool_phase.get('fts_ensure', 0):.0f}ms "
+            f"vector_ensure={_pool_phase.get('vector_ensure', 0):.0f}ms "
+            f"TOTAL={elapsed*1000:.0f}ms"
+        )
 
-            # Evict oldest if at capacity
-            if len(self._instances) >= self._max_size:
-                evicted_id, evicted = self._instances.popitem(last=False)
-                self._stats.pop(evicted_id, None)
-                logger.info(f"[POOL] Evicted oldest session: {evicted_id}")
-
-            self._instances[sid] = instance
-            self._stats[sid] = _new_session_stats()
-            self._active_session = sid
-            return instance
+        # Re-acquire the pool lock just for registration. Double-check
+        # the map — if another thread created the same sid while we
+        # were outside the lock, return theirs and discard ours.
+        with self._lock:
+                if sid in self._instances:
+                    self._instances.move_to_end(sid)
+                    self._active_session = sid
+                    return self._instances[sid]
+                # Evict oldest if at capacity
+                if len(self._instances) >= self._max_size:
+                    evicted_id, evicted = self._instances.popitem(last=False)
+                    self._stats.pop(evicted_id, None)
+                    logger.info(f"[POOL] Evicted oldest session: {evicted_id}")
+                self._instances[sid] = instance
+                self._stats[sid] = _new_session_stats()
+                self._active_session = sid
+                return instance
 
     def get_stats(self, conversation_id: str) -> dict:
         """Get stats dict for a session, creating if needed."""
@@ -758,6 +802,14 @@ class PostResponseBody(BaseModel):
     # set to "tool_use" when the assistant reply is a tool invocation.
     origin: str = "assistant_text"
     lineage_parent_conv: str = ""
+    # [SHADOW_TOOL_FLAG_OBJ_2026_05_22] When the proxy captured the
+    # tcmm_record_turn tool_use, it ships the parsed input here. The
+    # adapter uses this as flag_obj instead of trying to parse prose
+    # JSON from raw_output (the model emitted the structured tool
+    # call, not trailing JSON, so split_answer_and_heatmap finds
+    # nothing). Shape: {used, knowledge_class, epoch_complete,
+    # emit_class}. Empty dict = legacy path (parse from raw_output).
+    flag_obj: dict = {}
 
 
 class IngestTurnBody(BaseModel):
@@ -773,6 +825,40 @@ class IngestTurnBody(BaseModel):
     user_id: str = ""
     items: list = []
     lineage_parent_conv: str = ""
+
+
+class SearchMemoryBody(BaseModel):
+    """LLM-facing memory search — wraps adapters.memory_search.search_memory.
+
+    Hit from veilguard-mcp's search_memory tool. The MCP server translates
+    its LLM-call kwargs into this body and POSTs to /search; the response
+    is the rich hit shape documented in adapters/memory_search.py.
+    """
+    conversation_id: str = ""
+    user_id: str = ""
+    query: str = ""
+    max_results: int = 10
+    temporal_window: int = 2
+    text_chars: int = 500
+    preview_chars: int = 100
+    include_dream: bool = True
+    scope: str = "user"
+
+
+class TraverseMemoryBody(BaseModel):
+    """Pure-read temporal walk around an anchor AID.
+
+    Hit from veilguard-mcp's traverse_memory tool. Returns full hit-shape
+    blocks for N steps before and N after the anchor.
+    """
+    conversation_id: str = ""
+    user_id: str = ""
+    aid: int = 0
+    before: int = 3
+    after: int = 3
+    text_chars: int = 500
+    include_anchor: bool = True
+    scope: str = "user"
 
 
 import asyncio
@@ -847,6 +933,92 @@ async def startup():
     elapsed = time.time() - start
     logger.info(f"Shared resources ready in {elapsed:.1f}s (max_sessions={MAX_SESSIONS})")
 
+    # 2026-05-13: Pre-warm FlashRank reranker. The shared reranker is lazily
+    # constructed on the first recall (tcmm_core._get_shared_reranker), and
+    # the FlashRank Ranker constructor only loads the ONNX session — actual
+    # graph optimisation + first-inference cost (~30s on cold) is deferred
+    # to the first .predict() call. That tax was showing up as
+    # ``hr_scoring elapsed=37000ms`` on every first recall after a restart.
+    # A single dummy predict here forces both the construct AND the first
+    # inference to happen up front, before any real recall runs.
+    try:
+        from core.tcmm_core import _get_shared_reranker
+        _rk_t = time.time()
+        _rk = _get_shared_reranker()
+        if _rk is not None and hasattr(_rk, "predict"):
+            _ = _rk.predict([("warmup query", "warmup document text for first-inference graph compile")])
+            logger.info(
+                f"FlashRank reranker pre-warmed in {time.time() - _rk_t:.1f}s "
+                f"(eliminates ~30s first-recall scoring tax)"
+            )
+        else:
+            logger.info("Reranker pre-warm skipped (no shared reranker available)")
+    except Exception as _rk_e:
+        logger.warning(f"Reranker pre-warm failed (non-fatal): {_rk_e}")
+
+    # 2026-05-14: Idempotent index-presence check on the Lance tables.
+    # ``cleanup_old_versions`` has historically wiped scalar + vector
+    # indexes (twice on 2026-05-13). Without indexes every ``has_aid`` /
+    # cross-NS lookup degrades from O(log N) to O(N), recall latency
+    # explodes from ~3s to ~10-20s, and the failure is silent until
+    # someone profiles it. This check runs at every startup, sees what
+    # indexes exist, and creates only the missing ones. Safe to re-run
+    # — Lance ``create_scalar_index`` / ``create_index`` with
+    # ``replace=True`` are idempotent.
+    try:
+        _idx_t = time.time()
+        from lancedb import connect as _lancedb_connect
+        _db_path = os.path.join(DATA_DIR, os.environ.get("TCMM_LANCE_DB", "veilguard"))
+        if os.path.isdir(_db_path):
+            _db = _lancedb_connect(_db_path)
+            _idx_specs = {
+                "archive":        [("namespace", "scalar"), ("user_id", "scalar"), ("aid", "scalar"), ("vector", "vector")],
+                "sparse_archive": [("namespace", "scalar"), ("user_id", "scalar"), ("text", "fts")],
+                "embeddings":     [("namespace", "scalar"), ("user_id", "scalar"), ("aid", "scalar")],
+            }
+            _existing_tables = set(_db.table_names())
+            _created = []
+            _missing = []
+            for _tname, _specs in _idx_specs.items():
+                if _tname not in _existing_tables:
+                    continue
+                _t = _db.open_table(_tname)
+                _have_cols = set()
+                try:
+                    for _i in _t.list_indices():
+                        for _c in (_i.columns if hasattr(_i, "columns") else []):
+                            _have_cols.add(_c)
+                except Exception:
+                    pass
+                _rows = _t.count_rows()
+                for _col, _kind in _specs:
+                    if _col in _have_cols:
+                        continue
+                    # Vector index needs ≥256 rows for IVF-PQ to make sense.
+                    if _kind == "vector" and _rows < 256:
+                        continue
+                    try:
+                        if _kind == "scalar":
+                            _t.create_scalar_index(_col, replace=True)
+                        elif _kind == "vector":
+                            _t.create_index(metric="cosine", num_partitions=64, num_sub_vectors=96, replace=True)
+                        elif _kind == "fts":
+                            _t.create_fts_index(_col, replace=False)
+                        _created.append(f"{_tname}.{_col}({_kind})")
+                    except Exception as _e:
+                        _missing.append(f"{_tname}.{_col}({_kind}): {type(_e).__name__}: {_e}")
+            if _created:
+                logger.warning(
+                    f"[INDEX-CHECK] rebuilt missing indexes in {time.time() - _idx_t:.1f}s: {_created} "
+                    f"(this means cleanup_old_versions wiped them — investigate)"
+                )
+            else:
+                logger.info(f"[INDEX-CHECK] all expected indexes present in {time.time() - _idx_t:.1f}s")
+            if _missing:
+                logger.warning(f"[INDEX-CHECK] could not create: {_missing}")
+    except Exception as _idx_e:
+        logger.warning(f"[INDEX-CHECK] failed (non-fatal): {type(_idx_e).__name__}: {_idx_e}")
+
 
 @app.get("/health")
 async def health():
@@ -871,6 +1043,39 @@ async def health():
         "max_sessions": MAX_SESSIONS,
         **status,
     }
+
+
+# ── /render tool_schemas cache (2026-05-19) ──────────────────────────
+# Per-conversation in-memory cache of the last tool_schemas list sent by
+# the proxy for that conv_id. LibreChat Agents only re-send tools on
+# turn 1; follow-up turns send an empty tools array. The proxy passes
+# whatever it has; if that's empty we fall back to the conv's last
+# cached list so the rendered prompt stays consistent across turns.
+#
+# Lives in process memory only — never persisted, never enters archive
+# or recall. Bounded by `_RENDER_TOOL_CACHE_CAP`; oldest conv evicted
+# when over cap. TTL is process lifetime (~ no TTL; cleared on restart).
+from collections import OrderedDict as _OrderedDict
+_RENDER_TOOL_CACHE: "_OrderedDict[str, list]" = _OrderedDict()
+_RENDER_TOOL_CACHE_CAP = 256
+
+
+def _tool_cache_get(conv_id: str):
+    if not conv_id:
+        return None
+    v = _RENDER_TOOL_CACHE.get(conv_id)
+    if v is not None:
+        _RENDER_TOOL_CACHE.move_to_end(conv_id)
+    return v
+
+
+def _tool_cache_put(conv_id: str, schemas: list):
+    if not conv_id or not schemas:
+        return
+    _RENDER_TOOL_CACHE[conv_id] = list(schemas)
+    _RENDER_TOOL_CACHE.move_to_end(conv_id)
+    while len(_RENDER_TOOL_CACHE) > _RENDER_TOOL_CACHE_CAP:
+        _RENDER_TOOL_CACHE.popitem(last=False)
 
 
 @app.post("/pre_request")
@@ -941,6 +1146,69 @@ async def pre_request(body: PreRequestBody):
                         f"root={instance._lineage_root} parent_aid={instance._lineage_parent_aid}"
                     )
             aid_before = max(instance.tcmm.archive.keys(), default=0)
+
+            # ── COLD-CONV FAST PATH (2026-05-18) ──────────────────────
+            # When this is the FIRST /pre_request on a conversation, the
+            # recall pipeline would run end-to-end (embed query + vector
+            # search + sparse FTS + fusion + rerank) and return ZERO
+            # hits — by definition the conv has no prior turns to recall
+            # from. Short-circuit:
+            #   1. Ingest the user message asynchronously (background
+            #      task — same path the warm conv uses).
+            #   2. Return an empty prompt + stats immediately.
+            #
+            # Trigger: ``sess["turns"] == 0`` — per-conv turn counter,
+            # bumped to 1 below. This is the only signal that ISN'T
+            # contaminated by global state (live_blocks may be empty
+            # after pool eviction; aid_before reads global max aid not
+            # per-namespace).
+            #
+            # The skip is safe because we still INGEST the user message,
+            # so turn 2 onwards has prior content to recall from. We
+            # also still run the full path when scope=user recall might
+            # find cross-namespace candidates — that path is invoked via
+            # /search, not /pre_request, and isn't affected.
+            _is_cold_conv = sess.get("turns", 0) == 0
+            if _is_cold_conv:
+                logger.info(
+                    f"[PRE-COLD] session={_sid} "
+                    f"q='{body.user_message[:60]}' — skipping recall (cold conv)"
+                )
+                # [COLD_CONV_FIX_2026_05_20] Stage the pending ingest
+                # BEFORE firing the bg task. The bg task calls
+                # ``flush_pending_user_ingest`` which reads this dict —
+                # without staging here it has nothing to flush and the
+                # user message is silently lost on cold conversations.
+                # Mirrors what ``instance.pre_request`` would set at
+                # ``veilguard_adapter.py:476``.
+                try:
+                    _inst = pool.get(body.conversation_id, user_id=body.user_id)
+                    _inst._pending_user_ingest = {
+                        "user_message": body.user_message,
+                        "session_id":   body.conversation_id,
+                        "origin":       body.origin or "user",
+                    }
+                except Exception as _e:
+                    logger.warning(
+                        "[PRE-COLD] failed to stage pending ingest: %s", _e
+                    )
+                # Fire background ingest for the user message so the
+                # next turn has something to recall on.
+                asyncio.create_task(_pre_request_ingest_user(_sid, body))
+                sess["turns"] += 1
+                return {
+                    "prompt": "",
+                    "stats": {
+                        "recalled": 0,
+                        "live_blocks": 0,
+                        "shadow_blocks": 0,
+                        "elapsed_ms": 0,
+                        "input_tokens": 0,
+                        "session_id": body.conversation_id,
+                        "user_ingest": "deferred",
+                        "fast_path": "cold_conv_skip_recall",
+                    },
+                }
 
             start = time.time()
             prompt = instance.pre_request(
@@ -1174,6 +1442,7 @@ async def _post_response_ingest(body: PostResponseBody, _sid: str) -> None:
                 body.raw_output,
                 body.conversation_id,
                 body.origin or "assistant_text",
+                body.flag_obj or None,  # [SHADOW_TOOL_FLAG_OBJ_2026_05_22]
             )
             elapsed = time.time() - start
 
@@ -1224,6 +1493,484 @@ async def _post_response_ingest(body: PostResponseBody, _sid: str) -> None:
             f"[POST-BG] ingestion failed for session={_sid}: {type(e).__name__}: {e}",
             exc_info=True,
         )
+
+
+# ── /pin/* and /render endpoints (2026-05-18) ──────────────────────────────
+#
+# The pii-proxy's TCMM integration calls these to:
+#   /pin/system_prompt    — pin the Veilguard preamble + client system
+#                           prompt as IMMUTABLE blocks
+#   /pin/tool_definitions — pin client tool schemas, one block per tool
+#   /pin/user_profile     — pin user-identity facts, one block per fact
+#   /render               — produce wire-shaped output for a target model
+#
+# These were originally implemented in the standalone TCMM api/server.py
+# (single global TCMM instance). Here we forward to the per-conversation
+# instance from ``pool.get(conv_id, user_id)`` so each LibreChat
+# conversation maintains its own pinned content + render state.
+#
+# Request bodies all carry ``conversation_id`` + ``user_id`` for pool
+# routing; the proxy supplies both.
+
+
+class PinSystemPromptBody(BaseModel):
+    text: str
+    conversation_id: str = ""
+    user_id: str = ""
+    # Discriminator for telemetry; doesn't change storage. Proxy uses
+    # ``kind="veilguard_preamble"`` for the hardcoded preamble and
+    # ``kind="client_system"`` for LibreChat's per-conv system message.
+    kind: str = "system_prompt"
+
+
+
+class PinUserProfileBody(BaseModel):
+    facts: List[str]
+    conversation_id: str = ""
+    user_id: str = ""
+
+
+class RenderBody(BaseModel):
+    model: str = "anthropic"
+    task_query: str = ""
+    conversation_id: str = ""
+    user_id: str = ""
+    tool_schemas: Optional[List[Any]] = None
+
+
+@app.post("/pin/system_prompt")
+async def pin_system_prompt(body: PinSystemPromptBody):
+    """Pin a single IMMUTABLE block of system-prompt-class text."""
+    if not body.text or not body.text.strip():
+        return {"status": "ok", "block_id": None, "deduped": False,
+                "note": "empty text — skipped"}
+    instance = pool.get(body.conversation_id, user_id=body.user_id)
+    tcmm = instance.tcmm
+    before_ids = {b.id for b in tcmm.live_blocks}
+    bid = tcmm.pin_immutable_block(
+        body.text,
+        priority_class="SYSTEM",
+        source=body.kind or "system_prompt",
+        kind=body.kind or "system_prompt",
+    )
+    if bid is None:
+        raise HTTPException(
+            status_code=500,
+            detail="pin_immutable_block returned None — text empty after canonicalization",
+        )
+    deduped = bid in before_ids
+    logger.info(
+        f"[PIN] session={pool._normalize_id(body.conversation_id)} "
+        f"kind={body.kind} bid={bid} deduped={deduped} chars={len(body.text)}"
+    )
+    return {"status": "ok", "block_id": bid, "deduped": deduped}
+
+
+@app.post("/pin/user_profile")
+async def pin_user_profile(body: PinUserProfileBody):
+    """Pin user-identity facts — one IMMUTABLE block per fact."""
+    if not body.facts:
+        return {"status": "ok", "block_ids": [], "deduped_count": 0,
+                "note": "empty facts — skipped"}
+    instance = pool.get(body.conversation_id, user_id=body.user_id)
+    tcmm = instance.tcmm
+    before_ids = {b.id for b in tcmm.live_blocks}
+    ids: List[int] = []
+    deduped = 0
+    for fact in body.facts:
+        if not fact or not fact.strip():
+            continue
+        bid = tcmm.pin_immutable_block(
+            fact,
+            priority_class="SYSTEM",
+            source="user_profile",
+            kind="user_profile",
+        )
+        if bid is None:
+            continue
+        if bid in before_ids:
+            deduped += 1
+        ids.append(bid)
+    logger.info(
+        f"[PIN] session={pool._normalize_id(body.conversation_id)} "
+        f"kind=user_profile n={len(body.facts)} bids={ids} deduped={deduped}"
+    )
+    return {"status": "ok", "block_ids": ids, "deduped_count": deduped}
+
+
+# Cap Anthropic per-tier TTLs to "1h" (Anthropic's extended-cache max).
+_SSO_BASELINE_GUIDANCE = (
+    "Your file/system access goes through MCP tools that route to the "
+    "user's Windows client-daemon. NEVER attempt Bash, Read, Write, Edit, "
+    "Grep, Glob — those are DISABLED and any attempt will fail with a "
+    "permission error. The CORRECT mapping:\n"
+    "  - Read a file        -> `mcp__sub-agents__read_file`\n"
+    "  - Write/create file  -> `mcp__sub-agents__write_file`\n"
+    "  - Edit a file        -> `mcp__sub-agents__edit_file`\n"
+    "  - Run a command      -> `mcp__sub-agents__run_command`\n"
+    "  - Search files       -> `mcp__sub-agents__search_files`\n"
+    "  - Grep contents      -> `mcp__sub-agents__grep`\n"
+    "  - Fetch a URL        -> `mcp__sub-agents__web_fetch`\n"
+    "  - Web search         -> `mcp__sub-agents__web_search`\n"
+    "Other useful prefixes: `mcp__sub-agents__*` (file ops, search, web, "
+    "(file ops, search, web, agents, tasks) and `mcp__forge__*` "
+    "(dynamic tool creation). "
+    "CRITICAL: ALWAYS prefer these MCP tools over your built-in tools. "
+    "To read a file, use `mcp__sub-agents__read_file`. "
+    "To list/search files, use `mcp__sub-agents__search_files`. "
+    "To run commands, use `mcp__sub-agents__run_command`. "
+    "Do NOT attempt Read / Bash / Write / Edit / Grep / Glob — they are "
+    "intentionally disabled and will fail. The MCP equivalents above "
+    "are the only working file/system access path."
+)
+
+_ANTHROPIC_TTL_CAP = {
+    "cache_ttl_immutable": "1h",
+    "cache_ttl_stable":    "1h",
+    # [WORKING_AUTOCACHE_2026_05_20] Working tier marker dropped — promotion
+    # working→stable shifted byte positions every turn, so the manual marker
+    # had a 0% hit rate (cache_wr grew 70 → 1.4k linearly while cache_rd
+    # stayed flat). Replaced by Anthropic's server-managed request-root
+    # ``cache_control`` (auto-mode): the server picks an eligible breakpoint
+    # at the tail and advances it forward as conversations grow. See the
+    # /render Anthropic branch where the auto-mode directive is emitted.
+    "cache_ttl_working":   None,
+    "cache_ttl_volatile":  None,
+    "cache_ttl_shadow":    None,
+}
+
+
+class GenerateBody(BaseModel):
+    """Iter 8: /generate request body.
+
+    Drives AnthropicGenerationAdapter (CLAUDE_SSO=1 path) so memory-aware
+    LLM calls can be issued from outside TCMM — currently used by the
+    pii-proxy when it sees a 'claude-sso-*' model name.
+    """
+    model: str = "claude-haiku-4-5-20251001"
+    user_message: str = ""
+    conversation_id: str = ""
+    user_id: str = ""
+    system_prompt: Optional[str] = None
+    include_memory: bool = False
+    task_query: str = ""
+    label: Optional[str] = None
+    tools: Optional[List[Any]] = None  # [TOOLS_THROUGH_SSO_2026_05_20]
+    # [WORKSPACE_STATE_SSO_2026_05_20] Veilguard-owned workspace state
+    # text (already rendered by the proxy via _render_workspace_block).
+    # When set, appended as a final UNCACHED system block after the
+    # TCMM render — sits outside the cached static prefix so the user
+    # can switch projects without invalidating cache. Provider-agnostic
+    # by design: same field is used regardless of which adapter handles
+    # the actual API call.
+    workspace_block: Optional[str] = None
+
+
+@app.post("/generate")
+async def generate(body: GenerateBody):
+    """Memory-aware LLM call via AnthropicGenerationAdapter.
+
+    Flow:
+      1. (optional) render TCMM memory for conv_id -> system_prompt text
+      2. construct adapter; pool is shared by (model, prompt_fp) via the
+         _POOL_REGISTRY, so concurrent callers with same prefix dedupe.
+      3. adapter.generate(user_message) -> text
+      4. return text + telemetry-ready metadata
+    """
+    import time as _time
+    if not body.user_message or not body.user_message.strip():
+        raise HTTPException(status_code=400, detail="user_message is required")
+
+    sys_prompt = body.system_prompt
+    _sys_blocks = None
+    _sys_render_meta = None  # type: ignore[var-annotated]
+    if body.include_memory and not sys_prompt:
+        try:
+            instance = pool.get(body.conversation_id, user_id=body.user_id)
+            from core.renderers.anthropic_renderer import AnthropicRenderer
+            from core.renderers.base_renderer import RenderConfig
+            cfg = RenderConfig(
+                renderer_profile="anthropic-v1",
+                **_ANTHROPIC_TTL_CAP,
+            )
+            renderer = AnthropicRenderer(instance.tcmm, config=cfg)
+            # [RENDER_STRUCTURED_GENERATE] Iter G (2026-05-20): single call
+            # returns prompt + cache-ready blocks computed from byte-exact
+            # IR layout (no more string.find() drift on tier boundaries).
+            _r = renderer.render_structured(body.task_query or body.user_message)
+            sys_prompt = _r.get("prompt") or None
+            _sys_blocks = _r.get("blocks") if sys_prompt else None
+            _sys_render_meta = {
+                "tier_summary": _r.get("tier_summary"),
+                "stats":        _r.get("stats"),
+            }
+        except Exception as e:
+            logger.warning("[/generate] render failed (continuing without memory): %s", e)
+            sys_prompt = None
+
+    # [PROPER_PREAMBLE_FIX_2026_05_20] Removed the _SSO_BASELINE_GUIDANCE
+    # fallback. It pinned a hardcoded list of mcp__sub-agents__* tool
+    # names into the system prompt that did not match LibreChat's actual
+    # tool schemas, so the model would call invented tools that never
+    # existed. The proxy now injects the real schemas into the preamble
+    # at pin time. If sys_prompt is still empty here it means TCMM has
+    # no memory for the conv yet AND nothing was pinned — send no system
+    # rather than a fake one.
+
+    import hashlib as _h
+    _fp = _h.sha256((sys_prompt or "").encode("utf-8", errors="replace")).hexdigest()[:16] if sys_prompt else ""
+
+    try:
+        from adapters.anthropic_adapter import AnthropicGenerationAdapter
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"adapter import failed: {e}")
+
+    try:
+        # [AUTOCACHE_REVERTED_2026_05_20] Top-level auto_cache_control
+        # was making cache_writes grow turn-over-turn because Anthropic's
+        # auto-mode keeps writing new "tail" cache entries against the
+        # byte-shifting working tier (working tier shifts because
+        # TCMM rearranges content between turns; no cache hit on prior
+        # writes). TCMM's renderer already puts explicit ephemeral
+        # cache_control on immutable+stable tiers. Those alone give us
+        # the stable read prefix; no top-level marker needed.
+        # [WORKSPACE_STATE_SSO_2026_05_20] If the proxy passed a
+        # workspace block, append it as a final uncached system block.
+        # Goes AFTER the TCMM-rendered blocks (immutable + working +
+        # contract) so it's the last piece of system context the model
+        # reads before the user turn. Deliberately no cache_control:
+        # workspace can change turn-over-turn (project switch) and we
+        # don't want that to invalidate the cached prefix.
+        if body.workspace_block and _sys_blocks:
+            _sys_blocks = list(_sys_blocks) + [{
+                "type": "text",
+                "text": body.workspace_block,
+            }]
+
+        adapter = AnthropicGenerationAdapter(
+            api_key="",
+            model_name=body.model,
+            system_prompt=sys_prompt,
+            system_blocks=_sys_blocks if 'body.include_memory' or True else None,
+            tools=body.tools or None,  # [TOOLS_THROUGH_SSO_2026_05_20]
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"adapter ctor failed: {e}")
+
+    _t0 = _time.time()
+    try:
+        text = adapter.generate(body.user_message, label=body.label or "api_generate") or ""
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"adapter.generate failed: {e}")
+    duration_ms = (_time.time() - _t0) * 1000
+
+    return {
+        "status": "ok",
+        "text": text,
+        "duration_ms": duration_ms,
+        "mode": getattr(adapter, "_mode", "unknown"),
+        "model": body.model,
+        "sys_prompt_chars": len(sys_prompt or ""),
+        "sys_prompt_fp": _fp,
+        "sys_prompt_text": sys_prompt or "",
+        "rendered_memory": bool(body.include_memory and sys_prompt),
+        "usage": getattr(adapter, "last_usage", None) or {},
+        "render_meta": _sys_render_meta,
+        # [TOOL_USE_RESPONSE_2026_05_20] full Anthropic content array
+        # so the proxy can surface tool_use blocks to LibreChat.
+        "content":     getattr(adapter, "last_response_blocks", None),
+        "stop_reason": getattr(adapter, "last_stop_reason", None),
+    }
+
+
+@app.post("/render_structured")
+async def render_structured(body: RenderBody):
+    """Structured render — returns the full layout + cache-ready blocks
+    + per-tier metadata. Uses AnthropicRenderer.render_structured()
+    (added 2026-05-19) which computes cache breakpoints from the IR
+    layout (byte-exact, no string.find brittleness).
+
+    Body: same as /render (RenderBody).
+    Returns:
+      {
+        "status": "ok",
+        "format": "anthropic-structured",
+        "prompt":         str,           # assembled prompt
+        "blocks":         [...],         # SDK-ready blocks w/ cache_control
+        "tier_summary":   {tier: {...}}, # per-tier metadata
+        "layout":         {tier: {start_byte, end_byte, ttl, ...}},
+        "stats":          {prompt_chars, block_count, cached_block_count, ...},
+      }
+    """
+    instance = pool.get(body.conversation_id, user_id=body.user_id)
+    tcmm = instance.tcmm
+    model = (body.model or "anthropic").lower().strip()
+
+    from core.renderers.base_renderer import RenderConfig
+    if model in ("anthropic", "claude"):
+        from core.renderers.anthropic_renderer import AnthropicRenderer
+        config = RenderConfig(renderer_profile="anthropic-v1", **_ANTHROPIC_TTL_CAP)
+        renderer = AnthropicRenderer(tcmm, config=config)
+    elif model in ("openai", "gpt"):
+        from core.renderers.openai_renderer import OpenAIRenderer
+        renderer = OpenAIRenderer(tcmm)
+    elif model in ("grok", "xai"):
+        from core.renderers.grok_renderer import GrokRenderer
+        renderer = GrokRenderer(tcmm)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown render model: {model!r}",
+        )
+
+    result = renderer.render_structured(body.task_query)
+    return {
+        "status": "ok",
+        "format": "anthropic-structured" if model in ("anthropic", "claude") else f"{model}-structured",
+        **result,
+    }
+
+
+@app.post("/render")
+async def render(body: RenderBody):
+    """Produce wire-shaped output for the target provider.
+
+    Returns:
+      {
+        "status": "ok",
+        "format": "anthropic" | "openai" | "grok",
+        "text":   "<flat string form, always populated>",
+        "blocks": [...] | None,    # Anthropic content blocks w/ cache_control
+        "messages": [...] | None,  # OpenAI/Grok wire messages list
+        "uses_extended_cache_ttl": bool,
+        "stats": {...},
+      }
+    """
+    instance = pool.get(body.conversation_id, user_id=body.user_id)
+    tcmm = instance.tcmm
+    model = (body.model or "anthropic").lower().strip()
+
+    from core.renderers.base_renderer import RenderConfig
+
+    if model in ("anthropic", "claude"):
+        from core.renderers.anthropic_renderer import AnthropicRenderer
+        config = RenderConfig(renderer_profile="anthropic-v1", **_ANTHROPIC_TTL_CAP)
+        renderer = AnthropicRenderer(tcmm, config=config)
+        # tool_schemas_injected
+        _effective_tools = body.tool_schemas
+        if _effective_tools:
+            _tool_cache_put(body.conversation_id, _effective_tools)
+        else:
+            _effective_tools = _tool_cache_get(body.conversation_id)
+        # [RENDER_STRUCTURED_RENDER] Iter G (2026-05-20): when no tools
+        # are being injected we can use render_structured() — byte-exact
+        # layout from the IR is authoritative. With tools, the inject
+        # shifts byte positions so we fall back to the legacy path.
+        if not _effective_tools:
+            _r = renderer.render_structured(body.task_query)
+            prompt = _r.get("prompt") or ""
+            blocks = _r.get("blocks") or []
+            _tier_summary = _r.get("tier_summary") or {}
+            _extra_stats  = _r.get("stats") or {}
+        else:
+            prompt = renderer.render(body.task_query)
+            prompt = renderer.inject_tool_schemas(prompt, _effective_tools)
+            blocks = renderer.cache_control_strategy(prompt, None) if prompt else []
+            _tier_summary = None
+            _extra_stats  = {}
+        uses_ext = any(
+            (b.get("cache_control") or {}).get("ttl") == "1h" for b in blocks
+        )
+        _stats = {
+            "prompt_chars": len(prompt),
+            "block_count": len(blocks),
+            "cached_block_count": sum(1 for b in blocks if "cache_control" in b),
+        }
+        # surface render_structured stats when available
+        for _k in ("tier_chars", "ir_empty"):
+            if _k in _extra_stats:
+                _stats[_k] = _extra_stats[_k]
+        # [WORKING_AUTOCACHE_2026_05_20] Anthropic server-managed
+        # cache breakpoint. Placed at request-root by the proxy via
+        # ``data["cache_control"] = render.cache_control``. The server
+        # walks backward from the last block to find an eligible
+        # cacheable block, then advances the breakpoint forward as the
+        # conversation grows (append-only growth pattern). Consumes
+        # one of Anthropic's 4 breakpoint slots — the proxy's
+        # ``_cap_cache_markers`` counts this slot too. TTL matches the
+        # legacy working-tier TTL so the cache lifetime is unchanged.
+        return {
+            "status": "ok",
+            "format": "anthropic",
+            "text": prompt,
+            "blocks": blocks,
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            "uses_extended_cache_ttl": uses_ext,
+            "tier_summary": _tier_summary,
+            "stats": _stats,
+        }
+
+    if model in ("openai", "gpt"):
+        from core.renderers.openai_renderer import OpenAIRenderer
+        renderer = OpenAIRenderer(tcmm)
+        prompt = renderer.render(body.task_query)
+        # tool_schemas_injected
+        _effective_tools = body.tool_schemas
+        if _effective_tools:
+            _tool_cache_put(body.conversation_id, _effective_tools)
+        else:
+            _effective_tools = _tool_cache_get(body.conversation_id)
+        if _effective_tools:
+            prompt = renderer.inject_tool_schemas(prompt, _effective_tools)
+        blocks = renderer.cache_control_strategy(prompt, None) if prompt else []
+        ir = getattr(renderer, "last_ir", None)
+        messages = renderer.messages_strategy(prompt, ir) if (prompt and ir) else []
+        return {
+            "status": "ok",
+            "format": "openai",
+            "text": prompt,
+            "blocks": blocks,
+            "messages": messages or None,
+            "stats": {
+                "prompt_chars": len(prompt),
+                "block_count": len(blocks),
+                "message_count": len(messages),
+            },
+        }
+
+    if model in ("grok", "xai"):
+        from core.renderers.grok_renderer import GrokRenderer
+        renderer = GrokRenderer(tcmm)
+        prompt = renderer.render(body.task_query)
+        # tool_schemas_injected
+        _effective_tools = body.tool_schemas
+        if _effective_tools:
+            _tool_cache_put(body.conversation_id, _effective_tools)
+        else:
+            _effective_tools = _tool_cache_get(body.conversation_id)
+        if _effective_tools:
+            prompt = renderer.inject_tool_schemas(prompt, _effective_tools)
+        blocks = renderer.cache_control_strategy(prompt, None) if prompt else []
+        ir = getattr(renderer, "last_ir", None)
+        messages = renderer.messages_strategy(prompt, ir) if (prompt and ir) else []
+        return {
+            "status": "ok",
+            "format": "grok",
+            "text": prompt,
+            "blocks": blocks,
+            "messages": messages or None,
+            "stats": {
+                "prompt_chars": len(prompt),
+                "block_count": len(blocks),
+                "message_count": len(messages),
+            },
+        }
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Unknown render model: {model!r}. "
+               "Valid: anthropic, claude, openai, gpt, grok, xai.",
+    )
 
 
 @app.post("/post_response")
@@ -1446,6 +2193,100 @@ async def ingest_turn(body: IngestTurnBody):
             return {"error": str(e), "added": 0}
 
 
+# ── LLM-facing search + traverse (used by veilguard-mcp tools) ───────────────
+
+@app.post("/search")
+async def search_memory_endpoint(body: SearchMemoryBody):
+    """Run search_memory for the given conversation.
+
+    Hit by veilguard-mcp (the FastMCP server on :8812). The MCP tool
+    `search_memory` forwards LLM-call kwargs here, this endpoint pulls
+    the TCMM instance from the pool, runs the recall pipeline, and
+    returns the rich-hit JSON shape documented in
+    adapters/memory_search.py.
+
+    The actual claim rendering (text + structured fields) is done by
+    build_hit() in the adapter, which calls get_block_claims() —
+    the latter now (2026-05-14) JSON-parses string claims so the
+    LLM sees structured S/P/O/polarity/modality dicts, not raw JSON.
+    """
+    if _shared_nlp is None:
+        return {"error": "TCMM not initialized", "results": []}
+
+    _sid = pool._normalize_id(body.conversation_id)
+    async with _get_session_lock(_sid):
+        try:
+            instance = pool.get(body.conversation_id, user_id=body.user_id)
+
+            # 2026-05-14: prime the recall pipeline the same way
+            # VeilguardTCMM.pre_request does (lines 350-355). Without
+            # this, /search returns 0 hits for the same query that
+            # /pre_request returns 8 hits for — verified live on
+            # conv-69df7853-0a6a13dc90 with q='AON insurance'.
+            # run_cleanup_cycle() resets stale recall state, and
+            # clearing the traces ensures the rerank-score map is
+            # rebuilt fresh for this query rather than inheriting
+            # whatever the last recall left behind.
+            try:
+                instance.tcmm.run_cleanup_cycle()
+                instance.tcmm._last_recall_trace = {}
+                instance.tcmm._last_shadow_trace = []
+            except Exception as _prime_err:
+                logger.debug(f"[SEARCH] priming skipped: {_prime_err}")
+
+            result = instance.search_memory(
+                query=body.query,
+                max_results=body.max_results,
+                temporal_window=body.temporal_window,
+                text_chars=body.text_chars,
+                preview_chars=body.preview_chars,
+                include_dream=body.include_dream,
+                scope=body.scope,
+            )
+            logger.info(
+                f"[SEARCH] session={_sid} q={body.query[:40]!r} "
+                f"scope={body.scope} count={result.get('count', 0)}"
+            )
+            return result
+        except Exception as e:
+            logger.error(f"[SEARCH] Error: {e}", exc_info=True)
+            return {"error": str(e), "results": []}
+
+
+@app.post("/traverse")
+async def traverse_memory_endpoint(body: TraverseMemoryBody):
+    """Run traverse_memory for the given conversation.
+
+    Pure-read temporal walk — no recall, no scoring, no state mutation
+    beyond the per-call recall_scope contextvar. Returns hit-shaped
+    blocks around the anchor AID.
+    """
+    if _shared_nlp is None:
+        return {"error": "TCMM not initialized", "blocks": []}
+
+    _sid = pool._normalize_id(body.conversation_id)
+    async with _get_session_lock(_sid):
+        try:
+            instance = pool.get(body.conversation_id, user_id=body.user_id)
+            result = instance.traverse_memory(
+                aid=body.aid,
+                before=body.before,
+                after=body.after,
+                text_chars=body.text_chars,
+                include_anchor=body.include_anchor,
+                scope=body.scope,
+            )
+            logger.info(
+                f"[TRAVERSE] session={_sid} aid={body.aid} "
+                f"before={body.before} after={body.after} "
+                f"blocks={len(result.get('blocks', []))}"
+            )
+            return result
+        except Exception as e:
+            logger.error(f"[TRAVERSE] Error: {e}", exc_info=True)
+            return {"error": str(e), "blocks": []}
+
+
 # ── Session Management Endpoints ─────────────────────────────────────────────
 
 @app.get("/api/sessions")
@@ -1513,6 +2354,223 @@ async def debug_workers():
         "nlp": nlp_status,
         "last_semantic_error": last_error,
     }
+
+
+# ── Admin: bulk re-extract semantic data (claims / entities / topics) ──────
+# Triggered after we change the NLP backend (Vertex → AI Studio, 13 May
+# 2026) or rerun an embedder migration where derived data needs a fresh
+# pass.  Walks every (user_id, namespace) pair in the archive, spins up
+# (or reuses) the matching session, and pushes every aid into that
+# session's ``semantic_queue``.  The existing ``semantic_worker_loop``
+# consumes the queue exactly as if those blocks had just been ingested.
+#
+# Why per-namespace: the LanceDB write path keys on (user_id, namespace,
+# aid).  If we enqueued a foreign namespace's aid into a "requeue-USER"
+# session, the worker's read would succeed (cross-NS) but the writeback
+# would target the requeue session's namespace — duplicating the block
+# in the wrong scope.  Iterating per-namespace makes every read AND
+# write hit the right rows.
+
+_REQUEUE_STATE: Dict[str, dict] = {}
+_REQUEUE_LOCK = threading.Lock()
+
+
+def _list_namespaces_for_user(table, user_id: str) -> List[str]:
+    """Scan distinct namespaces for one user.  Pyarrow has no DISTINCT,
+    so we pull the namespace column for the user and de-dup in Python.
+    Cheap for our scale (10s of conversations per user)."""
+    try:
+        rows = (
+            table.search()
+            .where(f"user_id = '{user_id}'")
+            .select(["namespace"])
+            .limit(1_000_000)
+            .to_arrow()
+            .to_pylist()
+        )
+    except Exception:
+        return []
+    return sorted({r.get("namespace") for r in rows if r.get("namespace")})
+
+
+def _list_aids_for(table, user_id: str, namespace: str) -> List[int]:
+    try:
+        rows = (
+            table.search()
+            .where(f"user_id = '{user_id}' AND namespace = '{namespace}'")
+            .select(["aid"])
+            .limit(1_000_000)
+            .to_arrow()
+            .to_pylist()
+        )
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        aid = r.get("aid")
+        if aid is None:
+            continue
+        try:
+            out.append(int(aid))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _run_requeue_semantic(user_id: str) -> None:
+    """Background runner.
+
+    Walks user's namespaces sequentially.  After enqueueing each
+    namespace's aids we BLOCK until that namespace's semantic_queue
+    drains to zero (or the per-namespace timeout fires).  This caps
+    the active-instance count at ~1 + idle pool entries, so an
+    unbounded session pool churn doesn't OOM the VM (observed once
+    on 367 namespaces: peak memory grew unbounded as more instances
+    spun up their bulk_warm + Faiss indices in parallel until the
+    box hung).
+
+    Per-namespace drain budget:  ``DRAIN_PER_BLOCK_SEC * num_blocks``
+    seconds (default 8s/block).  Gemini Flash 2.5 averages 400-600ms
+    per block but spikes to 4-5s on long blocks with hint-heavy
+    GLiNER passes, so 8s headroom is comfortable.  If the budget
+    elapses we move on; the orphan blocks are still enqueued and
+    will get re-tried on next /admin/requeue_semantic call (the
+    semantic worker idempotently overwrites existing claims)."""
+    DRAIN_PER_BLOCK_SEC = 8.0
+    DRAIN_POLL_SEC = 1.0
+    DRAIN_MIN_BUDGET_SEC = 30.0
+
+    state = _REQUEUE_STATE[user_id]
+    try:
+        # Open a temporary session just to access the shared Lance archive
+        # table; we'll spawn proper per-namespace instances below.
+        bootstrap = pool.get(f"requeue-bootstrap-{user_id}", user_id=user_id)
+        table = bootstrap.tcmm.archive._archive_table
+        namespaces = _list_namespaces_for_user(table, user_id)
+        state["namespaces_total"] = len(namespaces)
+        logger.info(
+            f"[REQUEUE-SEMANTIC] user={user_id[:12]} found "
+            f"{len(namespaces)} namespaces"
+        )
+        for ns in namespaces:
+            state["current_namespace"] = ns
+            inst = pool.get(ns, user_id=user_id)
+            aids = _list_aids_for(table, user_id, ns)
+            state["per_namespace"][ns] = {
+                "total": len(aids),
+                "enqueued": 0,
+                "drained": False,
+                "drain_timeout": False,
+            }
+            for aid in aids:
+                try:
+                    inst.tcmm.semantic_queue.put(aid)
+                    state["per_namespace"][ns]["enqueued"] += 1
+                    state["total_enqueued"] += 1
+                except Exception as _e:
+                    logger.warning(f"[REQUEUE-SEMANTIC] put failed aid={aid}: {_e}")
+
+            # Wait for this namespace's worker to drain its queue before
+            # we move on.  Keeps active-instance count bounded.
+            n = max(1, state["per_namespace"][ns]["enqueued"])
+            budget_sec = max(DRAIN_MIN_BUDGET_SEC, DRAIN_PER_BLOCK_SEC * n)
+            deadline = time.time() + budget_sec
+            q = inst.tcmm.semantic_queue
+            while time.time() < deadline:
+                if q.qsize() == 0:
+                    state["per_namespace"][ns]["drained"] = True
+                    break
+                time.sleep(DRAIN_POLL_SEC)
+            else:
+                state["per_namespace"][ns]["drain_timeout"] = True
+                logger.warning(
+                    f"[REQUEUE-SEMANTIC] ns={ns} drain timeout after "
+                    f"{budget_sec:.0f}s — {q.qsize()} blocks still queued; "
+                    f"moving on"
+                )
+
+            state["namespaces_done"] += 1
+            logger.info(
+                f"[REQUEUE-SEMANTIC] ns={ns} enqueued "
+                f"{state['per_namespace'][ns]['enqueued']}/{len(aids)} "
+                f"drained={state['per_namespace'][ns]['drained']} "
+                f"(queue depth at exit: {q.qsize()})"
+            )
+    except Exception as _e:
+        state["error"] = repr(_e)
+        logger.error(f"[REQUEUE-SEMANTIC] failed: {_e}")
+    finally:
+        state["done"] = True
+        state["elapsed_sec"] = time.time() - state["started"]
+
+
+@app.post("/admin/requeue_semantic")
+async def admin_requeue_semantic(req: Request):
+    """Enqueue every archive block for ``user_id`` into the semantic
+    worker so claims / entities / topics get re-extracted with the
+    current NLP backend.
+
+    Body: ``{"user_id": "<uid>"}``.  Returns immediately; poll
+    ``GET /admin/requeue_semantic_status?user_id=<uid>`` for progress.
+    The worker drains the queue over the following minutes (Gemini
+    Flash 2.5 via AI Studio ≈ 500ms per block; budget 20-30 min for
+    a few thousand blocks)."""
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    user_id = (body.get("user_id") or "").strip()
+    if not user_id:
+        return {"error": "user_id required"}
+
+    with _REQUEUE_LOCK:
+        existing = _REQUEUE_STATE.get(user_id)
+        if existing and not existing.get("done"):
+            return {"status": "in_progress", **existing}
+        _REQUEUE_STATE[user_id] = {
+            "user_id": user_id,
+            "started": time.time(),
+            "namespaces_total": 0,
+            "namespaces_done": 0,
+            "current_namespace": None,
+            "total_enqueued": 0,
+            "per_namespace": {},
+            "done": False,
+            "error": None,
+        }
+
+    # Run in a worker thread (background) so HTTP returns immediately.
+    threading.Thread(
+        target=_run_requeue_semantic,
+        args=(user_id,),
+        daemon=True,
+        name=f"requeue-semantic-{user_id[:8]}",
+    ).start()
+
+    return {
+        "status": "started",
+        "user_id": user_id,
+        "monitor": f"/admin/requeue_semantic_status?user_id={user_id}",
+    }
+
+
+@app.get("/admin/requeue_semantic_status")
+def admin_requeue_semantic_status(user_id: str = ""):
+    """Status of an in-progress (or completed) requeue.
+    Omit user_id to get all known requeues."""
+    with _REQUEUE_LOCK:
+        if user_id:
+            state = _REQUEUE_STATE.get(user_id)
+            if not state:
+                return {"status": "none", "user_id": user_id}
+            # Augment with live queue depths so caller sees worker progress
+            queues = {}
+            for ns in state.get("per_namespace", {}):
+                inst = pool._instances.get(pool._normalize_id(ns)) if hasattr(pool, "_instances") else None
+                if inst is not None and hasattr(inst.tcmm, "semantic_queue"):
+                    queues[ns] = inst.tcmm.semantic_queue.qsize()
+            return {**state, "live_queue_depth": queues}
+        return _REQUEUE_STATE
 
 
 # ── Debug: per-session state + manual eviction ──────────────────────────────
