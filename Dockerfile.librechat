@@ -48,6 +48,27 @@ RUN NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}" npm run front
     && npm prune --production \
     && npm cache clean --force
 
+# ─── Bake the Veilguard cyber theme into the built client ─────────────
+# LibreChat's vite.config.ts disables ``publicDir`` on production builds
+# (client/vite.config.ts L131: ``publicDir: command === 'serve' ? './public' : false``),
+# so files under client/public/ are NOT copied to client/dist/ and any
+# <link> tags added to client/index.html that reference them get
+# stripped because Vite can't resolve the asset. We post-process the
+# built output instead:
+#   1. copy client/public/cyber.css → client/dist/cyber.css  (served at /cyber.css)
+#   2. inject a <link rel="stylesheet"> into the BUILT client/dist/index.html
+# Idempotent: re-runs are no-ops if the link is already present. Skipped
+# silently if client/public/cyber.css doesn't exist (no styling regression).
+RUN if [ -f client/public/cyber.css ]; then \
+        cp client/public/cyber.css client/dist/cyber.css; \
+        if ! grep -q 'cyber.css' client/dist/index.html; then \
+            sed -i 's|<link rel="apple-touch-icon" href="assets/apple-touch-icon-180x180.png" />|<link rel="apple-touch-icon" href="assets/apple-touch-icon-180x180.png" />\n    <link rel="stylesheet" href="/cyber.css" />|' client/dist/index.html; \
+        fi; \
+        echo "[cyber-theme] baked into client/dist/"; \
+    else \
+        echo "[cyber-theme] skipped — client/public/cyber.css absent"; \
+    fi
+
 EXPOSE 3080
 ENV HOST=0.0.0.0
 
@@ -61,11 +82,11 @@ USER root
 RUN apk add --no-cache python3 py3-pip jpeg-dev zlib-dev freetype-dev \
     && ln -sf /usr/bin/python3 /usr/bin/python
 
-COPY mcp-tools/filesystem/requirements.txt /tmp/fs-reqs.txt
-COPY mcp-tools/code-exec/requirements.txt /tmp/exec-reqs.txt
-COPY mcp-tools/web/requirements.txt /tmp/web-reqs.txt
-COPY mcp-tools/documents/requirements.txt /tmp/doc-reqs.txt
-COPY mcp-tools/image/requirements.txt /tmp/img-reqs.txt
+COPY services/filesystem/requirements.txt /tmp/fs-reqs.txt
+COPY services/code-exec/requirements.txt /tmp/exec-reqs.txt
+COPY services/web/requirements.txt /tmp/web-reqs.txt
+COPY services/documents/requirements.txt /tmp/doc-reqs.txt
+COPY services/image/requirements.txt /tmp/img-reqs.txt
 RUN pip install --no-cache-dir --break-system-packages \
     -r /tmp/fs-reqs.txt \
     -r /tmp/exec-reqs.txt \

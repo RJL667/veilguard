@@ -1,0 +1,37 @@
+# ──────────────────────────────────────────────────────────────────────────
+# Veilguard agent-runtime — Phase 0 dependencies
+# ──────────────────────────────────────────────────────────────────────────
+# The Claude Agent SDK is the agent loop runtime.  This service wraps it
+# with our middleware (TCMM render, audit, approval-gate hook, tenant
+# context) and exposes a streaming SSE endpoint LibreChat (via pii-proxy)
+# can call.
+#
+# Pinning notes:
+#   - lancedb pinned to the same version pii-proxy + TCMM use.  Mixed
+#     versions writing to the same on-disk store would risk version skew.
+#   - pyarrow >= 15 matches TCMM (pii-proxy uses the same floor).
+#   - fastapi / uvicorn match pii-proxy so we're not running two webserver
+#     stacks with different perf profiles.
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+
+# The agent loop runtime.  Provides query(), AgentDefinition, ClaudeAgentOptions,
+# HookMatcher, MCP client, prompt caching with cache_control.
+# See https://code.claude.com/docs/en/agent-sdk/overview
+claude-agent-sdk>=0.0.20
+
+# Decision-ledger storage (agent_tasks, task_proposals, org_memory, etc.)
+# Same Lance dir as TCMM + pii_audit — bump in lockstep with both.
+lancedb==0.30.2
+pyarrow>=15.0.0
+
+# Frontmatter parsing for agents/*.md persona files (the bold-Markdown KV
+# format the existing personas use, not YAML — per spec §0.3 Phase 0.0.2).
+# No yaml dependency needed; the parser is line-grammar regex in our own
+# code (utils/persona_loader.py).
+
+# Async test fixtures for the unit tests.
+pytest==8.3.4
+pytest-asyncio==0.25.0

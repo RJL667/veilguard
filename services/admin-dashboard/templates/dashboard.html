@@ -1,0 +1,1384 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Veilguard · Admin</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            bg: { 950: '#070a14', 900: '#0c1120', 800: '#11192c', 700: '#1a2440' },
+            line: '#1f2a44',
+            text: { hi: '#e6edff', mid: '#9aa6c2', lo: '#5b6685' },
+            ok: '#22d3a3', warn: '#fcb653', err: '#ef4d6d',
+            cy: '#56d6ff', vi: '#a78bfa', pk: '#ff79c6', em: '#ffd76b',
+          },
+          fontFamily: {
+            mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+          },
+          boxShadow: {
+            card: '0 0 0 1px rgba(86, 214, 255, .06), 0 12px 30px -12px rgba(86, 214, 255, .15)',
+            glow: '0 0 24px -2px rgba(167, 139, 250, .35)',
+          },
+        }
+      }
+    }
+  </script>
+  <style>
+    html, body { background: #070a14; }
+    body {
+      color: #e6edff;
+      font-feature-settings: "ss01", "cv11";
+      -webkit-font-smoothing: antialiased;
+    }
+    .grid-noise {
+      background-image:
+        radial-gradient(60% 40% at 50% -10%, rgba(167,139,250,.18), transparent 60%),
+        linear-gradient(180deg, rgba(86,214,255,.05) 0%, transparent 30%),
+        repeating-linear-gradient(0deg, rgba(31,42,68,.4) 0px, rgba(31,42,68,.4) 1px, transparent 1px, transparent 24px),
+        repeating-linear-gradient(90deg, rgba(31,42,68,.4) 0px, rgba(31,42,68,.4) 1px, transparent 1px, transparent 24px);
+    }
+    .stat-num { font-variant-numeric: tabular-nums; }
+    .pulse-dot::before {
+      content: ''; display: inline-block; width: 8px; height: 8px;
+      border-radius: 999px; background: currentColor; margin-right: 6px;
+      box-shadow: 0 0 6px currentColor;
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+    .scrollbar-thin::-webkit-scrollbar { width: 6px; height: 6px; }
+    .scrollbar-thin::-webkit-scrollbar-thumb { background: #1f2a44; border-radius: 3px; }
+    .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+    .chip {
+      padding: 0.25rem 0.625rem; border-radius: 0.375rem;
+      font-size: 11px; font-family: ui-monospace, monospace;
+      border: 1px solid #1f2a44; background: #11192c; color: #9aa6c2;
+      cursor: pointer; user-select: none; transition: all .15s ease;
+    }
+    .chip:hover { color: #e6edff; border-color: #56d6ff; }
+    .chip.active {
+      background: rgba(86,214,255,.12); color: #56d6ff; border-color: #56d6ff;
+    }
+    .filter-pill {
+      padding: 0.25rem 0.5rem; border-radius: 999px;
+      background: rgba(167,139,250,.15); color: #a78bfa;
+      font-size: 11px; font-family: ui-monospace, monospace;
+      display: inline-flex; align-items: center; gap: 6px;
+    }
+    .row-clickable { cursor: pointer; }
+    .row-clickable:hover { background: rgba(86,214,255,.06); }
+    .user-link {
+      cursor: pointer; color: #56d6ff; border-bottom: 1px dashed transparent;
+      transition: border-color .15s ease;
+    }
+    .user-link:hover { border-bottom-color: #56d6ff; }
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(7,10,20,.75);
+      backdrop-filter: blur(4px); z-index: 50;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .modal-card {
+      background: #0c1120; border: 1px solid #1f2a44; border-radius: 12px;
+      box-shadow: 0 20px 60px -20px rgba(86,214,255,.3);
+      max-width: 900px; width: 90vw; max-height: 85vh;
+      display: flex; flex-direction: column;
+    }
+    [x-cloak] { display: none !important; }
+    .bar-track {
+      height: 6px; background: #11192c; border-radius: 3px; overflow: hidden;
+      position: relative;
+    }
+    .bar-fill {
+      height: 100%; transition: width .4s ease;
+      background: linear-gradient(90deg, #56d6ff, #a78bfa);
+    }
+    .bar-fill.warn { background: linear-gradient(90deg, #fcb653, #ef4d6d); }
+    .bar-fill.err  { background: linear-gradient(90deg, #ef4d6d, #ff79c6); }
+  </style>
+</head>
+<body class="grid-noise min-h-screen">
+
+<div x-data="dashboard()" x-init="boot()" class="max-w-[1500px] mx-auto px-6 pt-6 pb-12">
+
+  <!-- ─── HEADER ───────────────────────────────────────────────────────── -->
+  <header class="flex items-center justify-between mb-4">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-lg bg-gradient-to-br from-cy to-vi shadow-glow"></div>
+      <div>
+        <div class="text-text-hi text-lg font-semibold tracking-tight">
+          Veilguard <span class="text-text-mid font-normal">/ admin</span>
+        </div>
+        <div class="text-xs text-text-lo">
+          {{ user.name }} · {{ user.email }}
+          <span class="ml-2 px-1.5 py-0.5 rounded text-[10px] font-mono bg-vi/10 text-vi">{{ user.role }}</span>
+        </div>
+      </div>
+    </div>
+    <div class="flex items-center gap-3 text-xs text-text-mid">
+      <span x-show="lastUpdate" class="font-mono">
+        updated <span x-text="lastUpdate"></span>
+      </span>
+      <button @click="refreshAll()"
+              class="px-3 py-1.5 rounded bg-bg-700 hover:bg-bg-800 border border-line text-text-hi text-xs">
+        ↻ refresh
+      </button>
+      <label class="flex items-center gap-2 cursor-pointer">
+        <input type="checkbox" x-model="autoRefresh" class="accent-cy">
+        <span>auto · 10s</span>
+      </label>
+    </div>
+  </header>
+
+  <!-- ─── FILTER BAR ───────────────────────────────────────────────────── -->
+  <section class="mb-5 rounded-lg bg-bg-900/60 border border-line p-3 flex flex-wrap items-center gap-2">
+    <span class="text-[10px] uppercase tracking-wider text-text-lo mr-1">window</span>
+    <template x-for="w in windowPresets" :key="w.id">
+      <button class="chip"
+              :class="window === w.id ? 'active' : ''"
+              @click="setWindow(w.id)"
+              x-text="w.label"></button>
+    </template>
+    <button class="chip"
+            :class="window === 'custom' ? 'active' : ''"
+            @click="window = 'custom'">custom</button>
+
+    <!-- Custom date range -->
+    <template x-if="window === 'custom'">
+      <span class="flex items-center gap-2 ml-2">
+        <input type="datetime-local" x-model="customStart"
+               class="bg-bg-800 border border-line rounded px-2 py-1 text-xs font-mono text-text-hi" />
+        <span class="text-text-lo">→</span>
+        <input type="datetime-local" x-model="customEnd"
+               class="bg-bg-800 border border-line rounded px-2 py-1 text-xs font-mono text-text-hi" />
+        <button @click="applyCustom()"
+                class="chip active">apply</button>
+      </span>
+    </template>
+
+    <!-- Selected user filter pill -->
+    <span class="ml-auto flex items-center gap-2" x-show="selectedUserId">
+      <span class="filter-pill">
+        <span x-text="'user · ' + (selectedUserName || (selectedUserId || '').slice(0,8))"></span>
+        <button @click="clearUser()" class="text-text-lo hover:text-err">✕</button>
+      </span>
+    </span>
+  </section>
+
+  <!-- ─── HEALTH STRIP ─────────────────────────────────────────────────── -->
+  <section class="grid grid-cols-2 md:grid-cols-5 gap-3 mb-5">
+    <template x-for="svc in healthPills" :key="svc.name">
+      <div class="rounded-lg p-3 bg-bg-900 border border-line">
+        <div class="flex items-center justify-between">
+          <div class="text-[11px] uppercase tracking-wider text-text-lo" x-text="svc.name"></div>
+          <span class="pulse-dot text-xs"
+                :class="svc.ok ? 'text-ok' : svc.warn ? 'text-warn' : 'text-err'"></span>
+        </div>
+        <div class="mt-1 text-[13px] text-text-hi font-mono" x-text="svc.detail"></div>
+      </div>
+    </template>
+  </section>
+
+  <!-- ─── ROW: HOST METRICS + NLP COVERAGE ─────────────────────────────── -->
+  <section class="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5 items-start">
+
+    <!-- Left column: SERVER metrics + NLP-recallable coverage stacked.
+         The right column's NLP-coverage-on-archive panel is much taller
+         than the bare SERVER card alone, so we use the spare vertical
+         space below SERVER to host the recallable-only NLP coverage
+         (same metrics as the right panel, denominator filtered to
+         recallable=True so ACK / CHATTER / tool-scaffolding don't
+         dilute the numbers). -->
+    <div class="space-y-5">
+
+    <!-- Host metrics -->
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">SERVER · cpu / mem / disk</h2>
+        <span class="text-[11px] text-text-lo font-mono"
+              x-text="'load ' + (host.load_avg||[]).map(x=>x.toFixed(2)).join(' · ')"></span>
+      </div>
+
+      <div class="space-y-3">
+        <!-- CPU bar -->
+        <div>
+          <div class="flex justify-between text-[11px] mb-1">
+            <span class="text-text-mid"
+                  x-text="'CPU ' + (host.cpu_count ? '(' + host.cpu_count + ' cores)' : '')"></span>
+            <span class="text-text-hi font-mono stat-num"
+                  x-text="(host.cpu_percent ?? '—') + '%'"></span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill" :class="cpuClass()"
+                 :style="'width: ' + (host.cpu_percent || 0) + '%'"></div>
+          </div>
+        </div>
+
+        <!-- Memory bar -->
+        <div>
+          <div class="flex justify-between text-[11px] mb-1">
+            <span class="text-text-mid">memory</span>
+            <span class="text-text-hi font-mono stat-num"
+                  x-text="fmtBytes(host.memory?.used) + ' / ' + fmtBytes(host.memory?.total) +
+                          ' (' + (host.memory?.percent ?? '—') + '%)'"></span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill" :class="pctClass(host.memory?.percent)"
+                 :style="'width: ' + (host.memory?.percent || 0) + '%'"></div>
+          </div>
+        </div>
+
+        <!-- Disk bar -->
+        <div>
+          <div class="flex justify-between text-[11px] mb-1">
+            <span class="text-text-mid font-mono"
+                  x-text="host.disk_lance?.path || 'disk'"></span>
+            <span class="text-text-hi font-mono stat-num"
+                  x-text="fmtBytes(host.disk_lance?.used) + ' / ' + fmtBytes(host.disk_lance?.total) +
+                          ' (' + (host.disk_lance?.percent ?? '—') + '%)'"></span>
+          </div>
+          <div class="bar-track">
+            <div class="bar-fill" :class="pctClass(host.disk_lance?.percent)"
+                 :style="'width: ' + (host.disk_lance?.percent || 0) + '%'"></div>
+          </div>
+        </div>
+
+        <!-- Uptime -->
+        <div class="flex justify-between text-[11px] pt-1">
+          <span class="text-text-lo">uptime</span>
+          <span class="text-text-mid font-mono" x-text="fmtUptime(host.uptime_seconds)"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- NLP coverage — RECALLABLE ROWS ONLY.
+         Same stages as the right-side "NLP · coverage on archive" panel
+         but the denominator is filtered to recallable=True. This strips
+         out ACK / CHATTER / tool-scaffolding noise (which by design
+         generates no links and few entities) so the operator sees the
+         true health of NLP work on the rows the recall pipeline
+         actually surfaces. -->
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5"
+         x-show="nlp.stages_recallable">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">
+          NLP · coverage on <span class="text-ok">recallable</span> rows only
+        </h2>
+        <span class="text-[11px] text-text-lo font-mono"
+              x-text="(nlp.recallable_archive_rows || 0) + ' / ' +
+                      (nlp.archive_rows || 0) + ' rows recallable' +
+                      (selectedUserId ? ' · scoped' : '')"></span>
+      </div>
+
+      <div class="grid grid-cols-2 gap-x-5 gap-y-2.5">
+        <template x-for="s in nlpStagesRecallable" :key="s.k">
+          <div>
+            <div class="flex justify-between text-[11px] mb-1">
+              <span class="text-text-mid" x-text="s.label"></span>
+              <span class="text-text-hi font-mono stat-num"
+                    x-text="(s.pct ?? '—') + '%'"></span>
+            </div>
+            <div class="bar-track">
+              <div class="bar-fill"
+                   :class="s.pct >= 90 ? '' : s.pct >= 60 ? 'warn' : 'err'"
+                   :style="'width: ' + (s.pct || 0) + '%'"></div>
+            </div>
+            <div class="text-[10px] text-text-lo mt-0.5"
+                 x-text="(s.covered ?? 0) + ' / ' + (nlp.recallable_archive_rows || 0) + ' rows'"></div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    </div>  <!-- /space-y-5 left column wrapper -->
+
+    <!-- NLP coverage -->
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">NLP · coverage on archive</h2>
+        <span class="text-[11px] text-text-lo font-mono"
+              x-text="(nlp.archive_rows || 0) + ' rows' +
+                      (selectedUserId ? ' · scoped' : '')"></span>
+      </div>
+
+      <div class="grid grid-cols-2 gap-x-5 gap-y-2.5">
+        <template x-for="s in nlpStages" :key="s.k">
+          <div>
+            <div class="flex justify-between text-[11px] mb-1">
+              <span class="text-text-mid" x-text="s.label"></span>
+              <span class="text-text-hi font-mono stat-num"
+                    x-text="(s.pct ?? '—') + '%'"></span>
+            </div>
+            <div class="bar-track">
+              <div class="bar-fill"
+                   :class="s.pct >= 90 ? '' : s.pct >= 60 ? 'warn' : 'err'"
+                   :style="'width: ' + (s.pct || 0) + '%'"></div>
+            </div>
+            <div class="text-[10px] text-text-lo mt-0.5"
+                 x-text="(s.covered ?? 0) + ' / ' + (nlp.archive_rows || 0) + ' rows'"></div>
+          </div>
+        </template>
+      </div>
+
+      <div class="mt-4 grid grid-cols-4 gap-2 pt-3 border-t border-line/60">
+        <template x-for="(v, k) in (nlp.link_totals || {})" :key="k">
+          <div class="text-center">
+            <div class="text-[10px] uppercase tracking-wider text-text-lo"
+                 x-text="k.replace('_links','')"></div>
+            <div class="text-base text-text-hi stat-num" x-text="fmt(v)"></div>
+            <div class="text-[10px] text-text-lo">links</div>
+          </div>
+        </template>
+      </div>
+
+      <div class="mt-3 text-[11px] text-text-lo flex flex-wrap gap-2"
+           x-show="nlp.embeddings_total != null">
+        <span class="text-text-mid">aux embeddings:</span>
+        <span class="text-text-hi font-mono stat-num" x-text="fmt(nlp.embeddings_total)"></span>
+        <template x-for="(n, t) in (nlp.embeddings_by_type || {})" :key="t">
+          <span class="px-1.5 py-0.5 rounded bg-bg-800 font-mono text-text-mid"
+                x-text="t + ':' + fmt(n)"></span>
+        </template>
+      </div>
+
+      <!-- Block-class × recallable breakdown.
+           Each row shows one classifier category (FACT, QUERY, …) with
+           its split between recallable=True (green) and recallable=False
+           (muted). Helps spot-check the classification labels: e.g.
+           QUERY rows should be mostly recallable, EXECUTION_LOG mostly
+           not. Also surfaces the UNCLASSIFIED bucket if the polling
+           worker isn't persisting the LLM's category. -->
+      <div class="mt-4 pt-3 border-t border-line/60"
+           x-show="nlp.class_breakdown">
+        <div class="flex items-baseline justify-between mb-2">
+          <span class="text-[11px] uppercase tracking-wider text-text-lo">
+            block class · recallable breakdown
+          </span>
+          <span class="text-[10px] text-text-lo font-mono"
+                x-text="(nlp.recallable_total || 0) + ' recallable / ' +
+                        (nlp.not_recallable_total || 0) + ' not'"></span>
+        </div>
+        <div class="grid grid-cols-1 gap-1.5">
+          <template x-for="(v, cls) in (nlp.class_breakdown || {})" :key="cls">
+            <div class="grid grid-cols-[110px_1fr_auto] items-center gap-2 text-[11px]">
+              <span class="text-text-mid font-mono truncate" x-text="cls"></span>
+              <!-- Stacked bar: green = recallable, muted = not. -->
+              <div class="flex h-2 bg-bg-800 rounded overflow-hidden">
+                <div class="bg-ok"
+                     :style="'width: ' +
+                       (v.total > 0 ? (100 * v.recallable / v.total) : 0) + '%'"
+                     :title="'recallable: ' + v.recallable"></div>
+                <div class="bg-text-lo opacity-50"
+                     :style="'width: ' +
+                       (v.total > 0 ? (100 * v.not_recallable / v.total) : 0) + '%'"
+                     :title="'not recallable: ' + v.not_recallable"></div>
+              </div>
+              <span class="text-text-mid font-mono stat-num text-[10px]">
+                <span class="text-ok" x-text="v.recallable"></span>
+                <span class="text-text-lo">/</span>
+                <span x-text="v.not_recallable"></span>
+                <span class="text-text-lo ml-1" x-text="'(' + v.total + ')'"></span>
+              </span>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- ─── ROW: RECALL + LANCE ──────────────────────────────────────────── -->
+  <section class="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
+
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">RECALL · workers + queues</h2>
+        <span class="text-[11px] text-text-lo font-mono"
+              x-text="'adapter: ' + (recall.nlp_adapter || '—')"></span>
+      </div>
+
+      <div class="grid grid-cols-3 gap-3 mb-4">
+        <template x-for="m in recallStats" :key="m.k">
+          <div class="bg-bg-800 rounded-lg p-3 border border-line/60">
+            <div class="text-[10px] uppercase tracking-wider text-text-lo" x-text="m.k"></div>
+            <div class="text-2xl text-text-hi stat-num" x-text="m.v"></div>
+            <div class="text-[10px] text-text-lo" x-text="m.sub"></div>
+          </div>
+        </template>
+      </div>
+
+      <div class="text-[11px] text-text-mid mb-1">queue depth</div>
+      <div class="grid grid-cols-3 gap-2 mb-4">
+        <template x-for="(v, k) in (recall.queues || {})" :key="k">
+          <div class="bg-bg-800 rounded p-2 text-center border border-line/60">
+            <div class="text-[10px] text-text-lo" x-text="k"></div>
+            <div class="text-base text-text-hi stat-num" x-text="v"></div>
+          </div>
+        </template>
+      </div>
+
+      <div class="text-[11px] text-text-mid mb-1">worker threads</div>
+      <div class="flex flex-wrap gap-1">
+        <template x-for="(alive, name) in (recall.thread_states || {})" :key="name">
+          <span class="px-2 py-0.5 rounded text-[10px] font-mono"
+                :class="alive ? 'bg-ok/10 text-ok' : 'bg-err/10 text-err'"
+                x-text="name.replace('TCMM-','')"></span>
+        </template>
+      </div>
+    </div>
+
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">LANCE · tables + fragmentation</h2>
+        <span class="text-[11px] text-text-lo font-mono"
+              x-text="lance.fts_index?.built ? 'FTS built' : 'FTS pending'"></span>
+      </div>
+      <div class="overflow-x-auto scrollbar-thin">
+        <table class="w-full text-xs">
+          <thead class="text-text-lo uppercase tracking-wider text-[10px]">
+            <tr>
+              <th class="text-left py-1.5">table</th>
+              <th class="text-right py-1.5">rows</th>
+              <th class="text-right py-1.5">frags</th>
+              <th class="text-right py-1.5">rows/frag</th>
+              <th class="text-right py-1.5">size</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="t in (lance.overview?.tables || [])" :key="t.name">
+              <tr class="border-t border-line/40">
+                <td class="py-1.5 text-text-hi font-mono" x-text="t.name"></td>
+                <td class="py-1.5 text-right text-text-hi stat-num" x-text="fmt(t.rows)"></td>
+                <td class="py-1.5 text-right text-text-hi stat-num" x-text="fmt(t.fragments)"></td>
+                <td class="py-1.5 text-right stat-num"
+                    :class="(t.rows_per_fragment || 9999) < 100 ? 'text-warn' : 'text-text-mid'"
+                    x-text="t.rows_per_fragment ? t.rows_per_fragment.toFixed(0) : '—'"></td>
+                <td class="py-1.5 text-right text-text-mid font-mono" x-text="fmtBytes(t.disk_bytes)"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── ROW: REQUESTS chart + by-type pie ───────────────────────────── -->
+  <section class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
+
+    <div class="lg:col-span-2 rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">REQUESTS TO LLM · <span x-text="windowLabel()"></span></h2>
+        <div class="flex items-center gap-2 text-[11px] text-text-lo">
+          <span x-text="(redact.total_rows || 0) + ' audit rows · ' +
+                        (redact.users_seen || 0) + ' users · ' +
+                        (redact.conversations_seen || 0) + ' conversations'"></span>
+        </div>
+      </div>
+      <!-- Chart needs explicit container height because Chart.js uses
+           responsive: true with maintainAspectRatio: false (set below) -->
+      <div style="position: relative; height: 220px;">
+        <canvas id="chart-redactions"></canvas>
+      </div>
+    </div>
+
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <h2 class="text-sm font-semibold text-text-hi tracking-wide mb-3">REDACTIONS BY TYPE</h2>
+      <div style="position: relative; height: 220px;">
+        <canvas id="chart-redaction-pie"></canvas>
+      </div>
+      <div class="mt-3 grid grid-cols-2 gap-1 text-[10px] text-text-mid">
+        <template x-for="(v, k) in (redact.tokens_by_kind || {})" :key="k">
+          <div class="flex justify-between">
+            <span x-text="k"></span>
+            <span class="text-text-hi font-mono stat-num" x-text="fmt(v)"></span>
+          </div>
+        </template>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── ROW: PROMPT CACHE (window-scoped) ───────────────────────────── -->
+  <section class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
+
+    <div class="lg:col-span-2 rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">PROMPT CACHE · <span x-text="windowLabel()"></span></h2>
+        <span class="text-[11px] text-text-lo"
+              x-text="(cache.cache_hits || 0) + ' hits / ' + (cache.from_llm_rows || 0) + ' responses · ' +
+                      ((cache.hit_rate || 0) * 100).toFixed(0) + '% hit rate'"></span>
+      </div>
+      <div style="position: relative; height: 220px;">
+        <canvas id="chart-cache"></canvas>
+      </div>
+    </div>
+
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <h2 class="text-sm font-semibold text-text-hi tracking-wide mb-3">CACHE TOTALS</h2>
+      <dl class="space-y-2 text-[12px]">
+        <div class="flex justify-between">
+          <dt class="text-text-lo">cache_read tokens</dt>
+          <dd class="text-text-hi font-mono stat-num" x-text="fmt(cache.cache_read_tokens)"></dd>
+        </div>
+        <div class="flex justify-between">
+          <dt class="text-text-lo">cache_write tokens</dt>
+          <dd class="text-text-hi font-mono stat-num" x-text="fmt(cache.cache_write_tokens)"></dd>
+        </div>
+        <div class="flex justify-between">
+          <dt class="text-text-lo">input tokens (paid)</dt>
+          <dd class="text-text-hi font-mono stat-num" x-text="fmt(cache.input_tokens)"></dd>
+        </div>
+        <div class="flex justify-between border-t border-line/40 pt-2 mt-2">
+          <dt class="text-text-lo">% input from cache</dt>
+          <dd class="text-text-hi font-mono stat-num"
+              x-text="((cache.input_volume_from_cache_ratio || 0) * 100).toFixed(0) + '%'"></dd>
+        </div>
+        <div class="flex justify-between">
+          <dt class="text-text-lo">savings (Sonnet eq.)</dt>
+          <dd class="text-em font-mono stat-num"
+              x-text="'$' + (cache.savings_usd || 0).toFixed(2)"></dd>
+        </div>
+        <div class="flex justify-between">
+          <dt class="text-text-lo">cache-write tax</dt>
+          <dd class="text-text-mid font-mono stat-num"
+              x-text="'-$' + (cache.extra_cost_usd || 0).toFixed(2)"></dd>
+        </div>
+        <div class="flex justify-between border-t border-line/40 pt-2">
+          <dt class="text-text-hi">net savings</dt>
+          <dd class="text-em font-mono stat-num font-semibold"
+              x-text="'$' + (cache.net_savings_usd || 0).toFixed(2)"></dd>
+        </div>
+      </dl>
+    </div>
+  </section>
+
+  <!-- ─── ROW: MESSAGES PER USER (window-scoped) ──────────────────────── -->
+  <section class="rounded-xl bg-bg-900 border border-line shadow-card p-5 mb-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <h2 class="text-sm font-semibold text-text-hi tracking-wide">MESSAGES TO LLM · <span x-text="windowLabel()"></span></h2>
+      <span class="text-[11px] text-text-lo">click a user name to drill in</span>
+    </div>
+    <div class="overflow-x-auto scrollbar-thin">
+      <table class="w-full text-xs">
+        <thead class="text-text-lo uppercase tracking-wider text-[10px]">
+          <tr>
+            <th class="text-left py-1.5">user</th>
+            <th class="text-left py-1.5">email</th>
+            <th class="text-right py-1.5">to llm</th>
+            <th class="text-right py-1.5">from llm</th>
+            <th class="text-right py-1.5">conversations</th>
+            <th class="text-right py-1.5">tokens in/out</th>
+            <th class="text-right py-1.5">bytes to llm</th>
+            <th class="text-right py-1.5">redactions</th>
+            <th class="text-left py-1.5 pl-3">last active</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="r in (messagesPerUser || [])" :key="r.user_id">
+            <tr class="border-t border-line/40">
+              <td class="py-1.5">
+                <span class="user-link"
+                      @click="selectUser(r.user_id, r.name)"
+                      x-text="r.name || '—'"></span>
+              </td>
+              <td class="py-1.5 text-text-mid font-mono text-[11px]" x-text="r.email || ''"></td>
+              <td class="py-1.5 text-right text-text-hi stat-num" x-text="fmt(r.to_llm)"></td>
+              <td class="py-1.5 text-right text-text-mid stat-num" x-text="fmt(r.from_llm)"></td>
+              <td class="py-1.5 text-right text-text-mid stat-num" x-text="fmt(r.conversations)"></td>
+              <td class="py-1.5 text-right text-text-mid font-mono stat-num"
+                  x-text="fmt(r.tokens_in) + ' / ' + fmt(r.tokens_out)"></td>
+              <td class="py-1.5 text-right text-text-mid stat-num" x-text="fmtBytes(r.to_llm_bytes)"></td>
+              <td class="py-1.5 text-right text-em stat-num" x-text="fmt(r.redactions_total)"></td>
+              <td class="py-1.5 pl-3 text-text-mid font-mono text-[11px]"
+                  x-text="fmtTime(r.last_seen)"></td>
+            </tr>
+          </template>
+          <tr x-show="!messagesPerUser || messagesPerUser.length === 0">
+            <td colspan="9" class="py-4 text-center text-text-lo">no messages in this window</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ─── ROW: RECENT REQUESTS table (click row → see redacted content) ── -->
+  <section class="rounded-xl bg-bg-900 border border-line shadow-card p-5 mb-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <h2 class="text-sm font-semibold text-text-hi tracking-wide">RECENT REQUESTS · <span x-text="windowLabel()"></span></h2>
+      <span class="text-[11px] text-text-lo">click a row to see what was sent to the LLM (redacted)</span>
+    </div>
+    <div class="overflow-x-auto scrollbar-thin">
+      <table class="w-full text-xs">
+        <thead class="text-text-lo uppercase tracking-wider text-[10px]">
+          <tr>
+            <th class="text-left py-1.5">when</th>
+            <th class="text-left py-1.5">user</th>
+            <th class="text-left py-1.5">email</th>
+            <th class="text-left py-1.5">conversation</th>
+            <!-- 2026-05-18: was "bytes" (raw char count of the redacted
+                 request body). Replaced with "tokens in" from the paired
+                 FROM_LLM row so the column is in the SAME unit as
+                 "cache rd" (tokens) — direct apples-to-apples comparison
+                 of cached vs total tokens. -->
+            <th class="text-right py-1.5" title="prompt_tokens reported by the upstream API for this turn">tokens in</th>
+            <th class="text-right py-1.5" title="cached_tokens — the slice of tokens_in that was served from prefix cache">cache rd</th>
+            <th class="text-right py-1.5" title="cache_creation_input_tokens (Anthropic only — xAI auto-caches without a write counter)">cache wr</th>
+            <th class="text-left py-1.5 pl-3">redactions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="r in (recent || [])" :key="r.aid">
+            <tr class="border-t border-line/40 row-clickable hover:bg-bg-800/40"
+                @click="openRequest(r.aid)">
+              <td class="py-1.5 text-text-mid font-mono" x-text="fmtTime(r.ts)"></td>
+              <!-- User name: clickable link, stops propagation so it filters
+                   instead of opening the request modal. -->
+              <td class="py-1.5">
+                <span class="user-link"
+                      @click.stop="selectUser(r.user_id, r.user_name)"
+                      x-text="r.user_name || '—'"></span>
+              </td>
+              <td class="py-1.5 text-text-mid font-mono text-[11px]" x-text="r.user_email || ''"></td>
+              <!-- 2026-05-18: was ``.slice(0,16)`` which collapsed distinct
+                   conv_ids that share a prefix (e.g. ``stream-cache-fix-X-1``
+                   and ``...-X-2`` both rendered as ``stream-cache-fix``).
+                   ``fmtConvId`` keeps prefix + suffix with an ellipsis; the
+                   ``title`` attribute surfaces the full id on hover for
+                   copy-paste / forensic work. -->
+              <!-- conv_id + turn-type badge. ``turn_type`` is computed
+                   server-side by pii_audit_stats._classify_turn() and
+                   distinguishes: ``turn`` (main user turn — full TCMM
+                   preamble, large prompt), ``tool`` (mid-flow tool
+                   followup — no preamble, smaller prompt, cache_rd=floor
+                   on cold caches), ``sub`` (sub-agent LLM call with a
+                   ``sub-<parent>-<id>`` conv_id). Lets you tell at a
+                   glance which rows are "real" user turns vs follow-ups
+                   that share the parent conv_id. -->
+              <td class="py-1.5 text-text-mid font-mono text-[11px] cursor-help"
+                  :title="r.conversation_id || ''">
+                <span x-text="fmtConvId(r.conversation_id)"></span>
+                <span class="ml-1 px-1 py-0 rounded text-[9px] font-mono align-middle"
+                      :class="{
+                        'bg-em/20 text-em':                r.turn_type === 'turn',
+                        'bg-text-lo/15 text-text-mid':    r.turn_type === 'tool',
+                        'bg-blue-500/20 text-blue-300':   r.turn_type === 'sub',
+                      }"
+                      x-text="r.turn_type || 'turn'"
+                      :title="r.turn_type === 'tool' ? 'Tool-result follow-up — model continuing after a tool execution. Shares conv_id with the parent user turn.'
+                            : r.turn_type === 'sub'  ? 'Sub-agent LLM call (spawn_agent/spawn_agentic) — fresh conv_id, separate TCMM namespace.'
+                            : 'Main user turn — full TCMM preamble.'"></span>
+              </td>
+              <!-- tokens_input is null until the FROM_LLM row is paired
+                   in by recent_redactions. Same pending-vs-orphan
+                   convention as cache_rd. Hover shows raw byte count
+                   for forensics. -->
+              <td class="py-1.5 text-right text-text-mid font-mono stat-num"
+                  :title="(r.bytes || 0) + ' bytes of redacted request body'"
+                  x-text="r.tokens_input == null ? ((Date.now()/1000 - (r.ts || 0)) < 60 ? '…' : '—') : fmt(r.tokens_input)"></td>
+              <!-- Cache columns: green when the response actually hit cache,
+                   muted "…" when the TO_LLM is < 60s old and we haven't seen
+                   its FROM_LLM yet (proxy writes audit AFTER the streaming
+                   response completes, so there's a 3-15s gap on every row),
+                   muted dash for genuine null (errored or orphaned). The
+                   prior version rendered "—" for both pending + miss, which
+                   made the dashboard look broken on every fresh request. -->
+              <td class="py-1.5 text-right font-mono stat-num"
+                  :class="(r.cache_read || 0) > 0 ? 'text-em' : 'text-text-lo'"
+                  :title="r.cache_read == null &amp;&amp; (Date.now()/1000 - (r.ts || 0)) < 60 ? 'response still streaming — refresh in a moment' : ''"
+                  x-text="r.cache_read == null ? ((Date.now()/1000 - (r.ts || 0)) < 60 ? '…' : '—') : fmt(r.cache_read)"></td>
+              <td class="py-1.5 text-right font-mono stat-num"
+                  :class="(r.cache_write || 0) > 0 ? 'text-text-hi' : 'text-text-lo'"
+                  x-text="r.cache_write == null ? ((Date.now()/1000 - (r.ts || 0)) < 60 ? '…' : '—') : fmt(r.cache_write)"></td>
+              <td class="py-1.5 pl-3">
+                <div class="flex flex-wrap gap-1">
+                  <template x-for="(n, kind) in (r.redactions || {})" :key="kind">
+                    <span class="px-1.5 py-0.5 rounded text-[10px] font-mono"
+                          :class="kindColour(kind)"
+                          x-text="kind + ':' + n"></span>
+                  </template>
+                </div>
+              </td>
+            </tr>
+          </template>
+          <tr x-show="!recent || recent.length === 0">
+            <td colspan="8" class="py-4 text-center text-text-lo">no requests in this window</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ─── ROW: USER USAGE all-time ────────────────────────────────────── -->
+  <section class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <h2 class="text-sm font-semibold text-text-hi tracking-wide">USER USAGE · all time vs <span x-text="windowLabel()"></span></h2>
+      <div class="text-[11px] text-text-lo font-mono" x-show="users.summary">
+        <span x-text="(users.summary?.users_total || 0) + ' users · ' +
+                      (users.summary?.conversations_total || 0) + ' conversations · ' +
+                      (users.summary?.messages_total || 0) + ' messages'"></span>
+      </div>
+    </div>
+    <div class="overflow-x-auto scrollbar-thin">
+      <table class="w-full text-xs">
+        <thead class="text-text-lo uppercase tracking-wider text-[10px]">
+          <tr>
+            <th class="text-left py-1.5">user</th>
+            <th class="text-left py-1.5">email</th>
+            <th class="text-left py-1.5">role</th>
+            <th class="text-right py-1.5">msgs (all)</th>
+            <th class="text-right py-1.5">tokens (all)</th>
+            <th class="text-right py-1.5">to llm <span class="text-text-lo">·win</span></th>
+            <th class="text-right py-1.5">tokens <span class="text-text-lo">·win</span></th>
+            <th class="text-right py-1.5">redactions <span class="text-text-lo">·win</span></th>
+            <th class="text-left py-1.5 pl-3">last active</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="u in (users.users || [])" :key="u.user_id">
+            <tr class="border-t border-line/40">
+              <td class="py-1.5">
+                <span class="user-link"
+                      @click="selectUser(u.user_id, u.name)"
+                      x-text="u.name || '—'"></span>
+              </td>
+              <td class="py-1.5 text-text-mid font-mono text-[11px]" x-text="u.email"></td>
+              <td class="py-1.5">
+                <span class="px-1.5 py-0.5 rounded text-[10px] font-mono"
+                      :class="u.role === 'ADMIN' ? 'bg-vi/10 text-vi' : 'bg-bg-800 text-text-mid'"
+                      x-text="u.role || '—'"></span>
+              </td>
+              <td class="py-1.5 text-right text-text-hi stat-num" x-text="fmt(u.messages)"></td>
+              <td class="py-1.5 text-right text-text-mid stat-num" x-text="fmt(u.tokens)"></td>
+              <td class="py-1.5 text-right text-cy stat-num" x-text="fmt(u.to_llm_in_window)"></td>
+              <td class="py-1.5 text-right text-cy stat-num" x-text="fmt(u.tokens_in_window)"></td>
+              <td class="py-1.5 text-right text-em stat-num" x-text="fmt(u.redactions_in_window)"></td>
+              <td class="py-1.5 pl-3 text-text-mid font-mono text-[11px]" x-text="fmtTime(u.last_message)"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="mt-8 text-center text-[10px] text-text-lo font-mono">
+    Veilguard admin · auth via LibreChat refreshToken · ADMIN role required
+  </footer>
+
+  <!-- ─── Request-detail modal ─────────────────────────────────────────── -->
+  <div x-show="modalOpen" x-cloak
+       @keydown.escape.window="closeRequest()"
+       @click.self="closeRequest()"
+       class="modal-backdrop">
+    <div class="modal-card">
+      <!-- Header -->
+      <div class="flex items-baseline justify-between p-5 border-b border-line">
+        <div>
+          <h2 class="text-text-hi text-sm font-semibold tracking-wide">
+            REQUEST · aid <span class="font-mono text-cy" x-text="modalData.aid"></span>
+          </h2>
+          <div class="text-[11px] text-text-lo font-mono mt-1">
+            <span x-text="modalData.user_name || '—'"></span>
+            <span class="text-text-mid"> · </span>
+            <span x-text="modalData.user_email || ''"></span>
+            <span class="text-text-mid"> · </span>
+            <span x-text="modalData.direction"></span>
+            <span class="text-text-mid"> · </span>
+            <span x-text="modalData.model"></span>
+            <span class="text-text-mid"> · </span>
+            <span x-text="fmtTime(modalData.ts)"></span>
+          </div>
+        </div>
+        <button class="text-text-lo hover:text-err text-lg" @click="closeRequest()">✕</button>
+      </div>
+      <!-- Stats strip -->
+      <div class="px-5 py-3 border-b border-line/60 grid grid-cols-4 gap-4 text-xs">
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-text-lo">bytes</div>
+          <div class="text-text-hi font-mono stat-num" x-text="fmt(modalData.bytes)"></div>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-text-lo">tokens in</div>
+          <div class="text-text-hi font-mono stat-num" x-text="fmt(modalData.tokens_input)"></div>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-text-lo">tokens out</div>
+          <div class="text-text-hi font-mono stat-num" x-text="fmt(modalData.tokens_output)"></div>
+        </div>
+        <div>
+          <div class="text-[10px] uppercase tracking-wider text-text-lo">redactions</div>
+          <div class="flex flex-wrap gap-1 mt-0.5">
+            <template x-for="(n, kind) in (modalData.redactions || {})" :key="kind">
+              <span class="px-1.5 py-0.5 rounded text-[10px] font-mono"
+                    :class="kindColour(kind)" x-text="kind + ':' + n"></span>
+            </template>
+            <span x-show="!modalData.redactions || Object.keys(modalData.redactions).length === 0"
+                  class="text-text-lo">none</span>
+          </div>
+        </div>
+      </div>
+      <!-- Content (REDACTED — REF_X tokens, never raw PII) -->
+      <div class="p-5 overflow-auto scrollbar-thin" style="flex: 1;">
+        <div class="text-[10px] uppercase tracking-wider text-text-lo mb-2">
+          content sent to LLM · <span class="text-warn">redacted</span> (REF_X tokens replace PII)
+        </div>
+        <pre class="text-[12px] text-text-hi whitespace-pre-wrap font-mono leading-relaxed bg-bg-800 rounded p-3 border border-line/60"
+             x-text="modalData.content || '(empty)'"></pre>
+      </div>
+      <!-- Footer link -->
+      <div class="px-5 py-3 border-t border-line/60 flex justify-between text-[11px]">
+        <span class="text-text-lo font-mono">
+          conversation: <span x-text="modalData.conversation_id"></span>
+        </span>
+        <button class="user-link" @click="closeRequest(); selectUser(modalData.user_id, modalData.user_name)">
+          drill into this user →
+        </button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+function dashboard() {
+  return {
+    autoRefresh: true,
+    lastUpdate: '',
+
+    // ── Filter state ──────────────────────────────────────────────────
+    window: '24h',
+    customStart: '',
+    customEnd: '',
+    selectedUserId: null,
+    selectedUserName: null,
+    windowPresets: [
+      { id: '1h',  label: '1h' },
+      { id: '24h', label: '24h' },
+      { id: '7d',  label: '7d' },
+      { id: '30d', label: '30d' },
+      { id: 'all', label: 'all' },
+    ],
+
+    // ── Data ──────────────────────────────────────────────────────────
+    health: {},
+    recall: {},
+    host: {},
+    nlp: { stages: {}, link_totals: {} },
+    lance: {},
+    redact: {},
+    cache: {},
+    recent: [],
+    users: { summary: {}, users: [] },
+    messagesPerUser: [],
+
+    // ── Request-detail modal ──────────────────────────────────────────
+    modalOpen: false,
+    modalData: {},
+
+    // (Chart.js instances live OUTSIDE Alpine state — see _charts below.
+    //  Putting them on `this.timeChart`/`this.pieChart` makes Alpine wrap
+    //  the Chart instance in a reactive Proxy; Chart.js then recurses
+    //  into the proxy on every internal read and crashes with
+    //  "Maximum call stack size exceeded" — chart never renders.)
+
+    // ── Lifecycle ─────────────────────────────────────────────────────
+    async boot() {
+      // Default custom range = last 24h, just to make the picker not empty
+      const now = new Date();
+      this.customEnd = now.toISOString().slice(0, 16);
+      this.customStart = new Date(now - 24 * 3600 * 1000).toISOString().slice(0, 16);
+      await this.refreshAll();
+      setInterval(() => { if (this.autoRefresh) this.refreshAll(); }, 10_000);
+    },
+
+    setWindow(w) {
+      this.window = w;
+      this.refreshAll();
+    },
+
+    applyCustom() { this.refreshAll(); },
+
+    selectUser(uid, name) {
+      this.selectedUserId = uid;
+      this.selectedUserName = name;
+      this.refreshAll();
+      // Scroll to top so the user sees the filter applied
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    },
+
+    clearUser() {
+      this.selectedUserId = null;
+      this.selectedUserName = null;
+      this.refreshAll();
+    },
+
+    windowLabel() {
+      if (this.window === 'custom') {
+        return 'custom range';
+      }
+      const lookup = {
+        '1h': 'last hour', '24h': 'last 24h', '7d': 'last 7 days',
+        '30d': 'last 30 days', 'all': 'all time',
+      };
+      return lookup[this.window] || this.window;
+    },
+
+    // Build query string with window + optional user filter.
+    _qs(extra = {}) {
+      const p = new URLSearchParams();
+      if (this.window === 'custom') {
+        if (this.customStart) p.set('start_ts', new Date(this.customStart).getTime() / 1000);
+        if (this.customEnd)   p.set('end_ts',   new Date(this.customEnd).getTime() / 1000);
+      } else {
+        p.set('window', this.window);
+      }
+      if (this.selectedUserId) p.set('user_id', this.selectedUserId);
+      for (const [k, v] of Object.entries(extra)) p.set(k, v);
+      return p.toString();
+    },
+
+    async refreshAll() {
+      try {
+        const qs = this._qs();
+        const [h, r, ho, nl, l, ro, rr, mpu, us, ca] = await Promise.all([
+          this._j('api/health'),
+          this._j('api/recall-perf'),
+          this._j('api/host'),
+          this._j('api/nlp-coverage' + (this.selectedUserId ? '?user_id=' + this.selectedUserId : '')),
+          this._j('api/lance'),
+          this._j('api/redactions/overview?' + qs),
+          this._j('api/redactions/recent?limit=30&' + qs),
+          this._j('api/messages/per-user?' + qs),
+          this._j('api/users?' + this._windowOnlyQs()),
+          this._j('api/cache/overview?' + qs),
+        ]);
+        this.health = h; this.recall = r; this.host = ho; this.nlp = nl; this.lance = l;
+        this.redact = ro; this.recent = rr;
+        this.messagesPerUser = mpu.rows || [];
+        this.users = us;
+        this.cache = ca;
+        this.lastUpdate = new Date().toLocaleTimeString();
+        this._renderCharts();
+      } catch (e) { console.error(e); }
+    },
+
+    // /api/users doesn't take user_id (it's the cross-user table)
+    _windowOnlyQs() {
+      const p = new URLSearchParams();
+      if (this.window === 'custom') {
+        if (this.customStart) p.set('start_ts', new Date(this.customStart).getTime() / 1000);
+        if (this.customEnd)   p.set('end_ts',   new Date(this.customEnd).getTime() / 1000);
+      } else {
+        p.set('window', this.window);
+      }
+      return p.toString();
+    },
+
+    async _j(path) {
+      const r = await fetch(path, { credentials: 'include' });
+      if (r.status === 401 || r.status === 403) {
+        document.body.innerHTML =
+          '<div class="text-center mt-32 text-text-mid">' +
+          '<h1 class="text-2xl text-err mb-2">' + r.status + ' — ' + r.statusText + '</h1>' +
+          '<p>Sign into LibreChat with an ADMIN account.</p></div>';
+        throw new Error('unauthenticated');
+      }
+      if (!r.ok) throw new Error(path + ': ' + r.status);
+      return r.json();
+    },
+
+    // ── Computed ──────────────────────────────────────────────────────
+    get healthPills() {
+      const h = this.health;
+      return [
+        {
+          name: 'TCMM', warn: false,
+          ok: h.tcmm?.status === 'ok',
+          detail: h.tcmm?.status === 'ok'
+            ? (h.tcmm.active_sessions || 0) + ' sessions / ' + (h.tcmm.archive_blocks || 0) + ' blocks'
+            : 'unreachable',
+        },
+        {
+          name: 'Lance', warn: false,
+          ok: h.lance?.ok,
+          detail: (h.lance?.tables || 0) + ' tables',
+        },
+        {
+          name: 'FTS index',
+          ok: h.fts_index?.built,
+          warn: !h.fts_index?.built,
+          detail: h.fts_index?.built ? 'built ' + (h.fts_index.count || 0) + ' idx' : 'pending',
+        },
+        {
+          name: 'NLP adapter', warn: false,
+          ok: !!this.recall?.nlp_adapter,
+          detail: this.recall?.nlp_adapter || '—',
+        },
+        {
+          name: 'Workers', warn: false,
+          ok: this.recall?.alive,
+          detail: Object.values(this.recall?.thread_states || {}).filter(Boolean).length + ' / ' +
+                  Object.keys(this.recall?.thread_states || {}).length + ' alive',
+        },
+      ];
+    },
+
+    get recallStats() {
+      // Source-of-truth: Lance counts of semantic_done/embedding_done
+      // surfaced by tcmm_stats._lance_nlp_progress. The previous version
+      // bound to per-session in-memory metrics (semantic.dequeue,
+      // semantic.success, nlp_batch_count) which are NEVER incremented
+      // by the process-level shared polling worker — so PROCESSED and
+      // BATCHES were perpetually blank even when workers were caught up.
+      // The new tiles read straight from Lance and answer "how much of
+      // the archive is enriched" honestly.
+      const r = this.recall;
+      const m = this.recall.metrics || {};
+      const total = r.archive_total || 0;
+      const processed = r.nlp_processed || 0;
+      const pending = r.nlp_pending || 0;
+      const pct = total > 0 ? Math.round(100 * processed / total) : 0;
+      return [
+        { k: 'enriched',
+          v: this.fmt(processed) + ' / ' + this.fmt(total),
+          sub: pct + '% of archive' },
+        { k: 'pending',
+          v: this.fmt(pending),
+          sub: pending === 0 ? 'fully caught up' : 'awaiting workers' },
+        { k: 'lifetime enq',
+          v: this.fmt(m['semantic.enqueue']),
+          sub: 'this session' },
+      ];
+    },
+
+    get nlpStages() {
+      const stages = this.nlp.stages || {};
+      const labels = {
+        topics: 'topics', topic_dicts: 'topics (dict)',
+        entities: 'entities', entity_dicts: 'entities (dict)',
+        claims: 'claims',
+        block_class: 'classifier',
+        semantic_links: 'semantic links', entity_links: 'entity links',
+        topic_links: 'topic links', contextual_links: 'contextual links',
+      };
+      const out = [];
+      // Vector coverage from separate field
+      if (this.nlp.vector_coverage && !this.nlp.vector_coverage.error) {
+        out.push({
+          k: 'vector', label: 'embedding (vector)',
+          covered: this.nlp.vector_coverage.covered,
+          pct: this.nlp.vector_coverage.percent,
+        });
+      }
+      // Classifier (block_class) is a quick health signal: if topics/
+      // entities are populated but classifier is at 0, the LLM
+      // classification path is broken even though the rest of the NLP
+      // stage is working. Worth its own row right after vector so it's
+      // visible above the link-stage rows.
+      for (const k of ['topics', 'entities', 'claims', 'block_class',
+                       'semantic_links', 'entity_links',
+                       'topic_links', 'contextual_links']) {
+        const s = stages[k];
+        if (!s) continue;
+        out.push({
+          k, label: labels[k] || k,
+          covered: s.covered, pct: s.percent,
+        });
+      }
+      return out;
+    },
+
+    // Same shape as ``nlpStages`` but pulled from
+    // ``nlp.stages_recallable`` so the dashboard can render a parallel
+    // "recallable rows only" panel. ACK / CHATTER / tool-scaffolding
+    // rows carry recallable=False and naturally drag the all-rows
+    // numbers down (a CHATTER block has no entities, so no entity
+    // links can ever be produced for it). The recallable view answers
+    // "did the NLP stack work on the rows that matter".
+    get nlpStagesRecallable() {
+      const stages = this.nlp.stages_recallable || {};
+      const labels = {
+        topics: 'topics', entities: 'entities', claims: 'claims',
+        block_class: 'classifier',
+        semantic_links: 'semantic links', entity_links: 'entity links',
+        topic_links: 'topic links', contextual_links: 'contextual links',
+      };
+      const out = [];
+      for (const k of ['topics', 'entities', 'claims', 'block_class',
+                       'semantic_links', 'entity_links',
+                       'topic_links', 'contextual_links']) {
+        const s = stages[k];
+        if (!s) continue;
+        out.push({
+          k, label: labels[k] || k,
+          covered: s.covered, pct: s.percent,
+        });
+      }
+      return out;
+    },
+
+    cpuClass() {
+      const p = this.host.cpu_percent;
+      if (p == null) return '';
+      if (p >= 85) return 'err';
+      if (p >= 60) return 'warn';
+      return '';
+    },
+    pctClass(p) {
+      if (p == null) return '';
+      if (p >= 90) return 'err';
+      if (p >= 75) return 'warn';
+      return '';
+    },
+
+    // ── Chart rendering ───────────────────────────────────────────────
+    // Chart instances are kept on `window._dashCharts` (NOT on `this`)
+    // because Alpine wraps `this.X` properties in a reactive Proxy.
+    // Chart.js then recurses through the proxy on every internal read
+    // and explodes with "Maximum call stack size exceeded" — which is
+    // exactly why the canvases were rendering blank before this fix.
+    _renderCharts() {
+      if (!window._dashCharts) window._dashCharts = {};
+      const charts = window._dashCharts;
+
+      // Plain (non-proxied) data for Chart.js to chew on. JSON
+      // round-trip strips Alpine's reactive wrappers off nested
+      // arrays/objects.
+      const rawTS = JSON.parse(JSON.stringify(this.redact.time_series_hourly || []));
+      const rawByKind = JSON.parse(JSON.stringify(this.redact.tokens_by_kind || {}));
+      const bucketSeconds = this.redact.bucket_seconds;
+
+      // ── Time-series bar chart ─────────────────────────────────────
+      const labels = rawTS.map(p => this._fmtBucketLabel(p.ts, bucketSeconds));
+      const data = rawTS.map(p => p.count);
+
+      const tcEl = document.getElementById('chart-redactions');
+      if (tcEl) {
+        if (charts.time) {
+          // Update the existing chart instance instead of destroy/recreate
+          charts.time.data.labels = labels;
+          charts.time.data.datasets[0].data = data;
+          charts.time.update('none');
+        } else {
+          charts.time = new Chart(tcEl.getContext('2d'), {
+            type: 'bar',
+            data: {
+              labels,
+              datasets: [{
+                data,
+                backgroundColor: '#56d6ff',
+                borderRadius: 3,
+                barThickness: 'flex',
+              }],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              animation: false,
+              plugins: { legend: { display: false } },
+              scales: {
+                x: { ticks: { color: '#5b6685', font: { size: 10 }, maxRotation: 0 },
+                     grid: { display: false } },
+                y: { ticks: { color: '#5b6685', font: { size: 10 } },
+                     grid: { color: '#1f2a44' }, beginAtZero: true },
+              },
+            },
+          });
+        }
+      }
+
+      // ── By-type doughnut ──────────────────────────────────────────
+      const pkv = Object.entries(rawByKind);
+      pkv.sort((a, b) => b[1] - a[1]);
+      const palette = ['#56d6ff', '#a78bfa', '#ff79c6', '#fcb653',
+                       '#22d3a3', '#ef4d6d', '#7dd3fc', '#c084fc'];
+      const pieLabels = pkv.map(([k]) => k);
+      const pieData = pkv.map(([, v]) => v);
+
+      const pcEl = document.getElementById('chart-redaction-pie');
+      if (pcEl) {
+        if (charts.pie) {
+          charts.pie.data.labels = pieLabels;
+          charts.pie.data.datasets[0].data = pieData;
+          charts.pie.data.datasets[0].backgroundColor =
+            pieLabels.map((_, i) => palette[i % palette.length]);
+          charts.pie.update('none');
+        } else {
+          charts.pie = new Chart(pcEl.getContext('2d'), {
+            type: 'doughnut',
+            data: {
+              labels: pieLabels,
+              datasets: [{
+                data: pieData,
+                backgroundColor: pieLabels.map((_, i) => palette[i % palette.length]),
+                borderColor: '#0c1120',
+                borderWidth: 2,
+              }],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              animation: false,
+              plugins: { legend: { display: false } },
+              cutout: '60%',
+            },
+          });
+        }
+      }
+
+      // ── Cache stacked bar chart ──────────────────────────────────
+      // Three series stacked per bucket: cache_read (green) + cache_write
+      // (purple) + uncached input (orange). The relative heights of the
+      // green vs orange bars are the at-a-glance answer to "is the cache
+      // doing useful work?" — green dominates when caching is healthy.
+      const cacheTS = JSON.parse(JSON.stringify(this.cache.time_series || []));
+      const cBucketSec = this.cache.bucket_seconds;
+      const cLabels = cacheTS.map(p => this._fmtBucketLabel(p.ts, cBucketSec));
+      const crData = cacheTS.map(p => p.cache_read || 0);
+      const cwData = cacheTS.map(p => p.cache_write || 0);
+      const inData = cacheTS.map(p => p.input || 0);
+
+      const ccEl = document.getElementById('chart-cache');
+      if (ccEl) {
+        if (charts.cache) {
+          charts.cache.data.labels = cLabels;
+          charts.cache.data.datasets[0].data = crData;
+          charts.cache.data.datasets[1].data = cwData;
+          charts.cache.data.datasets[2].data = inData;
+          charts.cache.update('none');
+        } else {
+          charts.cache = new Chart(ccEl.getContext('2d'), {
+            type: 'bar',
+            data: {
+              labels: cLabels,
+              datasets: [
+                { label: 'cache_read',  data: crData, backgroundColor: '#22d3a3', stack: 'tok' },
+                { label: 'cache_write', data: cwData, backgroundColor: '#a78bfa', stack: 'tok' },
+                { label: 'input',       data: inData, backgroundColor: '#fcb653', stack: 'tok' },
+              ],
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              animation: false,
+              plugins: {
+                legend: { position: 'top',
+                          labels: { color: '#9ca3af', font: { size: 10 }, boxWidth: 10 } },
+              },
+              scales: {
+                x: { stacked: true,
+                     ticks: { color: '#5b6685', font: { size: 10 }, maxRotation: 0 },
+                     grid: { display: false } },
+                y: { stacked: true,
+                     ticks: { color: '#5b6685', font: { size: 10 } },
+                     grid: { color: '#1f2a44' }, beginAtZero: true },
+              },
+            },
+          });
+        }
+      }
+    },
+
+    // ── Request-detail modal ──────────────────────────────────────────
+    async openRequest(aid) {
+      try {
+        const detail = await this._j('api/requests/' + aid);
+        this.modalData = detail;
+        this.modalOpen = true;
+      } catch (e) {
+        console.error('openRequest failed', e);
+      }
+    },
+
+    closeRequest() {
+      this.modalOpen = false;
+      this.modalData = {};
+    },
+
+    _fmtBucketLabel(ts, secs) {
+      const d = new Date(ts * 1000);
+      if (!secs) return d.toLocaleTimeString().slice(0, 5);
+      if (secs <= 3600) return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      if (secs <= 86400) return d.getHours() + 'h';
+      return (d.getMonth() + 1) + '/' + d.getDate();
+    },
+
+    // ── Formatters ───────────────────────────────────────────────────
+    fmt(n) {
+      if (n == null) return '—';
+      n = Number(n);
+      if (Number.isNaN(n)) return '—';
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + 'k';
+      return n.toLocaleString();
+    },
+    fmtBytes(b) {
+      if (b == null) return '—';
+      const u = ['B', 'kB', 'MB', 'GB', 'TB'];
+      let i = 0; while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+      return b.toFixed(b > 10 || i === 0 ? 0 : 1) + ' ' + u[i];
+    },
+    /**
+     * Format a conversation_id for display in tables.
+     *
+     * Plain ``slice(0, 16)`` was hiding the disambiguating suffix —
+     * conv_ids like ``stream-cache-fix-1779110012-1`` and
+     * ``stream-cache-fix-1779110012-2`` truncate to the same visual
+     * label, making distinct requests look like duplicates.
+     *
+     * Strategy: keep a short prefix AND the last segment so the user
+     * can tell them apart at a glance, with a hover-tooltip showing
+     * the full id for forensic work.
+     *
+     * Examples:
+     *   "conv-69df7853-fc"               -> "conv-69df7853-fc"   (short, unchanged)
+     *   "stream-cache-fix-1779110012-1"  -> "stream-cac…10012-1"
+     *   "stream-cache-fix-1779110012-2"  -> "stream-cac…10012-2"
+     */
+    fmtConvId(s) {
+      if (!s) return '—';
+      s = String(s);
+      if (s.length <= 20) return s;
+      return s.slice(0, 10) + '…' + s.slice(-8);
+    },
+    fmtTime(ts) {
+      if (!ts) return '—';
+      const d = typeof ts === 'string' ? new Date(ts) : new Date(ts * 1000);
+      const now = Date.now();
+      const diff = (now - d.getTime()) / 1000;
+      if (diff < 60)        return Math.floor(diff) + 's ago';
+      if (diff < 3600)      return Math.floor(diff / 60) + 'm ago';
+      if (diff < 86400)     return Math.floor(diff / 3600) + 'h ago';
+      if (diff < 2592000)   return Math.floor(diff / 86400) + 'd ago';
+      return d.toLocaleDateString();
+    },
+    fmtUptime(s) {
+      if (!s) return '—';
+      const d = Math.floor(s / 86400);
+      const h = Math.floor((s % 86400) / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      if (d > 0) return d + 'd ' + h + 'h';
+      if (h > 0) return h + 'h ' + m + 'm';
+      return m + 'm';
+    },
+    kindColour(kind) {
+      const k = (kind || '').toUpperCase();
+      const map = {
+        PERSON: 'bg-cy/15 text-cy', EMAIL: 'bg-vi/15 text-vi',
+        PHONE: 'bg-pk/15 text-pk', LOCATION: 'bg-warn/15 text-warn',
+        ID: 'bg-em/20 text-em', CREDIT_CARD: 'bg-err/15 text-err',
+        BANK_ACCOUNT: 'bg-err/15 text-err', IBAN_CODE: 'bg-err/15 text-err',
+        CARD: 'bg-err/15 text-err',
+        URL: 'bg-bg-700 text-text-mid', IP: 'bg-bg-700 text-text-mid',
+      };
+      return map[k] || 'bg-bg-800 text-text-mid';
+    },
+  };
+}
+</script>
+
+</body>
+</html>

@@ -108,3 +108,27 @@ scripts/tcmm_stats.py
 scripts/tcmm_test_aistudio_ingest.sh
 scripts/veilguard-tcmm-*.service
 scripts/veilguard-tcmm-*.timer
+
+# 2026-05-24: backup dirs + temp snapshots from VM-pull operations
+*.bak-*
+*.bak.*
+_vm-snapshot/
+librechat-src.bak-*/
+services.bak-*/
+mcp-tools.bak-*/
+_local_manifest.txt
+_vm_manifest.txt
+
+# Random scratch / game prototypes (don't commit)
+bros_doom.py
+hello_world.py
+mario_scroller.py
+street_fighter_super_casting.py
+veilguard.png
+veilguard_dark.png
+veilguard_logo*.png
+
+# Client-daemon build artifacts (rebuilt locally; release goes via publish_release.py)
+services/client-daemon/build/
+services/client-daemon/dist/
+services/client-daemon/installer_output/

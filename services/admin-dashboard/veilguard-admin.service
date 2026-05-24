@@ -1,0 +1,27 @@
+[Unit]
+Description=Veilguard Admin Dashboard (:8820)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rudol
+WorkingDirectory=/home/rudol/veilguard/mcp-tools/admin-dashboard
+EnvironmentFile=/home/rudol/veilguard/.env
+Environment=PYTHONUNBUFFERED=1
+# MongoDB lives in the docker bridge — admin runs on the host, so we
+# reach it via the published port on the docker0 gateway. This matches
+# how tcmm-service connects.
+Environment=MONGO_URI=mongodb://172.17.0.1:27017/LibreChat
+Environment=ADMIN_LANCE_DIR=/home/rudol/veilguard/tcmm-data/veilguard/tcmm.db
+Environment=TCMM_URL=http://127.0.0.1:8811
+Environment=ADMIN_PORT=8820
+Environment=ADMIN_HOST=127.0.0.1
+ExecStart=/usr/bin/python3 server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/veilguard-admin.log
+StandardError=append:/var/log/veilguard-admin.log
+
+[Install]
+WantedBy=multi-user.target

@@ -59,7 +59,7 @@ LOG=/tmp/tcmm-aistudio-test.log
 PYTHONPATH=/home/rudol/veilguard/TCMM/TCMM \
 TCMM_ROOT=/home/rudol/veilguard/TCMM/TCMM \
 TCMM_DATA_DIR=/home/rudol/veilguard/tcmm-data \
-nohup python3 mcp-tools/tcmm-service/server.py >"$LOG" 2>&1 &
+nohup python3 services/tcmm-service/server.py >"$LOG" 2>&1 &
 MANUAL_PID=$!
 echo "  manual TCMM PID: $MANUAL_PID  log: $LOG"
 

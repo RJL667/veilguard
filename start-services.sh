@@ -18,19 +18,19 @@ source .env 2>/dev/null
 set +a
 
 echo '[1/4] Starting host-exec on :8808...'
-nohup python3 mcp-tools/host-exec/server.py --sse --port 8808 > /tmp/host-exec.log 2>&1 &
+nohup python3 services/host-exec/server.py --sse --port 8808 > /tmp/host-exec.log 2>&1 &
 
 echo '[2/4] Starting sub-agents on :8809...'
-nohup python3 mcp-tools/sub-agents/server.py --sse --port 8809 > /tmp/sub-agents.log 2>&1 &
+nohup python3 services/sub-agents/server.py --sse --port 8809 > /tmp/sub-agents.log 2>&1 &
 
 echo '[3/4] Starting forge on :8810...'
-nohup python3 mcp-tools/forge/server.py --sse --port 8810 > /tmp/forge.log 2>&1 &
+nohup python3 services/forge/server.py --sse --port 8810 > /tmp/forge.log 2>&1 &
 
 sleep 2
 
 echo '[4/4] Starting TCMM on :8811...'
 cd ~/veilguard
-nohup python3 mcp-tools/tcmm-service/server.py > /tmp/tcmm.log 2>&1 &
+nohup python3 services/tcmm-service/server.py > /tmp/tcmm.log 2>&1 &
 
 echo 'All host services starting...'
 sleep 5

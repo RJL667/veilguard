@@ -198,9 +198,9 @@ story.append(Paragraph("docker compose up -d", styles["CO"]))
 story.append(Paragraph(
     "Starts: LibreChat (port 3080), MongoDB, MeiliSearch, PII Proxy (port 4000)", styles["B"]))
 story.append(Paragraph("Host-Side MCP Servers", styles["SH2"]))
-story.append(Paragraph("python mcp-tools/host-exec/server.py --sse --port 8808", styles["CO"]))
-story.append(Paragraph("python mcp-tools/sub-agents/server.py --sse --port 8809", styles["CO"]))
-story.append(Paragraph("python mcp-tools/forge/server.py --sse --port 8810", styles["CO"]))
+story.append(Paragraph("python services/host-exec/server.py --sse --port 8808", styles["CO"]))
+story.append(Paragraph("python services/sub-agents/server.py --sse --port 8809", styles["CO"]))
+story.append(Paragraph("python services/forge/server.py --sse --port 8810", styles["CO"]))
 story.append(Spacer(1, 10))
 story.append(Paragraph("Access the UI at <b>http://localhost:3080</b>", styles["B"]))
 
@@ -213,8 +213,8 @@ for line in [
     "\u251c\u2500\u2500 Dockerfile.librechat        # LibreChat + Python + tool deps",
     "\u251c\u2500\u2500 librechat.yaml              # Config, MCP servers, system prompt",
     "\u251c\u2500\u2500 .env / .env.example         # API keys",
-    "\u251c\u2500\u2500 pii-proxy/                  # PII redaction gateway (Presidio)",
-    "\u251c\u2500\u2500 mcp-tools/",
+    "\u251c\u2500\u2500 agent-proxy/                  # PII redaction gateway (Presidio)",
+    "\u251c\u2500\u2500 services/",
     "\u2502   \u251c\u2500\u2500 filesystem/server.py    # 14 tools",
     "\u2502   \u251c\u2500\u2500 code-exec/server.py     # 2 tools",
     "\u2502   \u251c\u2500\u2500 web/server.py           # 3 tools",

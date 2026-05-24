@@ -284,7 +284,7 @@ if __name__ == "__main__":
     results["health"] = test_health()
     if not results["health"]:
         print("\n✗ TCMM not running — cannot continue. Start it with:")
-        print("  python mcp-tools/tcmm-service/server.py --port 8811")
+        print("  python services/tcmm-service/server.py --port 8811")
         exit(1)
 
     results["pre_request"] = test_pre_request()

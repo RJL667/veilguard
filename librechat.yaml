@@ -92,6 +92,14 @@ endpoints:
     - name: "xAI"
       apiKey: "${XAI_API_KEY}"
       baseURL: "http://pii-proxy:4000/xai/v1"
+      # 2026-05-14: forward LibreChat's canonical conv UUID to the proxy on
+      # every xAI request, so TCMM treats Grok turns and Anthropic turns of
+      # the same chat as ONE session. Without this, the proxy falls back to
+      # hash(user_id, first_msg) and produces a different conv_id — splitting
+      # memory and breaking prompt cache when the user toggles models mid-chat.
+      headers:
+        x-conversation-id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+        x-user-id: "{{LIBRECHAT_USER_ID}}"
       models:
         # Keep curated; do NOT fetch from upstream because xAI's real
         # /v1/models returns the full catalogue (grok-imagine, 4.20
@@ -179,6 +187,17 @@ mcpServers:
     command: python
     args:
       - "/app/mcp-tools/web/server.py"
+
+  # Veilguard MCP: search_memory + traverse_memory — TCMM-backed
+  # tools exposed via the dedicated MCP server on host:8812.
+  # Calls through to tcmm-service (:8811) /search and /traverse routes.
+  veilguard:
+    type: sse
+    url: "http://host.docker.internal:8812/sse"
+    headers:
+      x-conversation-id: "{{LIBRECHAT_BODY_CONVERSATIONID}}"
+      x-user-id: "{{LIBRECHAT_USER_ID}}"
+
 
   # ─── SharePoint connector — OAuth-aware SSE transport ────────────────
   #

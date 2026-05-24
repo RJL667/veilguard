@@ -32,12 +32,17 @@ services:
       - WORKSPACE_ROOT=/workspace
     volumes:
       - ./librechat.yaml:/app/librechat.yaml
-      - ./mcp-tools:/app/mcp-tools
+      # Note: librechat.yaml mcpServers section references /app/mcp-tools/
+      # (matches VM).  We mount our renamed `services/` dir to that path
+      # so the existing config keeps working unchanged.
+      - ./services:/app/mcp-tools
       - ./workspace:/workspace
       - librechat-images:/app/client/public/images
       - librechat-logs:/app/api/logs
-      # Custom Veilguard frontend (built from librechat-src fork)
-      - ./librechat-src/client/dist:/app/client/dist
+      # DELIBERATELY NOT mounting ./librechat-src/client/dist:/app/client/dist —
+      # see memory `architecture_librechat_fork`.  The host dist is stale
+      # and shadows the image's baked client (cyber.css + index.html link).
+      # Cyber theme is now baked into the image via Dockerfile.librechat.
       # Custom Veilguard backend routes (authenticated proxy for the
       # client-daemon install flow).  Only the specific files we added
       # or modified — mounting the whole api/ directory would shadow
@@ -67,7 +72,7 @@ services:
 
   # === Admin Dashboard (read-only ops console) ===
   admin:
-    build: ./mcp-tools/admin-dashboard
+    build: ./services/admin-dashboard
     ports:
       - "8820:8820"
     depends_on:
@@ -88,7 +93,7 @@ services:
       - ADMIN_PORT=8820
     volumes:
       # Bind-mount source so edits hot-reload without rebuild
-      - ./mcp-tools/admin-dashboard:/app
+      - ./services/admin-dashboard:/app
       # Lance directory (TCMM + PII audit live here). Mounted RW because
       # lancedb's `connect()` opens version + lock files even on a
       # read-only query — :ro causes "Read-only file system" errors.
@@ -100,9 +105,67 @@ services:
       - /proc:/host/proc:ro
     restart: unless-stopped
 
-  # === Veilguard PII Gateway (FastAPI + Presidio) ===
+  # === Veilguard Agent Runtime (FastAPI + Claude Agent SDK) ===
+  # Embedded SDK runtime that owns the LLM-tool-LLM loop for
+  # Anthropic-bound conversations.  pii-proxy routes Anthropic calls
+  # here (instead of going direct) when the request is multi-agent-aware.
+  # Other providers (OpenAI, Gemini, xAI) keep going direct via pii-proxy.
+  agent-runtime:
+    build: ./agent-runtime
+    ports:
+      - "5000:5000"
+    # Same host-gateway pattern as pii-proxy / admin so TCMM (running
+    # on the host) and sub-agents (also host) are reachable.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Hot-reload during dev; bake into image for prod.
+      - ./agent-runtime/app:/app/app
+      # Persona files + CONSTITUTION.md — same dir LibreChat / sub-agents
+      # see via different mounts.  Mounted read-only here; user edits
+      # happen via the sidebar or direct file edit, never from inside
+      # this container.
+      - ./agents:/app/agents:ro
+      - ./logs:/app/logs
+      # Lance dir for the new decision-ledger tables (agent_tasks,
+      # task_proposals, etc.) AND the shared pii_audit table.  Must be
+      # writable; agent-runtime must run as the same OS user that owns
+      # the dir (typically rudol on prod VM — see memory:
+      # architecture_lance_index_perms for the catastrophe pattern).
+      - ./tcmm-data:/tcmm-data
+    env_file:
+      - .env
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_API_URL=${ANTHROPIC_API_URL:-https://api.anthropic.com}
+      - AGENT_RUNTIME_PORT=5000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - TCMM_ENABLED=${TCMM_ENABLED:-true}
+      - TCMM_URL=${TCMM_URL:-http://host.docker.internal:8811}
+      - SUB_AGENTS_URL=${SUB_AGENTS_URL:-http://host.docker.internal:8809}
+      - VEILGUARD_INTERNAL_SECRET=${VEILGUARD_INTERNAL_SECRET:-}
+      - AGENTS_DIR=/app/agents
+      - LEDGER_DB_PATH=/tcmm-data/veilguard/tcmm.db
+      - VEILGUARD_AUDIT_DB_PATH=${VEILGUARD_AUDIT_DB_PATH:-/tcmm-data/veilguard/tcmm.db}
+      - CACHE_TTL_DEFAULT=${CACHE_TTL_DEFAULT:-1h}
+      - APPROVAL_TIMEOUT_S=${APPROVAL_TIMEOUT_S:-120}
+      - APPROVAL_FAIL_CLOSED=${APPROVAL_FAIL_CLOSED:-true}
+    restart: always
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # === Veilguard Agent Proxy (was: PII Gateway; renamed 2026-05-23) ===
+  # Source dir renamed pii-proxy/ → agent-proxy/ when the LibreChat
+  # entry point moved to ChatAgent-based routing.  Docker service NAME
+  # kept as `pii-proxy` so internal Docker network DNS
+  # (http://pii-proxy:4000 from librechat.yaml etc.) still resolves
+  # without touching every consumer.
   pii-proxy:
-    build: ./pii-proxy
+    build: ./agent-proxy
     ports:
       - "4000:4000"
     # Same reason as api: TCMM_URL points at host.docker.internal:8811
@@ -110,7 +173,7 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      - ./pii-proxy/app:/app/app
+      - ./agent-proxy/app:/app/app
       - ./logs:/app/logs
       # Mount the TCMM Lance directory so audit_db.py can write to the
       # pii_audit table alongside TCMM's archive/sparse/dream tables.
@@ -118,6 +181,25 @@ services:
       # this container — but we share the on-disk store so ops only
       # has to back up one directory for both services.
       - ./tcmm-data:/tcmm-data
+      # 2026-05-24 [PR #5a]: when VEILGUARD_USE_CHAT_AGENT=1 the new
+      # handler at app/chat_agent_handler.py needs the agent/llm/pii
+      # packages importable.  Mount them next to /app so the handler's
+      # sys.path probe (parents[2] = /app/..  → /) sees them.
+      # Also mount TCMM root for AnthropicAdapter's sys.path import.
+      - ./agent:/agent
+      - ./llm:/llm
+      - ./pii:/pii
+      # TCMM root for AnthropicAdapter — read-only since the proxy
+      # never writes there.  Override TCMM_ROOT env if your local
+      # tree lives somewhere else.
+      - ~/.gemini/antigravity/tcmm/TCMM:/opt/tcmm:ro
+      # Claude OAuth credentials — read-only.  The TCMM adapter checks
+      # CLAUDE_CREDENTIALS_PATH (defaults to ~/.claude/.credentials.json)
+      # and refreshes the access_token in place when needed.  We mount
+      # the directory (not just the file) so the adapter's atomic
+      # `.tmp → .credentials.json` rename works.  RO here means refresh
+      # won't persist to disk, but the in-process bearer is still used.
+      - ~/.claude:/root/.claude:ro
     env_file:
       - .env
     environment:
@@ -138,6 +220,17 @@ services:
       # same Lance directory TCMM opens on the host so rows live next
       # to archive / sparse / dream data.
       - VEILGUARD_AUDIT_DB_PATH=${VEILGUARD_AUDIT_DB_PATH:-/tcmm-data/veilguard/tcmm.db}
+      # 2026-05-22: agent-runtime forwarding (Phase 0.1).  When true,
+      # Anthropic-bound requests go to agent-runtime instead of direct.
+      # USER_ALLOWLIST limits rollout (comma-separated user_ids; empty =
+      # all users).  See pii-proxy/app/main.py:_handle_agent_runtime_request.
+      - AGENT_RUNTIME_ENABLED=${AGENT_RUNTIME_ENABLED:-false}
+      - AGENT_RUNTIME_URL=${AGENT_RUNTIME_URL:-http://agent-runtime:5000}
+      - AGENT_RUNTIME_USER_ALLOWLIST=${AGENT_RUNTIME_USER_ALLOWLIST:-}
+      - AGENT_RUNTIME_DEFAULT_AGENT=${AGENT_RUNTIME_DEFAULT_AGENT:-director}
+    depends_on:
+      agent-runtime:
+        condition: service_started
     restart: always
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health')"]
