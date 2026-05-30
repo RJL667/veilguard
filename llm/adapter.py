@@ -134,6 +134,83 @@ class AdapterResult:
     model: str = ""
 
 
+def _ensure_setup_token_on_disk() -> bool:
+    """If VEILGUARD_CLAUDE_OAUTH_TOKEN is set, write it into the disk
+    credentials file with a far-future expiresAt so TCMM's adapter uses
+    it directly and never tries to refresh.
+
+    `claude setup-token` produces a long-lived bearer that does NOT
+    auto-rotate the way the regular OAuth refresh does — so the
+    Claude-Code-on-the-desktop / disk-stale-refresh-token race that
+    keeps breaking the SSO path goes away.
+
+    Returns True if the token was written (or already in place), False
+    if no env var is set (caller falls through to TCMM's normal
+    disk-read + refresh).
+    """
+    env_tok = os.environ.get("VEILGUARD_CLAUDE_OAUTH_TOKEN", "").strip()
+    if not env_tok:
+        return False
+
+    import json, time
+    from pathlib import Path
+
+    creds_path = Path(
+        os.environ.get(
+            "CLAUDE_CREDS_PATH",
+            str(Path.home() / ".claude" / ".credentials.json"),
+        )
+    )
+    # Far-future expiry (10 years) so TCMM's needs_refresh check is
+    # always False — bypasses the refresh path entirely.
+    far_future_ms = int((time.time() + 10 * 365 * 86400) * 1000)
+    payload = {
+        "claudeAiOauth": {
+            "accessToken": env_tok,
+            # Keep any existing refreshToken so we don't lose it if the
+            # user reverts to the OAuth path later.
+            "refreshToken": env_tok,   # placeholder; refresh never runs
+            "expiresAt": far_future_ms,
+            "scopes": [
+                "user:profile", "user:inference",
+                "user:sessions:claude_code", "user:mcp_servers",
+                "user:file_upload",
+            ],
+            "subscriptionType": "max",
+            "_source": "VEILGUARD_CLAUDE_OAUTH_TOKEN env",
+        }
+    }
+    # Preserve other top-level keys if the file already exists.
+    if creds_path.exists():
+        try:
+            with creds_path.open("r", encoding="utf-8") as f:
+                existing = json.load(f)
+            # If disk already has THIS exact env token, leave alone.
+            disk_at = (existing.get("claudeAiOauth") or {}).get("accessToken")
+            if disk_at == env_tok:
+                return True
+            for k, v in existing.items():
+                if k != "claudeAiOauth":
+                    payload[k] = v
+        except Exception:
+            pass
+
+    creds_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = creds_path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    tmp.replace(creds_path)
+    try:
+        os.chmod(creds_path, 0o600)
+    except OSError:
+        pass
+    logger.info(
+        f"[adapter] wrote VEILGUARD_CLAUDE_OAUTH_TOKEN to {creds_path} "
+        f"(expires_at=+10y)"
+    )
+    return True
+
+
 class AnthropicAdapter:
     """Cleaner interface over TCMM's AnthropicGenerationAdapter.
 
@@ -152,6 +229,10 @@ class AnthropicAdapter:
         tools: Optional[list[dict]] = None,
         agent_id: str = "",   # ignored; matches ScriptedAdapter signature
     ):
+        # If the operator supplied a long-lived bearer via env, write
+        # it to the disk creds file so TCMM's adapter picks it up.
+        # Avoids the recurring Claude-Code-rotates-refresh-token race.
+        _ensure_setup_token_on_disk()
         """
         Args:
           model: e.g. "claude-sonnet-4-5".  Aliases like "sonnet" do

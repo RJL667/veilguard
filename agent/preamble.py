@@ -1,24 +1,24 @@
-"""Veilguard system preamble — vendored from agent-proxy/app/main.py.
+"""Veilguard system preamble — tool-agnostic, byte-stable.
 
-Single source of truth.  Every Agent subclass calls `render_preamble(
-tools)` to build the system preamble that goes into the cached prefix.
+Single source of truth.  Every Agent subclass calls
+`render_preamble()` to build the system preamble that goes into the
+cached prefix.  The preamble does NOT inline tool schemas; tools are
+pinned separately via TCMM's /pin/tool_definitions (one immutable
+block per tool, dedup by fingerprint).  This means:
+  - One cache slot for the entire Veilguard frame across all
+    personas / variants.
+  - Tool changes invalidate exactly one tool block — not the whole
+    preamble.
+  - TCMM's live_blocks doesn't grow per-persona variant of the
+    preamble.
 
-Why it lives here (not in pii-proxy):
-  Per the design redo, the Agent class owns the LLM pipeline.  Each
-  agent's preamble + tools should be pinned to TCMM by that agent's
-  `prepare_session()` hook — not by the proxy.  This module gives
-  every Agent subclass the same well-formed preamble; the only
-  per-agent variability is the tool schemas (which the renderer
-  injects at the {TOOL_SCHEMAS_JSON} placeholder).
-
-The template comes verbatim from agent-proxy/app/main.py's
-_VEILGUARD_PREAMBLE_TEMPLATE.  Kept in sync by re-pasting if the proxy
-edits it; eventually the proxy will import from here.
+The template was vendored verbatim from agent-proxy/app/main.py's
+_VEILGUARD_PREAMBLE_TEMPLATE; eventually the proxy will import from
+here.
 """
 
 from __future__ import annotations
 
-import json
 from typing import Optional
 
 
@@ -137,24 +137,25 @@ _VEILGUARD_PREAMBLE_TEMPLATE = (
     "your first interaction with a new user, in which case you rely entirely "
     "on the current user turn in the messages array.\n\n"
 
-    # Section 4 — actual callable tool schemas injected from
-    # the LibreChat-supplied data["tools"] at pin time. The
-    # ``{TOOL_SCHEMAS_JSON}`` placeholder is resolved by
-    # _render_preamble_with_tools() before pinning so the
-    # cached prefix already contains the actual schemas.
+    # Section 4 — tools surface.  We DO NOT inline the schemas here.
+    # Tool definitions are pinned separately via TCMM's
+    # /pin/tool_definitions endpoint (one IMMUTABLE block per schema,
+    # priority_class="SYSTEM", dedup by fingerprint).  Anthropic also
+    # receives them natively in the `tools` request field.  Keeping the
+    # preamble tool-agnostic means a tool-schema tweak invalidates
+    # exactly one pinned block — not the whole preamble's cache slot —
+    # and TCMM's live_blocks doesn't grow per-persona variant.
     "## 4. AVAILABLE TOOLS\n\n"
 
-    "Tools below are the ONLY callable surface for this turn. "
-    "Each is also delivered as a proper ``tool`` entry in the "
-    "Anthropic ``tools`` field of this request — schemas are "
-    "duplicated here only so you can read them in context.\n\n"
-
-    "{TOOL_SCHEMAS_JSON}\n\n"
+    "Callable tools for this turn arrive as ``tool`` entries in the "
+    "Anthropic ``tools`` request field, AND as IMMUTABLE blocks at "
+    "the top of this rendered context (source=tool_def). Treat that "
+    "set as the ONLY callable surface.\n\n"
 
     "**Discipline:** never claim an action completed unless you "
     "actually emitted the matching ``tool_use`` block in this "
-    "same response. If the tool you need is not in the list "
-    "above, say so and stop — do not invent tool names.\n\n"
+    "same response. If the tool you need is not in the list above, "
+    "say so and stop — do not invent tool names.\n\n"
 
     "## 5. MEMORY BLOCK SEMANTICS\n\n"
 
@@ -379,40 +380,23 @@ _VEILGUARD_PREAMBLE_TEMPLATE = (
 
 
 def render_preamble(tools: Optional[list[dict]] = None) -> str:
-    """Build the Veilguard preamble with `tools` schemas substituted in.
+    """Build the Veilguard preamble — tool-agnostic.
 
-    Args:
-      tools: Anthropic-shape tool schemas (name, description,
-        input_schema).  Pass None or [] to render "No tools attached
-        to this request." in the AVAILABLE TOOLS section.
+    The ``tools`` parameter is retained for ABI compatibility (callers
+    still pass it) but is IGNORED.  Tool schemas are no longer inlined
+    into the preamble bytes — they get pinned separately via TCMM's
+    /pin/tool_definitions endpoint and arrive natively in Anthropic's
+    ``tools`` request field.  Keeping the preamble tool-agnostic gives
+    one stable cache slot for the entire Veilguard frame, regardless
+    of which persona / tool variant is on the wire.
 
-    Returns:
-      The full preamble string, ready to pin to TCMM via
-      pin_system_prompt(kind="veilguard_preamble").
-
-    Cache-stability: identical (tools, template) input → identical
-    output bytes.  Tool ordering matters — pass tools in a stable order
-    so the cached prefix doesn't churn turn-over-turn.
+    Cache-stability: byte-for-byte identical across all callers and
+    turns.  Pin once, hit forever.
     """
-    if not tools or not isinstance(tools, list):
-        rendered = "No tools attached to this request."
-    else:
-        lines: list[str] = []
-        for t in tools:
-            if not isinstance(t, dict):
-                continue
-            try:
-                lines.append(
-                    json.dumps(t, ensure_ascii=False, separators=(",", ":"))
-                )
-            except Exception:
-                continue
-        rendered = "\n".join(lines) if lines else (
-            "No tools attached to this request."
-        )
-    return _VEILGUARD_PREAMBLE_TEMPLATE.replace(
-        "{TOOL_SCHEMAS_JSON}", rendered,
-    )
+    # Note: signature still accepts `tools` so we don't have to chase
+    # every caller in lockstep; the arg is documented as IGNORED.
+    _ = tools  # explicitly silence linters
+    return _VEILGUARD_PREAMBLE_TEMPLATE
 
 
 __all__ = [

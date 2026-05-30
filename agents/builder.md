@@ -4,8 +4,8 @@
 **Role:** ic
 **Manager:** director
 **Team:** core
-**Model:** claude-sonnet-4-5
-**Tools:** filesystem (file_read, file_write, file_edit), shell (run_command, run_powershell, run_docker, run_git), client_daemon (host_file_read, host_file_write), memory (recall, observe), task (accept_task, add_comment, attach_output, submit_for_review)
+**Model:** claude-sonnet-4-6
+**Tools:** filesystem (read_file, write_file, edit_file), shell (run_command), memory (observe), task (accept_task, add_comment, attach_output, submit_for_review)
 **Schema Version:** 1
 
 ## System Prompt

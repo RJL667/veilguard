@@ -262,6 +262,102 @@ def test_cache_control_preserved_into_adapter(fake_tcmm_adapter, stub_tcmm_http)
     assert cc, f"cache_control dropped: {init_blocks}"
 
 
+def test_haiku_cache_floor_preamble_inlined_when_prefix_short(
+    fake_tcmm_adapter, stub_tcmm_http,
+):
+    """[HAIKU_CACHE_FLOOR_INLINE_PREAMBLE_2026_05_28] regression test.
+
+    The empirical Haiku 4.5 cache floor is ~6000 tokens.  When a cold
+    conversation has only the magic prefix + persona in the system
+    blocks (< 12000 chars ≈ 3000 tokens), `Agent.run_turn` should inline
+    the `_VEILGUARD_PREAMBLE_TEMPLATE` between the magic prefix and the
+    rest so the cached prefix clears the floor.
+    """
+    # TCMM stub returns ONLY the magic prefix as a block — simulates a
+    # cold conversation with no memory yet.
+    stub_tcmm_http["render_response"]["blocks"] = [
+        {"type": "text",
+         "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+    ]
+
+    from agent import ChatAgent, TurnContext
+
+    chat = ChatAgent(model="claude-haiku-4-5", client_tools=[])
+    ctx = TurnContext(
+        conversation_id="conv-cold", user_id="u-1", tenant_id="t-1",
+    )
+    asyncio.run(_drain(chat, [{"role": "user", "content": "hi"}], ctx))
+
+    import importlib
+    mod = importlib.import_module("adapters.anthropic_adapter")
+    captured = mod.get_captured()
+    init_blocks = captured["init"]["system_blocks"]
+    assert init_blocks is not None
+
+    total_chars = sum(
+        len(b.get("text", "")) for b in init_blocks
+        if isinstance(b, dict) and b.get("type") == "text"
+    )
+    # After inlining we expect well over the 12000-char threshold.
+    # The Veilguard preamble alone is ~17000 chars; plus magic + persona.
+    assert total_chars > 12000, (
+        f"preamble was not inlined despite short prefix; "
+        f"total system chars={total_chars}, expected > 12000"
+    )
+
+    # Magic prefix must STILL be block 0 (Anthropic attribution gate
+    # depends on this ordering).
+    assert init_blocks[0]["text"].startswith(
+        "You are a Claude agent"
+    ), "magic prefix must remain at block[0] after inlining"
+
+
+def test_haiku_cache_floor_preamble_NOT_inlined_when_prefix_already_fat(
+    fake_tcmm_adapter, stub_tcmm_http,
+):
+    """The inline-preamble fix MUST NOT double-up on warm conversations.
+
+    When TCMM already returns a fat memory-rendered prefix (≥12000
+    chars), we skip inlining — TCMM's pinned content is already there
+    and inlining would duplicate bytes + risk cache invalidation
+    against pii-proxy paths that see only the pinned version.
+    """
+    # Give TCMM a fat response — simulates a warm conv with memory.
+    stub_tcmm_http["render_response"]["blocks"] = [
+        {"type": "text",
+         "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+        # 12000+ chars of "memory" content to clear the threshold.
+        {"type": "text",
+         "text": "Past memory: " + ("filler context " * 1000)},
+    ]
+    from agent import ChatAgent, TurnContext
+
+    chat = ChatAgent(model="claude-haiku-4-5", client_tools=[])
+    ctx = TurnContext(
+        conversation_id="conv-warm", user_id="u-1", tenant_id="t-1",
+    )
+    asyncio.run(_drain(chat, [{"role": "user", "content": "hi"}], ctx))
+
+    import importlib
+    mod = importlib.import_module("adapters.anthropic_adapter")
+    captured = mod.get_captured()
+    init_blocks = captured["init"]["system_blocks"]
+
+    # The Veilguard preamble template starts with a recognisable line —
+    # check it's NOT in any block (excluding the persona at the tail,
+    # which is a different string).
+    from agent.preamble import _VEILGUARD_PREAMBLE_TEMPLATE
+    preamble_head = _VEILGUARD_PREAMBLE_TEMPLATE[:80]
+    preamble_inlined = any(
+        isinstance(b, dict) and preamble_head in b.get("text", "")
+        for b in init_blocks
+    )
+    assert not preamble_inlined, (
+        "preamble was inlined even though the TCMM-rendered prefix was "
+        "already fat enough; this duplicates bytes and risks cache miss"
+    )
+
+
 def test_side_channel_skips_tcmm(fake_tcmm_adapter, stub_tcmm_http):
     """LibreChat title-gen / summary calls must NOT hit TCMM."""
     from agent import ChatAgent, TurnContext

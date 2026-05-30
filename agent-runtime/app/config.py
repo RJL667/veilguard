@@ -7,9 +7,12 @@ Default values match docker-compose.yml so a bare `docker compose up`
 works without an .env file (for dev).  Production overrides via .env.
 """
 
+import logging
 import os
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("agent-runtime.config")
 
 
 def _env(key: str, default: str = "") -> str:
@@ -108,9 +111,24 @@ def validate() -> list[str]:
     readable message rather than crashing later on a real request.
     """
     errors: list[str] = []
-    if not ANTHROPIC_API_KEY:
+    # ANTHROPIC_API_KEY was required by the legacy SDK path.  BACKEND=live
+    # uses TCMM's AnthropicGenerationAdapter (OAuth bearer via the
+    # long-lived setup-token written to ~/.claude/.credentials.json),
+    # so the API key is no longer needed in the default path.  We only
+    # warn now — not a fatal error — so /health stays green when the
+    # bearer is in place.
+    backend_name = os.environ.get("BACKEND", "live").lower()
+    if backend_name == "live":
+        # Live path uses OAuth bearer; API key not needed.
+        if not ANTHROPIC_API_KEY:
+            logger.info(
+                "[config] ANTHROPIC_API_KEY unset — fine for BACKEND=live "
+                "(OAuth bearer path)."
+            )
+    elif not ANTHROPIC_API_KEY:
         errors.append(
-            "ANTHROPIC_API_KEY is unset — agent-runtime cannot reach the SDK"
+            f"ANTHROPIC_API_KEY is unset and BACKEND={backend_name!r} "
+            "requires it"
         )
     if not AGENTS_DIR.exists():
         errors.append(

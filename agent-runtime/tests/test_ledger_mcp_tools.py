@@ -66,8 +66,15 @@ class TestToolMetadata:
         assert {"owner_id", "brief", "deliverable_spec"} <= required
 
     def test_tool_count(self):
-        # 4 Director + 6 IC + 1 Critic (review_decision) = 11
-        assert len(_ALL_TOOLS) == 11
+        # Director:        create_task, assign_task, convert_proposal,
+        #                  shelve_proposal, defer_proposal, list_proposals,
+        #                  list_lessons_for_review                 = 7
+        # IC:              accept_task, add_comment, attach_output,
+        #                  submit_for_review, get_task, inbox       = 6
+        # Critic:          review_decision                          = 1
+        # Phase 7.5 teams: create_team, list_teams, team_cost_report = 3
+        # Total                                                      = 17
+        assert len(_ALL_TOOLS) == 17
 
 
 class TestFailClosedWithoutContext:

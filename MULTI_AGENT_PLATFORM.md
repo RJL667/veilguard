@@ -377,6 +377,9 @@ Non-negotiables extracted from the critic pass and existing-regression memory.
 - **Reuse existing primitives.** Agent identity = extension of `agents/*.md`. Persistent agents = renaming the daemons mechanism + adding identity. Workspace = a dir convention. Inter-agent messaging = A2A protocol (don't build a bespoke RPC).
 - **Honor existing user memory + project constraints.** The `feedback_no_worktrees` memory entry says: "work directly in canonical paths; never `isolation:"worktree"`." Earlier drafts violated this with a worktree-per-agent mandate; corrected in §3.5. The general rule: if a memory entry contradicts a spec choice, the memory wins unless the spec explicitly justifies an exception.
 - **`source_kind` is set by the tool, never by the agent.** Agent prose cannot influence its own provenance class. `fetch()` always stamps `source_kind=TOOL_RESULT`. User-conversation observe always stamps `source_kind=USER` (verified via `x-user-id` header at pii-proxy). Agent observe is hard-coded to a per-agent class (e.g., `AGENT_RESEARCHER` or `extracted_by=agent:<aid>` with `source_kind=INFERRED`). Any attempt to overwrite from agent prose is rejected server-side. This closes the prompt-injection provenance-laundering hole.
+- **Tasks transform state; conversations are scaffolding.** *(Added 2026-05-27 in response to external review.)* The dominant workload of this system must be agents producing observable state mutations — ledger writes, memory writes, artifact creation, approval responses, dream node updates — not agents narrating to each other. Any feature whose primary observable is "more messages exchanged between agents" gets architectural skepticism. The canonical failure mode of public multi-agent platforms (Auto-GPT, BabyAGI) is collapse into expensive self-narration: ~70-80% of tokens spent on "I should think about what I just thought about," near-zero artifact production. **Operationalised** by the Artifact Production Ratio (APR) metric and a Phase 6 circuit breaker (§3 — memory write-path discipline + Phase 6.7) that pauses agent-to-agent calls when APR drops below a healthy band. The principle is observable, not aspirational: if APR < 0.1 sustained over 30 minutes, the system is talking to itself and gets halted automatically.
+- **TCMM is the knowledge-graph substrate; the ledger is the state machine.** *(Added 2026-05-27 after the 2-iteration TCMM-unification panel.)* Content that contributes to the knowledge graph — agent reasoning, lessons, outcome narratives, proposal rationales, observed claims — lives in TCMM, where it earns concept_gravity, bridge_score, and contradiction detection. Operational state — task status, leases, hash-chained audit, alignment weights, secrets, approval records, settings — lives in the ledger, where it gets exact lookups, atomic transitions, hash-chain integrity, and never-compress guarantees. **TCMM observations may reference ledger PKs (cross-ref pointers in `extras.entity_id`) but must never mirror ledger fields** (status, decided_at, cost, approval state). Never dual-write operational state to TCMM — the sync overhead doesn't earn a recall benefit you can't get from FTS over the ledger's content columns. Migrate only knowledge-graph contributors. This rule aligns Veilguard with the universal pattern across Magentic-One (Task Ledger vs working memory), MemGPT/Letta (main/recall/archival hierarchy), Cognition Devin ("decisions an agent commits to must be reconstructible exactly — RAG is unsafe for that"), Anthropic Multi-Agent Research (Jun 2025 lead-plan vs subagent findings), and the entire event-sourcing literature (Kafka, Datomic, EventStore — one-way projection, never bidirectional).
+- **Every subsystem must justify itself via measurable operational leverage.** *(Added 2026-05-27 in response to an external "conceptual overfitting" critique.)* APR (Phase 6.7) measures the system's overall artifact-vs-narration discipline. This principle is the per-subsystem counterpart: any subsystem — `proposal_taxonomies`, `stance_arcs`, `reflective_heuristics`, `regret_weighting`, future additions — must be defensible against a concrete operational question: *"What measurable outcome moves when this subsystem is on vs off?"* If the answer is qualitative ("it makes recall richer") or unfalsifiable ("the dream graph would be less expressive"), the subsystem is decoration, not infrastructure. Existing subsystems get audited under this rule at the Phase 6 post-mortem; new subsystems must pass it before merging. The architecture has reached a level of philosophical elegance where preserving abstractions because they're beautiful is now the dominant failure mode — this principle is the guardrail. Mechanical enforcement: every subsystem in `agent-runtime/app/` is named in a `tests/SUBSYSTEM_ROI.md` companion file with its specific metric, its on/off measurement, and the threshold below which it's a candidate for removal.
 
 ---
 
@@ -528,6 +531,12 @@ Open Q #10 in earlier drafts asked whether dream's bridge_score / concept_gravit
 
 ### 3.4.1 TCMM scoping — typed channels (within the dream-backed substrate)
 
+> **AMENDED 2026-05-29 — authoritative: [TCMM_CHANNEL_ARCHITECTURE.md](TCMM_CHANNEL_ARCHITECTURE.md).** The typed-channel design below is refined:
+> - **Channel is a first-class block COLUMN + a read-time visibility filter + a recall weight — NOT a substrate partition.** The dream graph stays unified per user; channels are stamped (`channel` on raw blocks, `_channels` owner-qualified token-set on dream nodes) and filtered at the single `get_archive_entry` chokepoint via a swappable `subset` (conservative default) / `intersection` (permissive) policy.
+> - **One dream substrate per collaboration unit (v1 = per `user_id`; tenant = `user_id` is the hard wall).** The slash-form "namespace tree" below is now a set of recall-time VIEWS over that unified per-user graph, selected by `channel` — not separate stores.
+> - **Substrate-wall reality:** there are **~231** dream cross-block loops (not the ~30 estimated) and dream nodes carry no `user_id`, so per-loop guards are infeasible. The protection is the **single-user-per-instance invariant** enforced at `bulk_warm_user_archive` (tripwire), audited by `tests/test_channel_substrate_wall.py`.
+> - **Promotion = re-author** a fresh clean-lineage block (Critic-gated), never flag-flip. **Channel enum** (reconciled with §3.4.2 / §3.11 submission targets): `agent_private, conv, team_drafts, team_events, team_knowledge, user_deliverable, org_blackboard`.
+
 ```
 TCMM namespace tree (after Phase 2):
 
@@ -678,10 +687,19 @@ Not every dream primitive should propose a Task. The split:
 
 | Signal | Status | Implementation |
 |---|---|---|
-| `low_stability_cluster` | Not emitted as a node type today (only `_reason="low_stability_low_rc"` strings in persistence.py) | New emitter stage in dream_engine.py |
-| `stale_supersession_chain` | Supersession state exists per-claim, no aggregator emits chain-level signals | New aggregator stage |
+| `low_stability_cluster` | **Shipped 2026-05-27 → verified end-to-end 2026-05-28.** Implemented agent-runtime-side in `agent-runtime/app/proposals/signal_emitters.py` as a scanner over the `archive` table that injects synthetic `LOW_STABILITY_CLUSTER` rows into `dream_archive`. DreamScanner picks them up next cycle. Avoids dream-engine surgery. | `emit_low_stability_clusters()` |
+| `stale_supersession_chain` | **Shipped 2026-05-27 → verified end-to-end 2026-05-28.** Same pattern — scans archive for topic groups whose max(`timestamp`) is older than `STALE_CHAIN_AGE_DAYS` (default 60d) and injects `STALE_SUPERSESSION_CHAIN` synthetic dream rows. | `emit_stale_supersession_chains()` |
 
-Until these emitters ship, proposal generation runs on 5 signal types, not 7.
+End-to-end live verification — see `scripts/verify_signal_emitters.py`. Run from inside the agent-runtime container; seeds the local `archive` with two synthetic clusters (one low-density, one 70 days old), fires `run_one_cycle()`, asserts:
+1. Empty-archive guard short-circuits without log noise on a 0-row archive.
+2. `emit_low_stability_clusters` writes exactly 1 LOW_STABILITY_CLUSTER row to `dream_archive` for the seeded low-density cluster.
+3. `emit_stale_supersession_chains` writes exactly 1 STALE_SUPERSESSION_CHAIN row for the seeded stale cluster.
+4. Re-running the cycle on unchanged data emits 0 (idempotency — both emitters check `dream_archive` for an existing same-topic synthetic node per user_id).
+5. `DreamScanner._scan_once()` picks up both synthetic rows, computes `signal_impact × objective_alignment > 0`, and writes a `task_proposal` row per user-signal combination (verified: TOTAL +19 over a scan with 19 candidate dream rows when per-signal cap raised; per-user delta +2 = 1 low_stab + 1 stale_chain).
+
+**Latent bug surfaced + fixed during verify run (2026-05-28).** The emitter's `_scan_topics()` called `tbl.search().select(["aid", …])` directly. On an empty `archive` table (local dev or a freshly-provisioned tenant), Lance raises `SchemaError: No field named aid` and the worker logged a WARNING every 24h cycle indefinitely. Patched: short-circuit if `tbl.count_rows() == 0` or the schema lacks `aid`/`topics` fields. See `[EMPTY_ARCHIVE_GUARD_2026_05_28]` comment in `signal_emitters.py:_scan_topics`.
+
+Phase 3 proposal generation now runs on all 7 signal types as intended; the original "5 signal types, not 7" footnote is retired.
 
 **Non-generative** (shape recall, don't propose action): `causal_arc`, `semantic_principle`, `narrative_arc`, `identity_*`, `motif_node`, `belief_attribution`, `concept_node`.
 
@@ -744,7 +762,9 @@ Three stacking caps:
 
 #### 3.7.4 Dedup, recurrence, carry-over
 
-Candidate keyed on `(signal_type, sorted(signal_node_ids))`. Same key re-triggering increments `recurrence_count` and refreshes `last_surfaced_ts`; no duplicate row created.
+Candidate keyed on `(tenant_id, user_id, signal_type, sorted(signal_node_ids))`. Same key re-triggering increments `recurrence_count`, refreshes `last_surfaced_ts`, and floors `decay_score` to `max(existing_decay, new_impact_score)`; no duplicate row created.
+
+**Implementation state.** Shipped 2026-05-28 — `ledger.proposals.create_proposal` performs the dedup-check at write time. Until 2026-05-28 the spec contract was correct but the writer didn't enforce it (every re-emission was a new row); the dream_scanner's in-memory `_seen_keys` provided a single-process workaround but reset on container restart, allowing the audit table to fill with structurally-identical rows. The Phase-3 dedup now runs in the storage layer: on a SHELVED status the dedup releases (a user-shelved signal that re-emerges deserves a new surfacing). Cross-tenant collisions are impossible — the key includes `(tenant_id, user_id)`. Anchor: `[PROPOSAL_DEDUP_2026_05_28]` in `agent-runtime/app/ledger/proposals.py:create_proposal`. Regression tests at `app/ledger/tests/test_proposal_dedup.py`.
 
 - **Decay:** deferred candidates' impact decays 0.9× per cycle until either re-triggered (impact recomputed fresh) or below floor → auto-shelved with reason `aged_unaddressed`.
 - **TTL:** 7 days. Stale candidates auto-expire with reason `expired_ttl`.
@@ -1200,6 +1220,58 @@ All on the existing Daemons-tab infrastructure. No LibreChat fork changes.
 
 The deeper benefit: a user looking at "what is this system doing about topic X" gets a unified timeline across proposals→tasks→outcomes→lessons. That's the lineage view, free from the shared skeleton.
 
+#### 3.10.5 Sidebar surface — concrete endpoints (Phase 3/4 ship state)
+
+*Added 2026-05-28 — closes out the sidebar-tab specification.* The §3.10.4 description is the conceptual view; this subsection pins down the wire contract so the LibreChat fork's `useVeilguardAPI.ts` hook and the four sidebar tabs are implementable without re-reading the code.
+
+**Auth.** All endpoints expect `tenant_id` + `user_id` as query params (GET) or top-level JSON keys (POST). `VEILGUARD_INTERNAL_SECRET` is checked via the proxy injection middleware — sidebar requests go LibreChat → `pii-proxy:4000/api/veilguard/*` → `agent-runtime:5000/*`. The proxy injects the secret header; the sidebar JS never sees it. Missing tenant/user → 400. Missing secret → 503 cascade (see `architecture_internal_secret_503` memory).
+
+**Push model.** All four tabs open one `EventSource` to `GET /events?tenant_id=…&user_id=…` after their initial GET. Server pushes one SSE message per ledger mutation in that namespace (`proposal_created`, `proposal_status_changed`, `task_created`, `task_status_changed`, `task_comment_added`, `lesson_status_changed`). Heartbeat every 25s. **Polling is the fallback** when EventSource fails — back off to 10s GETs.
+
+| Tab | Initial GET | What it shows | Row actions | Mutator endpoints |
+|---|---|---|---|---|
+| **Proposed Tasks** | `GET /proposals?tenant_id=…&user_id=…&status=pending,deferred&include_escalated=1` | `queue[]` sorted by `decay_score DESC`, plus `emergency[]` (USER×USER contradictions, visual emphasis), plus `escalated[]` (recurrence ≥ 5) | [Approve], [Defer], [Shelve], [Open drill-in] | `POST /proposals/{id}/convert` (Approve), `POST /proposals/{id}/decision` body `{action: defer\|shelve, until?: ts, reason?: str}`, `GET /proposals/{id}` (drill-in) |
+| **Work Items** | `GET /work_items?tenant_id=…&user_id=…[&kind=task,proposal,lesson]` | UNION of `agent_tasks` (status in open/accepted/in_progress/review), `task_proposals` (pending/deferred), and `lessons` due-for-review. Each row tagged `_kind` ∈ {task, proposal, lesson}. Sorted cross-kind by `_sort_ts DESC`; UI re-groups. Optional `?kind=` narrows the UNION server-side (`task`, `proposal`, `lesson`, comma-separated, or `all` / omit for full UNION). | [Open drill-in] dispatches per kind | `GET /tasks/{id}` (task drill-in), `GET /proposals/{id}` (proposal drill-in), no direct mutator — drill-in screens own actions |
+| **Lessons / Review Queue** | `GET /lessons/review_queue?tenant_id=…&user_id=…` | Lessons whose `review_after` has passed (post-M1 cutover: reads from TCMM archive via `memory.lessons_reader.find_lessons_due_for_review`, NOT the dropped `org_memory` Lance table) | [Keep], [Amend], [Retire] | `POST /lessons/{id}/decision` body `{action: keep\|retire, note?: str}`. "Amend" is client-side: edit trigger/rule in modal, then POST `keep` with `note` describing the diff |
+| **Amendment Candidates** *(sub-tab of Lessons)* | `GET /lessons/amendment_candidates?tenant_id=…&user_id=…` | Lessons with `confidence ≥ 0.75` AND `reinforcement_count ≥ 5`. Sorted by confidence DESC. Threshold values returned in response for UI to display. | [Promote to constitution amendment] (manual today; future: amend tool with diff review) | No server mutator today — promotion is a manual operator workflow that edits `CONSTITUTION.md` and writes a `[lesson_amended]` observation to TCMM |
+
+**Caching contract.** Per memory `workflow_admin_dashboard_caching`, sidebar reads MUST go through the 8s TTL `_windowed_rows()` cache pattern on the agent-runtime side — naïve `t.to_arrow()` scans on each refresh murdered the admin dashboard at ~480ms/scan. The cache key is `(endpoint, tenant_id, user_id, rounded_timestamp)`. The unified `/work_items` UNION specifically gets the `work_items_recent` 30-day projection per §3.10.2.
+
+**Latency budget.** Sidebar GET round-trip should be < 400ms warm (≤ 250ms agent-runtime + ≤ 150ms transit). Drill-in GET (`/proposals/{id}`, `/tasks/{id}`) runs Lance reads in `asyncio.to_thread` per the 2026-05-27 fix — without that, an in-flight SSE stream on the same event loop starves the read and the sidebar shows HTTP 502.
+
+**Dependency-tolerant errors.** All sidebar endpoints return `200` with `{error: "…", items: []}` when Lance is unreachable, NOT 500. The sidebar shouldn't go red over a transient ledger hiccup; it should render a "memory layer reconnecting" banner over an empty list. The single exception: a missing `tenant_id`/`user_id` IS 400 (it's a contract violation, not a backend issue).
+
+**Open work** (not blocking Phase 4 ship, listed so the closeout is honest):
+- ~~`lesson_created` / `lesson_status_changed` SSE events are TODO~~ — shipped 2026-05-28. `lesson_created` broadcasts from `phase_7_writers.promote_lesson_to_team_knowledge()` after the TCMM write persists. `lesson_status_changed` broadcasts from `main.lesson_decision()` after the observation lands. Both gated on the upstream write success so a failed write doesn't generate a phantom event. Verified end-to-end + cross-namespace isolation via `scripts/verify_lesson_sse.py`. Anchors: `[LESSON_SSE_2026_05_28]` comment in both call sites.
+- `task_status_changed` events fire today but the EventSource reconnection logic in `useVeilguardAPI.ts` doesn't dedupe events received during reconnect window — possible double-render. Idempotent-render fix on the client side, not server.
+- ~~Cross-kind filter (`/work_items?kind=proposal`) not implemented~~ — shipped 2026-05-28. `?kind=` accepts a comma-separated subset of `{task, proposal, lesson}` (or omit / `all` for the legacy UNION). Bad-kind returns 400 with a helpful error; missing query param defaults to all kinds (no breaking change). Saves one Lance scan per filtered-out kind. Anchor: `[WORK_ITEMS_KIND_FILTER_2026_05_28]` in `main.py:work_items_view`.
+
+### 3.11 Memory write-path discipline (Phase 6 sub-deliverable)
+
+> **AMENDED 2026-05-29 (channel correction).** Every TCMM writer now stamps a `channel` (top-level ingest item field, persisted to the `channel` column); the `_WriterDest` map + regenerated `MEMORY_WRITE_PATHS.md` carry a `channel` column (`agent_private` / `team_knowledge` / `team_events` / `n/a` for ledger-only). Routing is centralised in `observe_agent_output(..., channel=)`. See [TCMM_CHANNEL_ARCHITECTURE.md](TCMM_CHANNEL_ARCHITECTURE.md) §6.
+
+*Added 2026-05-27 in response to external review.* Veilguard's memory topology has ~13 distinct destinations (7 agent-runtime ledger tables + 6 TCMM-side typed channels). The reviewer's concern: as agents start "choosing" memory destinations, entropy rises fast — developers and LLMs both lose track of "where should this thing live?" The fix is not documentation; it's narrowing the write surface.
+
+**Rule.** Agent code does not write directly to a memory destination. Every memory mutation flows through one of 5-7 typed *writer functions* that decide destination internally via declarative rules. Linter blocks direct writes; tests verify each writer's destination contract.
+
+**The writer functions** (target signatures; final names to be confirmed in implementation):
+
+| Writer | Destination(s) it owns | Routing rule |
+|---|---|---|
+| `record_episode(...)` | TCMM `agent/<aid>/observations/<user_id>`, conversation memory | Default for raw observations during a turn |
+| `promote_to_semantic(...)` | TCMM `team/knowledge/`, `org/blackboard/` | Critic-gated; carries `extracted_by`, source_kind, decision_ledger ref |
+| `log_decision(...)` | `agent_tasks`, `task_comments` (SHA-chained), `proposal_outcomes` | Status transitions + review_decisions; never bypassed |
+| `update_org_memory(...)` | `org_memory`, `reflective_heuristics` | Promoted lessons, dream-derived heuristics |
+| `enqueue_dream_input(...)` | `dream_archive` (TCMM-side) | High-importance events crossing TCMM's importance threshold |
+| `record_approval(...)` | `client_tool_approvals`, `client_tool_bypass` | Approval gate decisions only |
+| `attach_artifact(...)` | `agent_tasks.outputs[]`, workspace path under task ownership | Builder outputs; respects workspace isolation (Phase 7) |
+
+**Enforcement.** Lint rule rejects any module under `agent-runtime/app/` or `agent/` that imports a memory-destination client (Lance table handle, TCMM HTTP client, workspace fs writer) outside the writer-function module. Negative-fixture test catches violations.
+
+**Documentation.** The flat `(writer × destination × trigger × transformation)` table is auto-generated from writer function signatures + their destination-routing rules — not hand-maintained. Generated artefact lives at `agent-runtime/docs/MEMORY_WRITE_PATHS.md` and is rebuilt on every Phase-6+ test run. If it falls out of sync with the writers, the test fails — the table cannot rot.
+
+**Note on TCMM vs agent-runtime destinations.** Six of the thirteen destinations (the typed TCMM channels: `agent/<aid>/observations/`, `team/{events,knowledge,drafts}/`, `blackboard/`, derived dream-graph nodes) live in a separate codebase at `~/.gemini/antigravity/tcmm/TCMM/`. Writer functions calling into those destinations cross a process boundary (HTTP to `:8811`) — the writer-function discipline still applies on the agent-runtime side, but the TCMM-side write semantics are governed by TCMM's own `/ingest_turn` contract. See `architecture_tcmm_canonical_path` memory note.
+
 ---
 
 ## 4. The org — concrete agents
@@ -1415,9 +1487,424 @@ The protocol, collaboration, and organizational-learning-maintenance layer.
 
 ### Phase 5 — A2A (external)
 
-- A2A endpoints exposed externally. API-key + (later) OAuth/mTLS.
+- A2A endpoints exposed externally. API-key shipped in 5.0; OAuth + mTLS shipped in 5.1 (this subsection).
 - External agents (e.g. a customer's CrewAI deployment) can delegate Tasks into Veilguard's org. Inverse: Veilguard's Director can delegate to external A2A endpoints.
 - Small effort once Phase 3 internal A2A exists — mostly auth, rate-limiting, and tenant-scoped allow-lists.
+
+#### Phase 5.1 — OAuth/mTLS auth layer for `/external/a2a/*`
+
+*Added 2026-05-28 — closes out the external A2A auth specification.* The base Phase-5 transport (`agent-runtime/app/a2a_external.py`) ships API-key auth bound to a tenant via the Lance-backed `a2a_external_keys` registry. Phase 5.1 layers two additional auth methods on top — OAuth/JWT and mTLS — so customers can plug Veilguard into an existing identity infrastructure without provisioning per-tenant static keys. Implementation lives in `agent-runtime/app/a2a_auth.py:authenticate()`; auth methods are tried in fixed precedence and any one succeeding produces the same tenant-context row shape that the API-key path returns. Downstream call-sites (`/messages`, `/tasks`, `/inbox`) don't know which method authenticated.
+
+**Auth precedence at request time** (strict order — first success wins):
+
+1. **`Authorization: Bearer <jwt>`** → JWT verified via JWKS.
+2. **`X-Client-Cert-Subject: CN=…`** → mTLS cert subject mapped to tenant.
+3. **`X-API-Key: …`** → existing API-key registry lookup.
+
+All three end at the same `a2a_external_keys` row — the row carries the rate-limit + agent allow-list config that downstream gates enforce. JWT/mTLS are *identity binders*; the registry row is the *authorization carrier*. This keeps "who are you" and "what can you do" cleanly separated.
+
+**JWT path.** Operator sets `VEILGUARD_A2A_JWT_JWKS_URL` (PUBLIC keys only — server NEVER holds signing keys), `VEILGUARD_A2A_JWT_AUD`, `VEILGUARD_A2A_JWT_ISS`. The token `aud` claim MUST match the configured audience, `iss` MUST match the issuer, and the tenant-claim (default `sub`, override via `VEILGUARD_A2A_JWT_TENANT_CLAIM`) is used to look up the registry row by `tenant_id`. JWKS is cached 5 min in-process to avoid hitting the IdP on every request. Algorithms accepted: `RS256`, `ES256`, `PS256` — no `HS*` (symmetric → we'd need a shared secret, defeats the JWKS model) and no `none`. PyJWT is the implementation; the codebase carries a `VEILGUARD_A2A_JWT_INSECURE_UNSIGNED=1` dev override that decodes header+payload without signature check — this MUST NEVER be set in prod and the code emits a `WARNING` every call when it is.
+
+**mTLS path.** TLS terminates at the reverse proxy (Caddy / nginx / GCP LB). The proxy sets `X-Client-Cert-Subject: CN=acme-corp,O=Acme,C=ZA` after validating the client cert chain. agent-runtime parses the header, extracts `CN`, and looks up `a2a_external_keys WHERE label = '<CN>' AND status = 'active'`. The TLS layer already verified the chain — we don't need to re-validate the cert here. Operator convention: when issuing an mTLS-bound peer access, set the registry row's `label` field to the CN. Cert rotation = issue new cert with the same CN; revocation = flip `status = 'revoked'`. The TLS terminator config is OUT OF SCOPE for this doc (it's standard nginx/Caddy mTLS) — but it MUST set the header before the request reaches agent-runtime or all mTLS requests 401.
+
+**Defensive defaults — opt-in per gate.** Operator unset → that gate returns `None` and falls through. So a fresh deployment with neither `VEILGUARD_A2A_JWT_JWKS_URL` nor `VEILGUARD_A2A_MTLS_ENABLED` set runs **API-key only** with no behavioural change from Phase 5.0. Turn on what you need; leave the rest off.
+
+**Rejected handshake — what the peer sees.** Any combination of "bearer present but JWT verify fails" / "mTLS header present but CN unknown" / "API key present but hash mismatch or revoked" → `401 Unauthorized` with `{error: "auth_failed"}`. We do NOT distinguish "no JWT presented" from "JWT presented but invalid" in the response (info-leak prevention). We DO log the failed method server-side so an operator can correlate spikes. Rate-limit failures are `429`, not `401` — auth succeeded, quota didn't.
+
+**Audit trail.** Every authenticated request appends to `client_tool_approvals` (today reused; future: dedicated `a2a_external_audit` table) with `auth_method ∈ {jwt, mtls, api_key}`, `tenant_id`, `target_agent_id`, `request_ts`, `outcome`. Failed auths log to the same table with `outcome=auth_failed` so a misconfigured peer is visible without spelunking server logs.
+
+**What this changes vs Phase 5.0.** Nothing user-facing on the rate-limit / allow-list / quota path. Same `a2a_external_keys` row, same enforcement, same `/external/a2a/*` URL surface. The only delta is HOW the caller's identity gets bound to that row. Adding either gate doesn't break existing API-key consumers; removing the API-key gate (operator decision when they're confident in JWT/mTLS coverage) is a separate config flip not addressed here.
+
+**Anchors.**
+- `agent-runtime/app/a2a_auth.py` — `verify_jwt()`, `parse_mtls_subject()`, `mtls_to_tenant()`, `authenticate()`
+- `agent-runtime/app/a2a_external.py` — base API-key flow + `_resolve_key()` (line 81)
+- Env-config block: `_jwt_enabled()`, `_mtls_enabled()`, `_expected_aud()`, `_expected_iss()`, `_tenant_claim_name()` (lines 56-74)
+- Schema: `a2a_external_keys_schema()` — `label` field reused as mTLS CN-binding (line 64)
+
+### Phase 6 — Hierarchical decomposition + acceptance-criteria gating + scaling tiers
+
+The "make critics actually enforce completion + scale past 10 agents" phase. Produced 2026-05-27 by a 2-iteration research panel (Researcher + Evaluator + Critic, then Researcher + Critic adversarial second pass). Each iteration ran in parallel, finished independently, then was synthesised under the framework's own acceptance criteria — i.e. **the plan passes its own gate**.
+
+The animating failure mode this phase closes: *"the LLM declared done halfway, no one noticed, the work shipped."* Every existing mitigation at lower phases — Critic personas, `review_decision` enum, `constraint_violations`, deliverable_spec freeform string — is prompt-level. Phase 6 makes done-gating **structural**: row-level constraints, mechanically-checkable acceptance criteria, server-side critic invariants, and explicit lease semantics so dead workers don't hold work hostage. This is the phase that justifies the org's existence past the demo-toy size.
+
+#### Phase 6.0 — Acceptance criteria framework (the foundation)
+
+Single most important change in this phase. Without it, every other tier-1 deliverable degrades to prompt engineering.
+
+**New column on `agent_tasks`:**
+
+```
+acceptance_criteria: List[Struct{
+  id          string  not null    # "AC-1", monotonic within task
+  statement   string  not null    # human-readable assertion
+  check_kind  string  not null    # enum, see below
+  check_args  string  not null    # JSON, schema depends on check_kind
+  required    bool    not null    # default true
+  rationale   string              # ≤ 280 chars audit-trail
+}>  not null                      # array MUST be non-empty
+```
+
+**`check_kind` enum (7 mechanical, 1 escape hatch — see §6.0.3 for the deferral of `llm_verify` to Phase 7):**
+
+| kind | check_args | semantics | result on empty / missing |
+|---|---|---|---|
+| `claim_count` | `{predicate: str, op: ">="|"=="|"<=", n: int}` | Count claims in task's chain matching predicate, compare to `n` | `fail` if predicate matches nothing — never silently `pass` |
+| `claim_predicate` | `{predicate: str, must_exist: bool}` | ≥1 claim must match JSONPath predicate | `fail` if no claim matches |
+| `output_path_exists` | `{path: str, min_bytes: int = 1}` | File at path exists in task's output dir AND is ≥ min_bytes | rejects empty / stub files |
+| `output_path_matches_regex` | `{path: str, pattern: str, flags: str = ""}` | File exists AND contents match regex | empty file with regex `.*` returns `fail`, not `pass` (anti-false-positive) |
+| `output_path_jsonschema` | `{path: str, schema: dict}` | File parses as JSON and validates against JSONSchema | parse failure → `error`, not `fail` |
+| `test_passes` | `{cmd: str, cwd: str, timeout_s: int = 60, expect_exit: int = 0}` | Run command, assert exit code; stdout/stderr captured into evidence | timeout → `error`, exit 127 (cmd not found) → `error`, not `fail` |
+| `manual_user` | `{question: str}` | Gates to user; critic emits `undecidable`; Director must escalate | never auto-passes; explicit human gate |
+
+**Iron rule:** every required AC's `check_kind ∉ {manual_user}` AND `≠ llm_verify` (deferred). At least one required AC per task must be mechanical. Director-side `create_task` rejects tasks that violate this rule. **LLM-only verification is forbidden as sole gate** — this is the anti-rubber-stamp guarantee.
+
+**Three-state executor result** (not two): `pass | fail | error`. `error` means the check itself failed to execute (cmd not on PATH, file unreadable, regex compile error). `error` blocks the gate the same way `fail` does. Distinction matters for diagnostics: `fail` means "the artifact is wrong"; `error` means "we couldn't verify." Both → `changes_requested`.
+
+**Evidence hashes.** Every executor returns:
+```
+{status: pass|fail|error, evidence: {path_sha256?, exit_code?, stdout_hash?, predicate_match_count?, ...}, reason: str}
+```
+The critic re-verifies evidence on review and rejects if mismatched (catches "builder partial-writes, crashes mid-flight, retry passes a *different* artifact under the same path" — silent corruption that AC-pass-on-file-existence alone misses).
+
+#### Phase 6.0.1 — Hard-gate on `state='done'`
+
+Atomic with Phase 6.0 — shipping the gate without the criteria framework gives false confidence (criticisms become prose-only rubber stamps, hard-gate fires on every reviewed task).
+
+Lance / programmatic guard:
+```
+state transition to 'done' REQUIRES:
+  review_decision = 'accepted'
+  AND constraint_violations = []
+  AND (all required AC results are status='pass')
+```
+
+Enforced at **two write paths**: (a) `ledger.tasks.update_status`, (b) any direct `observe()`/Lance write that mutates `state`. The duplicate-enforcement is deliberate: AC-10 in the Phase 6 test plan probes the second path specifically because it's the most common bypass route ("we fixed `update_status` but forgot the raw write").
+
+#### Phase 6.0.2 — Director-side acceptance contract
+
+`create_task` validates at insertion:
+
+1. `acceptance_criteria` must be non-empty.
+2. At least one required AC must be mechanical (`check_kind ∉ {manual_user, llm_verify}`).
+3. If `expected_artifact != null`, ≥1 required AC must be of kind `output_path_exists` / `_matches_regex` / `_jsonschema` / `test_passes` whose `check_args.path` (or test target) is consistent with `expected_artifact`.
+4. If `expected_artifact == null` (claim-only tasks: research, analysis), ≥1 required AC must be `claim_count` or `claim_predicate`. No "vacuous research task" with no observable.
+
+These rules force Director to articulate "done" before dispatch — moves the judgment from worker self-assessment to mechanical post-condition. The Director's most common failure mode (vague brief, "use your judgment", trust the worker) becomes a schema violation.
+
+#### Phase 6.0.3 — Deferrals (explicitly out of scope for Phase 6)
+
+To keep tier-1 atomic and review-friendly, the following are **not** in Phase 6 even though the AC framework names them:
+
+- **`llm_verify` check_kind.** Reintroduces the rubber-stamp risk Phase 6 exists to eliminate (LLM judging LLM, possibly same model family). Director must express ACs in the 7 mechanical kinds. Anything that can't be expressed mechanically isn't done. Re-evaluate in a future phase only after the mechanical kinds are proven insufficient for some real artifact class.
+- **Explicit `depends_on TEXT[]` column.** The existing implicit DAG via `agent_tasks.inputs[]` (`F7_DEPENDENCY_AWARE_CLAIM_2026_05_26` at `app/workers/inbox_poller.py:307`) handles 5-10 agent producer→consumer ordering. Two representations create a consistency obligation. Promote to tier-2 (30 agents) where cross-lineage fan-in matters.
+
+#### Phase 6.1 — Fresh-context critics
+
+Critic dispatch path builds the LLM prompt from `(spec, acceptance_criteria, artifact)` only — explicitly excludes the producer's trajectory / chain-of-thought / per-turn comments. This is the **correctness foundation** that must ship before per-persona concurrency caps; otherwise scaling critic throughput just scales rubber-stamping.
+
+Implementation surface: `agent/critic.py` prompt assembly. Structural enforcement: a regex-absence check in source guarantees no `producer_messages | producer_trajectory | parent_thread` field is wired into the critic's prompt builder under any flag (debug, fallback, anything). Negative-fixture unit test deliberately wires a leak; the test must catch it.
+
+#### Phase 6.2 — Per-persona concurrency caps
+
+Replace global `MAX_CONCURRENT_DISPATCHES = 4` with per-persona budgets:
+
+```
+PERSONA_CAPS = {
+  "researcher":   8,
+  "builder":      6,
+  "critic-claim": 4,
+  "critic-prose": 4,
+  "phishing-analyst": 2,
+  "threat-analyst":   2,
+  "report-writer":    2,
+}
+```
+
+Independence guarantee: a researcher saturated at 8/8 MUST NOT starve a builder claim. (Single shared semaphore keyed on persona acquired before persona-resolution is the wrong implementation — see AC-16 in the test plan.) The old global constant `MAX_CONCURRENT_DISPATCHES` must be **removed from the source**, not just bypassed — AC-14 in the test plan does a structural source grep (`regex absence`) to prove dead-code didn't ship.
+
+#### Phase 6.3 — Lease TTL + heartbeats
+
+Highest-risk-but-easy-to-miss change in Phase 6. The turn cap (`_ENABLE_TURN_CAP = True`, `app/workers/inbox_poller.py:786`) catches **live dithering** but does nothing for **dead workers** holding stale claims — turns aren't accruing on the corpse. At 5-10 agents this surfaces as either (a) orphan claims that sit forever or (b) duplicate workers re-claiming and double-writing on the same workspace path.
+
+New table:
+```
+agent_task_heartbeats: List[Struct{
+  task_id     string  not null
+  worker_id   string  not null
+  last_beat_at f64    not null
+  lease_ttl_s  i64    not null    # default 300
+}>
+```
+
+Worker writes a heartbeat row at every N turns (N = 1 is fine — heartbeats are cheap). `inbox_poller` startup sweep + per-cycle sweep auto-reclaim any task where `state IN ('open','accepted','in_progress','blocked')` AND `now() - last_beat_at > lease_ttl_s`. Reclaim writes an audit comment (`lease_expired: reclaimed from worker {worker_id} after {elapsed}s of no heartbeat`).
+
+This is the architectural answer to the failure mode the existing `_force_cancel_on_timeout` (line 494) was a *symptom-treater* for. Phase 6.3 makes it root-cause-correct.
+
+#### Phase 6.4 — Revision-priority lane
+
+When a critic returns `changes_requested`, the IC's respawned revision task gets `is_revision = True`. Inbox-poller's claim SQL prefers `is_revision=True` rows when its persona's cap has open slots AND a revision is waiting. Otherwise: critic-revision sits behind fresh Director-emitted builds, never gets re-attempted, "done halfway" becomes "done forever-pending."
+
+Single boolean column on `agent_tasks`. ~15 LOC of claim SQL change.
+
+#### Phase 6.5 — Truncated-output marker (sibling-of-observe-silent fix)
+
+The agent-loop bug we just closed (2026-05-27, `tcmm.py:317-326` + `memory_mcp.py:212-237`) has a sibling: tool outputs that get **truncated for response-size limits** look identical to complete outputs from the LLM's point of view. `read_file` / `web_search` / `inbox` results capped → agent reasons over a prefix → same epistemic failure class as observe-silent.
+
+Every tool wrapper emits an explicit tail: `[TRUNCATED: <N> of <M> bytes shown — page or chunk before acting]`. Persona prompts get a one-line rule:
+> If a tool result ends with `[TRUNCATED: ...]`, the response is incomplete. Either (a) call the tool again with pagination args, or (b) raise a `blocker_raised` comment and `submit_for_review` with what you have. **Do not reason over a truncated response as if complete.**
+
+~10 LOC per wrapper + a 1-line persona-prompt edit.
+
+#### Phase 6.7 — APR (Artifact Production Ratio) metric + circuit breaker
+
+*Added 2026-05-27 after iter-3 panel.* Operationalises the §2 design principle "Tasks transform state; conversations are scaffolding" — without instrumentation that principle is decoration.
+
+```
+APR = artifacts_per_window / (LLM_tokens_per_window / 1000)
+```
+
+**"Artifact"** counts only state-mutation events: status_change, attach_output, observe (when persisted), approval response, dream node update, decision-ledger entry. **Does NOT count**: agent-to-agent messages, intermediate reasoning, internal critique narration.
+
+**Healthy band** (calibrated from Magentic-One / ChatDev telemetry analogs): **0.5–2.0 artifacts per 1k tokens** at the system level.
+
+**Collapse signal**: APR sustained **< 0.1 over a rolling 30-minute window**. At that ratio the system is talking to itself (the Auto-GPT / BabyAGI failure mode the strategic principle exists to prevent).
+
+**Circuit breaker.** When APR < 0.1 for > 30 min:
+1. inbox_poller stops dispatching new tasks.
+2. In-flight tasks complete their current turn and are paused (not cancelled).
+3. Sidebar surfaces a banner: "Veilguard halted: artifact production below floor (APR=<N>). Operator unblock required."
+4. Director receives an `apr_circuit_breaker` event in its inbox.
+5. Operator either acks (resumes dispatch) or cancels the offending task subtree.
+
+**Implementation surface.** ~150 LOC: APR rolling-window calculator + Prometheus-style counter emission + inbox_poller circuit-check before dispatch + sidebar surfacing.
+
+#### Phase 6.8 — Memory writer-function layer
+
+*Added 2026-05-27 after iter-3 panel.* Implements §3.11 (Memory write-path discipline). Defines the 5-7 typed writer functions, the linter rule, and the auto-generated docs.
+
+| Deliverable | LOC |
+|---|---|
+| Writer-function module under `agent-runtime/app/memory/writers.py` with `record_episode`, `promote_to_semantic`, `log_decision`, `update_org_memory`, `enqueue_dream_input`, `record_approval`, `attach_artifact` | ~250 |
+| Linter rule (`tests/test_memory_write_paths.py`) — fails any module under `agent-runtime/app/` or `agent/` that imports Lance handles / TCMM HTTP client / workspace writers outside the writers module | ~80 |
+| Auto-generated docs (`agent-runtime/docs/MEMORY_WRITE_PATHS.md`) — built from writer-function introspection on every test run | ~70 |
+
+~400 LOC total. The linter is the hard gate: if a future agent writes to memory outside a writer function, CI breaks.
+
+#### Phase 6.9 — Constitution schema with mandatory `evaluator_id`
+
+*Added 2026-05-27 after iter-3 panel.* Converts the constitution from "natural-language governance sludge" (reviewer's phrase) into typed policy with deterministic checkers.
+
+**Mandatory schema for every `constitution.json` entry:**
+
+```jsonc
+{
+  "id":                 "string, unique within file",
+  "kind":               "objective | constraint | default",
+  "rank":               "int, conflict-resolution priority (lower = higher priority)",
+  "metric_name":        "string",
+  "comparison_op":      "<= | >= | == | in | contains",
+  "threshold":          "number | string | list",
+  "evidence_source":    "string — which audit log / eval / counter produces the metric",
+  "evaluator_id":       "string — pointer to a deterministic check function in evaluators/ registry",
+  "applicability":      "{ when this rule fires — task_kind, owner_id, source_kind, etc. }",
+  "action_on_violation": "block | warn | log | reflect"
+}
+```
+
+**`evaluator_id` is the iron-rule field.** Entries without an evaluator are **not policy — they're aspiration. Loader refuses to load them.** This is the discipline that prevents the constitution from drifting into vague natural-language sludge.
+
+Phase 6.9 scope: schema definition + loader refuses-to-load behavior + 5-10 evaluators wired (the ones the existing constitution.json already implicitly relies on: approval-rate threshold, cost-ceiling, fairness-factor, source-kind-trust, USER×USER emergency lane).
+
+Phase 7 follow-on: expand evaluator registry to cover every constitutional objective; deprecate entries that can't be evaluator-bound.
+
+~200 LOC for schema + validator + initial evaluators.
+
+#### Phase 6.10 — Repository abstraction with table tagging
+
+*Added 2026-05-27 after iter-3 panel.* Prepares for the eventual LanceDB → PostgreSQL migration for `mutable_transactional` tables without forcing it now.
+
+```python
+class Repository(Protocol):
+    table_name: str
+    table_kind: Literal["mutable_transactional", "append_analytical", "vector"]
+    backend:    Literal["lance", "postgres", "lance+postgres"]
+    # CRUD methods abstracted; today all backends return "lance"
+
+class TasksRepository(Repository):    table_kind = "mutable_transactional"
+class CommentsRepository(Repository): table_kind = "append_analytical"  # SHA-chained, never updated
+class ProposalsRepository(Repository):table_kind = "mutable_transactional"
+class ApprovalsRepository(Repository):table_kind = "append_analytical"
+class OrgMemoryRepository(Repository):table_kind = "mutable_transactional"
+class DreamArchiveRepository(Repository): table_kind = "vector"           # TCMM-side
+```
+
+All current code is routed through Repository wrappers. Implementation stays Lance for now.
+
+**Migration triggers** (instrumented as Prometheus metrics):
+- `tasks` row count > 500K, OR
+- `agent_tasks` p95 mutation latency > 100 ms, OR
+- Any operation requires cross-row transactional guarantee.
+
+When a trigger fires, the migration is a Repository-level swap (Postgres for `mutable_transactional`, Lance for `append_analytical`/`vector`). Two weeks of focused work, no agent-runtime code changes.
+
+~300 LOC for Repository protocol + concrete adapters + metric instrumentation.
+
+#### Phase 6.11 — Director interface skeleton: `route()` / `synthesize()` / `propose()`
+
+*Added 2026-05-27 after iter-3 panel.* Bakes the future Phase-8 Router/Synthesis split as method-level interfaces now — without splitting the persona — so the eventual split is mechanical.
+
+```python
+class Director:
+    async def route(self, signal: WorkSignal) -> RoutingDecision:
+        """Pure routing: which persona owns this? Sub-1k-token call. Today: Sonnet. Future: Haiku."""
+
+    async def synthesize(self, task: Task, child_outputs: list[ChildOutput]) -> FinalDeliverable:
+        """Final synthesis: collect, summarise, decide. ≤8k-token call. Today: Sonnet. Future: Sonnet/Opus."""
+
+    async def propose(self, ranked_candidates: list[Proposal]) -> list[ApprovedTask]:
+        """Proactive-stream surface: select N from ranked queue for approval. Mid-weight call. Today: Sonnet."""
+```
+
+Today all three live behind the same persona prompt + model. Phase 8 swap target: `route` moves to Haiku, `synthesize` stays Sonnet, `propose` stays Sonnet, and the calls become independent dispatches.
+
+**Trigger to actually split** (instrumented):
+- Director prompt > 8k structured tokens per turn (p95), OR
+- Director p95 latency > 2× the slowest specialist persona, OR
+- Synthesis-correctness errors appear in eval suite (sub-agents' findings lost in Director synthesis).
+
+~150 LOC for interface scaffolding + per-method telemetry. No behavior change today.
+
+#### Phase 6.6 — Acceptance criteria for Phase 6 itself (the meta-gate)
+
+The whole phase passes its own framework. **45 ACs total** (after iter-3 expansion: 32 original + 13 new for sub-phases 6.7–6.11), 43 mechanical, 2 `manual_user`. Each Phase-6 sub-deliverable has ≥1 required mechanical AC. Distribution:
+
+| Sub | ACs | Coverage |
+|---|---|---|
+| 6.0 schema + executors | AC-1, AC-2, AC-3, AC-4 (7 not 8 executors registered), AC-5, AC-6, AC-7 (empty-input no-false-pass), AC-8 (sandbox), **AC-26 (evidence hash present)**, **AC-27 (3-state error blocks gate)** | migration + executor correctness + adversarial sad paths |
+| 6.0.1 hard-gate | AC-9, **AC-10 (direct-observe bypass)**, AC-11, AC-12 (post-deploy invariant scan) | both write paths probed |
+| 6.0.2 Director contract | embedded in AC-9 / AC-12 | rejection-at-insert validated |
+| 6.1 fresh-context critic | AC-21 (prompt content), **AC-22 (structural source grep)**, **AC-23 (negative-fixture / tests the test)** | catches debug-flag leaks |
+| 6.2 per-persona caps | AC-13, **AC-14 (regex-absence of dead global)**, AC-15, **AC-16 (starvation independence)** | catches stub-shipped config-only PRs |
+| 6.3 lease + heartbeat | **AC-28 (heartbeat row appears)**, **AC-29 (orphan reclaimed after TTL)** | proves auto-reclaim fires |
+| 6.4 revision lane | **AC-30 (revision claimed before fresh builds when both available)** | proves priority logic |
+| 6.5 truncation marker | **AC-31 (read_file emits marker)**, **AC-32 (persona prompt mentions TRUNCATED)** | both halves of the fix |
+| **6.7 APR + circuit breaker** | **AC-33** (APR counter emitted per dispatch), **AC-34** (rolling-window calculator handles boundary correctly), **AC-35** (synthetic-self-narration fixture triggers circuit breaker; deliberate 30-min low-APR load gets paused) | proves operational backstop fires |
+| **6.8 Memory writers** | **AC-36** (linter test fails when a module imports Lance handle outside writers.py), **AC-37** (writer-to-destination map auto-generated; every writer routes to its declared destination only), **AC-38** (negative fixture: try to write to org_memory from a non-writer module → blocked) | catches direct-write bypass shipping |
+| **6.9 Constitution schema + evaluator_id** | **AC-39** (loader refuses constitution entries missing `evaluator_id`), **AC-40** (every existing constitutional objective has a registered evaluator on load), **AC-41** (evaluator output is deterministic — same input twice → same verdict) | constitution converted from prose to typed policy |
+| **6.10 Repository abstraction** | **AC-42** (every direct Lance table access in `agent-runtime/app/` is replaced by a Repository call; static-import audit), **AC-43** (migration-trigger metrics emitted — `repo.<name>.row_count`, `repo.<name>.p95_mutation_latency_ms`) | swap-readiness without forcing migration |
+| **6.11 Director interface skeleton** | **AC-44** (Director exposes `route()`, `synthesize()`, `propose()` as separate awaitables; static-introspection check), **AC-45** (per-method telemetry emitted — `director.route.latency_ms`, etc., distinct from generic `agent_query`) | future split is mechanical |
+| cross | AC-24 (end-to-end 5-fanout smoke), AC-25 (user sign-off) | demo asymmetry: flip gate off, prove unhardened path "ships done"; flip gate on, prove it doesn't |
+
+The AC list is held in a companion file `agent-runtime/tests/PHASE_6_ACCEPTANCE.md` (created during Phase 6 implementation, not yet in this commit). It is the **release gate** — Phase 6 is "done" only if all 43 mechanical ACs run green in CI.
+
+#### Phase 6 — totals & adoption ladder
+
+**~1775 LOC total** (after iter-3 expansion), ordered:
+
+| # | Sub | LOC | Ships with | Unlocks |
+|---|---|---|---|---|
+| 1 | 6.0 + 6.0.1 + 6.0.2 atomic | ~330 | each other (one PR) | the anti-rubber-stamp gate |
+| 2 | 6.1 fresh-context critic | ~80 | standalone | correctness foundation for scaling |
+| 3 | 6.8 memory writer-function layer | ~400 | with 6.0 (touches same write paths) | narrow write surface; lint blocks bypass |
+| 4 | 6.9 constitution schema + evaluator_id | ~200 | standalone | typed governance; loader refuses untyped policy |
+| 5 | 6.10 Repository abstraction | ~300 | standalone (no behavior change today) | swap-readiness for Postgres migration |
+| 6 | 6.11 Director route/synth/propose interface | ~150 | standalone (no behavior change today) | Phase 8 Director split becomes mechanical |
+| 7 | 6.2 per-persona caps | ~100 | after 6.1 (per iter-2 sequence) | real fanout throughput, safe because critic is fresh |
+| 8 | 6.3 lease + heartbeats | ~40 | standalone | dead-worker recovery |
+| 9 | 6.4 revision lane | ~15 | standalone | prevents critic-revision starvation |
+| 10 | 6.5 truncation marker | ~10 + prompts | standalone | closes sibling-of-observe-silent class |
+| 11 | 6.7 APR + circuit breaker | ~150 | last (depends on writers + lease + AC) | operationalises "tasks transform state, not conversations" |
+
+**After Phase 6: 5-10 agents in parallel, structurally gated against premature-done, no orphan claims, narrow write surface, typed constitution, swap-ready storage, baked-in Director split interface, conversation-collapse circuit breaker.**
+
+**Phase 7 (tier-2, ~30 agents)** — not detailed here; spawned naturally by Phase 6 success:
+- `agent_teams` table + `agent_tasks.team_id` (aggregate cost rollup; per-team budget enforcement)
+- New `team-lead` persona (mini-Director scoped to one team)
+- Explicit `depends_on TEXT[]` column (now genuinely needed for cross-lineage fan-in)
+- Stall detector worker (Magentic-One Progress Ledger pattern)
+- Re-introduce `llm_verify` for artifact classes mechanical checks can't cover
+
+**Phase 8 (tier-3, ~90 agents)** — aspirational; real precedent is the Anthropic C-compiler run (16 parallel Claudes, $20k, GCC as oracle), not the mythologised 90-agent OS-build:
+- Manager-of-managers (`agent_teams.parent_team_id`, capped depth 3)
+- Per-artifact-class oracle gates (non-LLM verifiers wherever possible)
+- Token-bucket throttler in front of Anthropic (provider-rate-limit defense is ours, not theirs)
+- `director_plans` table for Director memory-file pattern (Anthropic Research pattern when Director's own context exceeds ~150k tokens)
+- Per-team kill switch
+- **Runtime replay determinism** (new — added 2026-05-27 after external "you are building an OS, not an assistant" critique). Distinct from Phase 4's Replay v1, which reconstructs lineage trees for counterfactual UI. This is the harder version: given a complete snapshot of `(Task graph, approvals, tool outputs, Constitution version, TCMM memory snapshot at time T, alignment_weights version, dream-graph signals at T)`, can we reproduce the exact decision the Director or any agent made? Required because Phase 6 + 7 introduce subsystems that mutate system behavior over time (regret-weighted recalibration of `alignment_weights`, institutional memory consolidation in `org_memory`, dream-derived heuristics surfacing as proposals). Without runtime replay, the OS becomes unauditable: you can see *that* a proposal surfaced but not *why* — that's existential when autonomous proposal generation + self-recalibration are both active. **Trigger condition**: before any feature that mutates system behavior over time ships beyond Phase 6.9, runtime replay must produce deterministic reproduction of at least one full decision trace (proposal → critic decision → outcome → recalibration delta). Scope: extends Phase 4 Replay v1 from lineage-tree view to runtime determinism by adding (a) snapshot anchors at every Director decision point (anchor = content hash of all input substrates), (b) deterministic re-execution against a frozen snapshot, (c) reproduction tolerance bounded by LLM non-determinism — anchor allows comparing reasoning ENVELOPES, not exact tokens. ~600 LOC + 1-week per-anchor test scaffolding.
+
+#### Phase 6 — design provenance
+
+Produced by a 3-iteration adversarial research panel:
+
+- **Iteration 1** (parallel): Researcher (Plan agent) literature review + tier ladder; Evaluator (Explore agent) codebase audit producing the 10-dimension gap matrix; Critic (general-purpose agent) acceptance-criteria framework. Reports converged on "row-level done-gating via mechanical ACs" as the highest-leverage tier-1 change.
+- **Iteration 2** (parallel, adversarial against iter-1 plan): Researcher hunting tier-1 blind spots produced 3 new failure modes (evidence hashes, lease/heartbeat, revision lane) + 2 sequence corrections (atomic ACs+hard-gate, fresh-context-before-caps); Critic applied iter-1's own AC framework to the tier-1 plan, produced 25 ACs (later expanded to 32 with iter-2 Researcher additions), ran adversarial mapping of 10 "ships-looks-done-isn't-done" bypass patterns, all caught by existing ACs.
+- **Iteration 3** (parallel, against external expert critique): A skilled external reviewer produced a detailed critique identifying 5 risks (Director cognitive overload, memory topology complexity, dream-cycle latency, constitution operational fuzziness, LanceDB long-term ceiling) + 1 strategic recommendation ("agents transform state, not conversations") + 1 prioritisation recommendation (approval gate / provenance / cache / ledger / replay before autonomy expansion). The panel re-fired against the critique: Researcher (Plan) ran prior-art research on each risk with concrete Veilguard responses; Evaluator (Explore) verified the critique's factual claims against the actual codebase (found ~3 stale claims — `rank_proposals` in persona frontmatter but not in `_ALL_TOOLS`, TCMM channels conflated with agent-runtime ledger tables, dream-cycle timing confused with DreamScanner poll interval); Critic gated the proposed spec additions against its own iter-1 AC framework, verdict `changes_requested` with 4 specific upgrades required. Iter-3 produced 6 new Phase 6 sub-deliverables (6.7–6.11 above, plus §3.11 memory write-path discipline) converting acknowledgment-only spec additions into concrete operational commitments. Phase 6 grew from ~575 to ~1775 LOC.
+
+All three iterations are preserved in the agent-runtime audit log as cancelled tasks under tenant `69c4468a1fde1abc19c7835c` (the local dev user). Transcripts in `C:\Users\rudol\AppData\Local\Temp\claude\C--Users-rudol--veilguard\f5ed0511-8d78-4c80-8c49-0ccfffa96b3f\tasks\`.
+
+**Properties the external review missed (surfaced by iter-3 Evaluator) and therefore not yet credited in §3:** SHA-chained `task_comments` (append-only anti-tampering integrity), explicit server-of-record trust-boundary discipline per field (§3.8.5), Magentic-One-style task_ledger + progress_ledger via `agent-runtime/app/ledger/task_progress.py` (Phase 4), per-tenant proactive-config pause (user can halt the proactive stream per-tenant), atomic lease semantics on `agent_tasks` (prevents concurrent dispatch by multiple workers). These are not new work — they're existing strengths the critique didn't account for, and they strengthen the Phase 6 design's foundation.
+
+### Phase 7 — Close the TCMM-ledger duplication (tier-2 prerequisite)
+
+*Added 2026-05-27 after a 2-iteration TCMM-unification panel (iter-4: 3 agents discovered the duplication; iter-5: 3 agents gated the boundary rule + 4 migrations).* Phase 7 was originally a sketch of "~30 agent scaling" deliverables. This sub-section is the first concrete Phase 7 work and a prerequisite for the team-leader work below: **before scaling to 30 agents, fix the memory topology so the existing ~10-table sprawl doesn't multiply.**
+
+The boundary rule was added as a §2 design principle (above): TCMM holds knowledge-graph contributors; the ledger holds the state machine; observations may reference ledger PKs but never mirror ledger fields. This phase migrates the four destinations that violate that rule today.
+
+#### Phase 7.1 — Four migrations
+
+| # | Migration | Type | Cross-ref |
+|---|---|---|---|
+| **M1** | `org_memory` Lance table → TCMM `team/knowledge/<team_id>/` lane=`org_critic` with hard-include floor | full (delete the Lance table post-cutover) | none — TCMM-side only |
+| **M2** | `proposal_outcomes`: numeric columns (`task_cost_usd`, `value_realized`, `regret_score`, `succeeded`, `computed_at_ts`) stay in ledger. **Narrative observations born in TCMM** (`source_kind="outcome_narrative"`) via `dream/prediction_record.py`. `objective_deltas_json` migrates with the narrative. | not-quite-a-split — narrative was never in ledger; this adds a new TCMM observation type alongside existing ledger work | bidirectional: ledger gains `tcmm_obs_id` column; TCMM observation carries `extras.outcome_id` |
+| **M3** | `task_proposals`: migrate `proposed_brief` + `rationale` to TCMM `archive[source_kind="proposal"]`. Status index (`id`, `status`, `decided_at`, `decay_score`, `signal_type`, `signal_node_ids`, `impact_score`, `objective_alignment`, `constraint_violations`, `recurrence_count`, all timestamps, `shelf_reason`, `resulting_task_id`, `emergency_lane`, `proposed_deliverable_spec`, `constitution_version`) stays in ledger as thin Lance projection. | column-level split | bidirectional: ledger gains `tcmm_obs_id` column; TCMM observation carries `extras.proposal_id` |
+| **M4** | `task_comments[kind=discussion / note]` → TCMM `agent/<aid>/observations/` (`source_kind="discussion"`). SHA-chained kinds (`status_change`, `review_decision`, `blocker_raised`, `blocker_cleared`) stay in ledger with chain. | split-by-kind | one-directional: ledger chain is immutable source of truth; TCMM observations are derivative; no back-ref needed |
+
+The `tcmm_obs_id ↔ entity_id` cross-ref protocol is the load-bearing piece: ledger row stores `tcmm_obs_id` for cascade tracking; TCMM observation stores `extras.<entity>_id` for joining back. Even after TCMM's dream cycle compresses the observation into a summary node, the ledger row's `tcmm_obs_id` becomes a "this used to point at observation X, which may now be part of summary Y" trail — graceful degradation, not orphan corruption.
+
+For M2 and M3, the writer functions (`record_outcome`, `record_proposal`) are the only sanctioned cross-ref sites — they write the ledger row, get its PK, post the TCMM observation with the PK in `extras_json`, then update the ledger row with `tcmm_obs_id`. All other call sites are blocked by the Phase 6.8 writer-function lint.
+
+#### Phase 7.2 — Migration order
+
+1. **M1** first — lowest risk, highest payoff. `org_memory` is the most clearly-misplaced table; the migration closes the Phase-3 incompleteness where `lessons.py` writes Lance but never observes to TCMM, and unblocks Critic-promoted lessons earning concept_gravity / bridge_score in the dream graph. ~80 LOC + 1-week parallel-write soak.
+2. **M2** — adds the cross-ref pattern that M3 reuses. ~150 LOC (split writer + ledger schema column add + initial `prediction_record` integration).
+3. **M3** — reuses M2's cross-ref pattern. ~200 LOC (split writer + schema column changes + status-index-only query path).
+4. **M4** — must land **after** Phase 6.8 writer-function discipline. Without 6.8's lint, agents writing through the old `add_comment(kind=...)` path would route both kinds to one destination. ~150 LOC + careful migration of historical `task_comments[kind=discussion]` rows to TCMM observations.
+
+Total Phase 7.1+7.2: **~580 LOC** spread across 4 PRs. Each PR ships independently and is gated by its own AC subset.
+
+#### Phase 7.3 — Acceptance criteria (6 mechanical gates)
+
+| AC | check_kind | What it verifies |
+|---|---|---|
+| **AC-P7.1** | `output_path_matches_regex` | The boundary rule text is present in `MULTI_AGENT_PLATFORM.md` §2 (`"TCMM is the knowledge-graph substrate; the ledger is the state machine"`). |
+| **AC-P7.2** | `claim_predicate` | `lance_table_exists('org_memory') == False` post-M1 cutover. |
+| **AC-P7.3** | `claim_predicate` | Post-M2/M3, ledger schemas for `proposal_outcomes` and `task_proposals` have no free-text content columns; only numeric/enum/FK/timestamp columns plus `tcmm_obs_id`. |
+| **AC-P7.4** | `test_passes` | Status-index queries on `task_proposals` (e.g. `SELECT * WHERE status='pending'`) execute with zero TCMM HTTP calls — assert via mocked TCMM client `call_count == 0`. Operational hot path stays cold on TCMM. |
+| **AC-P7.5** | `test_passes` | SHA-chain integrity over remaining `task_comments` kinds (`status_change`, `review_decision`, `blocker_raised`, `blocker_cleared`) verifies end-to-end after M4. The chain was not broken by removing the discussion/note rows. |
+| **AC-P7.6** | `test_passes` | Runtime probe scans TCMM `archive` for observations written by `agent-runtime` and asserts every `source_kind` is in the allow-list `{lesson, proposal, outcome_narrative, discussion, agent_observation}`. Unknown source_kind from agent-runtime → fail. |
+
+#### Phase 7.4 — What we explicitly rejected
+
+Iter-5's Critic proposed 4 additional amendments that were folded back out after a forcing-function call:
+
+- **M5 `alignment_weights[narrative]` migration** — premature. The recalibration narrative isn't a feature today; add the migration when the feature ships, not preemptively.
+- **"Free text bound to a never-compress guarantee" clause** in the rule — edge case for a feature (operator justification on secret rotation) that doesn't exist. The main rule already covers it via "hash-chained audit lives in the ledger."
+- **"References between TCMM rows are graph edges" clause** in the rule — true but obvious; TCMM-internal refs are TCMM's whole point. Not worth a clause.
+- **`# boundary: split-writer` annotation discipline + fail-closed enum + 13 of the 21 ACs** — over-engineered. With 3 split writers (M2, M3 — and M5 when it eventually lands), the dual-write scanner hard-codes their function names. AC-P7.6 is the runtime backstop that catches violations without AST-introspection tooling we don't have.
+
+These rejections are themselves logged in the decision log so future drift back into the amendments has a forcing function to argue against.
+
+#### Phase 7.5 — Remaining Phase 7 work (sketched only)
+
+After Phase 7.1-7.4 close the duplication, the remaining tier-2 work spawns naturally:
+- `agent_teams` table + `agent_tasks.team_id` (per-team budget enforcement; aggregate cost rollup)
+- New `team-lead` persona (mini-Director scoped to one team)
+- Explicit `depends_on TEXT[]` column (cross-lineage fan-in)
+- Stall detector worker (Magentic-One Progress Ledger pattern)
+- Re-introduce `llm_verify` for artifact classes mechanical checks can't cover
+- ~~Tiered micro-dreams resolving Q22~~ **Retired 2026-05-28** — see Q22 below; live benchmark showed 100-block cycle at 112s vs spec's "9-10 min" premise, killing the architectural justification
+
+These ride on top of the cleaner memory topology Phase 7.1 establishes.
 
 ---
 
@@ -1454,6 +1941,14 @@ The protocol, collaboration, and organizational-learning-maintenance layer.
 | Constitution amendment re-scoring policy | High | When constitution updates, pending proposals are re-scored against new weights and re-sorted; any failing `constraint_gate` auto-shelve with `reason=constitution_amended` + diff pointer. Done items NOT retroactively re-evaluated — replay uses `constitution_version` snapshot stored on the proposal. |
 | Constitution self-justifying loop — metrics calibrated by the same loop they steer | Medium (acknowledged, no clean fix) | Recalibration weights bounded ±20%/week; quarterly user review of metric definitions surfaced as sidebar "metric calibration" prompt. Bounds drift; doesn't fully solve self-justification. |
 | Pattern C cache amortization is additive across agents, not multiplicative | Medium | 3 agents = 3 distinct cache-create costs per fresh-cache turn at 1h TTL. ~3× cache_write per Pattern C cold start; subsequent calls within TTL get full benefit. Acceptable tradeoff for parallel work. |
+| **Agent declares done halfway (LLM rubber-stamps own output)** | **Critical** | **Phase 6.0 acceptance-criteria framework + 6.0.1 hard-gate.** `state='done'` is a Lance/programmatic constraint: required ACs all `pass`, `review_decision='accepted'`, `constraint_violations=[]`. ≥1 required AC per task is mechanical (`check_kind ∉ {manual_user, llm_verify}`). Director-side `create_task` rejects no-mechanical-AC tasks. Critics walk ACs one-by-one with evidence hashes; undecidable required AC ≠ pass. **Iron rule: LLM-only verification is forbidden as sole gate.** |
+| Critic rubber-stamps by inheriting producer's trajectory blind spots | Critical | Phase 6.1 fresh-context critics. Critic dispatch builds prompt from `(spec, AC, artifact)` only. Structural source-grep guarantees no `producer_messages | producer_trajectory | parent_thread` field is wired in under any flag. Negative-fixture test catches debug-flag leaks. |
+| Global concurrency cap serializes 5+ agent fanouts; one persona starves another | High | Phase 6.2 per-persona caps (`{researcher: 8, builder: 6, critic-*: 4}`). Independence guarantee: researcher saturation MUST NOT starve a builder claim. Old `MAX_CONCURRENT_DISPATCHES` constant removed from source (not just bypassed) — regex-absence AC catches dead-code shipping. |
+| Dead worker holds stale claim; turn cap doesn't catch corpse | High | Phase 6.3 lease TTL + heartbeats. `agent_task_heartbeats` table; worker beats every turn; `inbox_poller` auto-reclaims tasks with `now() - last_beat_at > lease_ttl_s` and writes `lease_expired` audit comment. |
+| Critic-revision starves behind fresh Director builds — "done halfway" → "done forever-pending" | High | Phase 6.4 `is_revision BOOLEAN` flag + priority claim. Inbox-poller's claim SQL prefers revisions when persona cap has open slots. |
+| Truncated tool output reasoned over as complete (sibling of observe-silent failure) | High | Phase 6.5 explicit `[TRUNCATED: N of M bytes]` tail on every tool wrapper. Persona prompt rule: "If you see TRUNCATED, page/chunk or raise blocker — do not reason over a truncated response as if complete." |
+| `acceptance_criteria` executor itself fails silently (cmd not on PATH, regex compile error) | High | Phase 6.0 three-state executor result: `pass | fail | error`. `error` blocks the gate the same as `fail`. Catches "always-pass" bugs in the gate code itself. |
+| Builder partial-writes artifact, crashes, retry writes different content under same path; `output_path_exists` AC still passes | High | Phase 6.0 evidence hashes. Every executor returns `{status, evidence: {path_sha256?, exit_code?, stdout_hash?}}`. Critic re-verifies evidence at review time; mismatched hash → `changes_requested`. |
 
 ---
 
@@ -1481,6 +1976,10 @@ To resolve before Phase 1:
 18. **`team/events/` channel under dream-as-scheduler.** Most events flow from Task lifecycle, and dream already tracks what happened. The events sub-channel may be redundant. Reconsider during Phase 3.
 19. **`extracted_by` partition exact location in dream's posterior aggregation.** Phase 0.2.6 says partition BEFORE merge; the exact code location in `confidence_update.py` (or equivalent) needs depth-reading before Phase 0.2 implementation.
 20. **`run_proposal_pass()` mini-cycle scope.** Phase 3 net-new infrastructure. What stages does it run? Just proposal-emission against existing graph, or also refresh `decay_score` on existing proposals?
+
+Q21. **Director role-splitting — Router/Synthesis/Strategy.** *(External reviewer raised; iter-3 panel resolved.)* Should Director eventually split into Router-Director (Haiku-class, pure routing, <1k tokens) + Synthesis-Director (Sonnet-class, owns final response + ledger + strategy)? **Decision: yes, but bake the interface in Phase 6.11 without splitting personas; resolve the behavioral split in Phase 8 when trigger conditions fire.** Triggers: Director prompt > 8k structured tokens per turn (p95), OR Director p95 latency > 2× slowest specialist, OR synthesis-correctness errors appear in eval (sub-agent findings lost in Director synthesis). **Resolved-by:** Phase 8 (behavioral split); interface skeleton resolved in Phase 6.11.
+
+Q22. **Dream-cycle freshness pattern.** *(External reviewer raised; iter-3 panel proposed tiered micro-dreams; **retired 2026-05-28 by live benchmark.**)* Original premise — "TCMM's 9-10 min `run_cycle()` is the largest architectural pressure point" — is **obsolete**. Live trace (2026-05-28, 100-block cold-cache cycle on `bench_F_phase3_group`): `cycle_wall=112.3s` (~1.9 min, 46 LLM calls @ 0% cache hit, top stage `_run_causal_counterfactual_52h`=11s × 2 calls). With warm cache + larger workloads this stays sub-3-min. The proposed Q22 architecture (hot overlay graph + Pinot-style lambda merge at retrieval) is sized for a 10-min cycle and doesn't pay for itself at <2 min. **Decision: retire Q22.** No micro-dream / overlay work. If future benchmarks regress past 5-min the question reopens. The only surviving piece — event-triggered cycle firing on importance-sum threshold — becomes a small standalone optimization candidate inside the existing dream worker, not a new substrate.
 
 ---
 
@@ -1598,6 +2097,34 @@ To resolve before Phase 1:
 | 2026-05-22 | **Lance `IS NULL` not supported in where clauses — use sentinel values.** | Inbox poller's claim filter `lease_owner IS NULL OR lease_until < now` returned 0 rows because LanceDB's SQL parser doesn't accept `IS NULL`. Switched to sentinel: tasks at rest have `lease_owner=""` and `lease_until=0.0`; available filter is just `lease_until < now`. `ledger/tasks.py:create_task` updated to set sentinels. Pinned by tests + demos. |
 | 2026-05-22 | **`review_decision` MCP tool added for Critic.** | Atomically adds a `review_decision` comment AND transitions task status. `decision=approved` → review→done; `decision=changes_requested` → review→in_progress (IC iterates); `decision=declined` → review→cancelled. Tool count went from 10 → 11. Single-call pattern avoids the comment/status race. |
 | 2026-05-22 | **4 demo scenarios run end-to-end, all pass.** | `demo/scenario_pattern_a_solo.py` (Director answers from recall), `demo/scenario_pattern_b_delegation.py` (Director → Researcher full lifecycle), `demo/scenario_pattern_c_fanout.py` (Director → Researcher + Builder parallel), `demo/scenario_critic_iterate.py` (Researcher → Critic reject → Researcher iterate → Critic approve). `demo/run_all.py` orchestrates. Demonstrates: ledger writes, inbox poller dispatch, parallel task claiming via lease, comment chain with 6+ status_changes and 2+ review_decisions, final status=done. All four scenarios use the scripted backend (no LLM cost) and prove the full orchestration pipeline works on the actual Lance store. |
+| 2026-05-27 | **`observe()` no longer silently swallows TCMM-unreachable failures.** | `middleware/tcmm.py:observe_agent_output` returned `None` for both success and HTTP failure → `tools/memory_mcp.py:observe_tool` reported `_ok({"observed": True})` to the LLM even when nothing was written. LLM then re-checked task state, saw outputs[] empty, looped re-running observe(). Verified live: `task-6becb4f4e1dc` burned 100+ stream events / ~25 LLM turns before user force-cancelled. Fix: `observe_agent_output` now returns `bool` (True = persisted, False = any failure). `observe_tool` reads the bool and returns `_err("TOOL UNAVAILABLE: TCMM did not persist this observation. Do NOT retry observe()...")` with explicit fallback guidance (continue in-context OR submit_for_review + blocker_raised). Sibling failure mode: tool outputs silently truncated → reasoned over as complete. Phase 6.5 closes that. |
+| 2026-05-27 | **`_ENABLE_TURN_CAP` enabled (was False).** | `workers/inbox_poller.py:786`. IC tasks cap at 25 LLM turns, critics at 10. Hit cap → runtime emits `max_iterations` event → `_force_cancel_on_turn_cap` writes audit comment distinguishing "turn cap" from wall-clock "dispatch_timeout". Activation was empirically deferred per the original plan; the 2026-05-27 demo loop justified flipping the switch — every observed non-convergence was dithering, not productive past ~12-15 turns. Cap is per-dispatch, not per-task lifetime — a task that legitimately needs multiple critic rounds gets fresh budgets each turn. |
+| 2026-05-27 | **Phase 6 designed: row-level done-gate + acceptance-criteria framework.** | Produced by a 2-iteration adversarial research panel (Researcher + Evaluator + Critic, then Researcher + Critic re-applying their own framework). Iter-1 converged on "row-level mechanical AC gating" as the highest-leverage tier-1 change. Iter-2 added 3 missing failure modes (evidence hashes, lease/heartbeat, revision-priority lane), 2 sibling classes of the agent-loop bug (truncation, stale-claim), 2 sequence corrections (ACs+hard-gate must ship atomic; fresh-context-critics before per-persona caps), and dropped 2 deliverables to tier-2 (explicit `depends_on` column, `llm_verify` check_kind). Final Phase 6 = 6 sub-phases, ~575 LOC, 32 ACs (31 mechanical, 1 manual_user). Critic iter-2 verdict on the plan: `accepted` (every sub-deliverable has ≥1 required mechanical AC; iron rule satisfied). Implementation gated by AC-1..AC-32 in CI. |
+| 2026-05-27 | **`llm_verify` check_kind deferred from Phase 6 to Phase 7.** | Reintroduces the rubber-stamp risk Phase 6 exists to eliminate (LLM judging LLM, possibly same model family). Director must express tier-1 ACs in 7 mechanical kinds only. If something can't be expressed mechanically, by Phase-6 definition it isn't done. Re-evaluate only after the 7 mechanical kinds are proven insufficient for some real artifact class. |
+| 2026-05-27 | **Explicit `depends_on TEXT[]` deferred from Phase 6 to Phase 7.** | The existing implicit DAG via `agent_tasks.inputs[]` (F7_DEPENDENCY_AWARE_CLAIM_2026_05_26 at `app/workers/inbox_poller.py:307`) handles 5-10 agent producer→consumer ordering. A second explicit edge representation creates a consistency obligation between the two (`depends_on` and `inputs[]` could disagree → potential cycle one source sees but the other doesn't). Promote to Phase 7 where cross-lineage fan-in from sibling tasks not sharing an `inputs` edge becomes genuinely necessary. |
+| 2026-05-27 | **`acceptance_criteria` + hard-gate `state='done'` must ship atomically.** | Hard-gate without structured ACs makes critics rubber-stamp on prose-only `deliverable_spec` — *false confidence is worse than no gate*. ACs without hard-gate means the framework is advisory; nothing prevents an agent from declaring done with a failing AC. Iter-2 Researcher caught this sequence bug. Treated as one ~330 LOC change covering 6.0 + 6.0.1 + 6.0.2 (schema migration + 7 executors with 3-state + evidence hashes + Lance constraint + Director-side `create_task` validation). |
+| 2026-05-27 | **Fresh-context critics must ship before per-persona concurrency caps.** | Per-persona caps double critic throughput. If the critic still inherits producer trajectory (Phase 6.1 not yet shipped), that's doubled rubber-stamping. Fresh-context is the *correctness* prerequisite for the *throughput* upgrade. Iter-2 Researcher: "Fresh-context is the single biggest leverage point for the 'declared done halfway' failure — the critic is currently being convinced by the same trajectory that convinced the builder." |
+| 2026-05-27 | **New §2 design principle: "Tasks transform state; conversations are scaffolding."** *(owner: Director persona contract; revisit: 2026-08-27 against APR telemetry)* | External reviewer's strategic recommendation: don't let the system become "agents talking to agents" as the dominant workload. Iter-3 panel converted it from acknowledgment to operational commitment via Phase 6.7 APR (Artifact Production Ratio) metric + circuit breaker. Healthy band 0.5-2.0 artifacts per 1k LLM tokens; sustained APR < 0.1 over 30-min window auto-pauses agent-to-agent dispatch. The principle is now observable, not aspirational. Calibrated against Magentic-One / ChatDev telemetry analogs. |
+| 2026-05-27 | **§3.11 — Memory write-path discipline via typed writer functions, not flat documentation table.** *(owner: agent-runtime/app/memory/writers.py; revisit: when 14th destination considered)* | Iter-3 Researcher rejected the originally-proposed flat `(writer × destination × trigger × transformation)` table as "a read projection, not a write governance tool — rots the moment a 14th destination appears." Replaced with 5-7 typed writer functions (`record_episode`, `promote_to_semantic`, `log_decision`, `update_org_memory`, `enqueue_dream_input`, `record_approval`, `attach_artifact`). Hard linter rule rejects direct memory writes from any module under `agent-runtime/app/` or `agent/` outside the writers module. Flat table is auto-generated from writer signatures — cannot drift. Pattern source: MemGPT's narrow API surface (4 functions cover all writes) + ATLAS write/read separation. |
+| 2026-05-27 | **Phase 6.11 — Director exposes `route()` / `synthesize()` / `propose()` as separate methods, behind one persona for now.** *(owner: agent/director.py; revisit: when trigger conditions fire — see Q21)* | Bakes the future Phase-8 Router/Synthesis split as a method-level interface now. Trigger conditions for the actual split: Director prompt > 8k structured tokens per turn (p95), OR Director p95 latency > 2× slowest specialist, OR synthesis-correctness errors in eval. Pattern source: Anthropic's lead-researcher pattern (Jun 2025) — the lead's token consumption became ~80% of total cost; baking the interface now is cheap insurance against the same outcome here. ~150 LOC. No behavior change today. |
+| 2026-05-27 | **Phase 6.10 — Repository abstraction with `mutable_transactional | append_analytical | vector` tagging.** *(owner: agent-runtime/app/storage/repository.py; revisit: when any trigger metric fires)* | External reviewer flagged LanceDB as eventually-wrong for operational tables. Iter-3 Researcher: don't migrate now, architect for it. All Lance access routes through Repository wrappers. Migration triggers instrumented as Prometheus metrics: `tasks` row count > 500K, OR `agent_tasks` p95 mutation latency > 100 ms, OR any operation requires cross-row transactional guarantee. When triggered: 2-week swap of `mutable_transactional` tables to PostgreSQL primary; `append_analytical` + `vector` stay on Lance. Pattern source: Notion CQRS, Pinecone → Postgres migrations (2023-2024 postmortems), Weaviate hybrid at >100M objects. ~300 LOC for the wrappers + metric emission. |
+| 2026-05-27 | **Phase 6.9 — Constitution schema with mandatory `evaluator_id`; loader refuses to load untyped entries.** *(owner: agent-runtime/app/constitution/loader.py; revisit: Phase 7 evaluator-registry expansion)* | External reviewer: "Constitution layer may become operationally fuzzy. Drift into vague natural-language governance sludge." Iter-3 Researcher response: every constitution.json entry must have (`metric_name`, `comparison_op`, `threshold`, `evidence_source`, `evaluator_id`). **`evaluator_id` is non-negotiable** — entries without an evaluator are not policy, they're aspiration; loader refuses to load them. Pattern source: Anthropic Responsible Scaling Policy (capability × eval × threshold × action tuple), OpenAI Model Spec (explicit conflict-resolution rank), NIST AI RMF as the negative example (typing without evaluators is theater). Phase 6.9: schema + loader + 5-10 evaluators wired. Phase 7: expand evaluator registry to cover every constitutional objective. ~200 LOC. |
+| 2026-05-27 | **Phase 6.7 — APR (Artifact Production Ratio) metric + circuit breaker** operationalises the new §2 design principle. | See "New §2 design principle" entry above. The circuit breaker is the load-bearing piece: Veilguard now has a structural answer to the question "is this system actually doing work?" beyond looking at logs. |
+| 2026-05-27 | **Existing strengths the external reviewer missed (surfaced by iter-3 Evaluator).** | Reviewer wrote a thorough critique but read some spec text as deployed reality (`rank_proposals` in `director.md` frontmatter is not in `_ALL_TOOLS` — it's a Phase 3 deliverable not yet wired), and conflated systems (the 13 memory destinations span agent-runtime AND TCMM, which is a separate codebase at `~/.gemini/antigravity/tcmm/`; the 9-10 min cycle is TCMM's `run_cycle()`, separate from agent-runtime's DreamScanner 600s poll). Strengths the critique missed: (1) SHA-chained `task_comments` (anti-tampering), (2) explicit server-of-record trust-boundary per field (§3.8.5), (3) Magentic-One-style `task_progress.py` ledger (Phase 4 already shipped), (4) per-tenant proactive-config pause, (5) atomic lease semantics on `agent_tasks`. These existing properties strengthen the Phase 6 foundation. |
+| 2026-05-27 | **New §2 design principle: "TCMM is the knowledge-graph substrate; the ledger is the state machine."** *(owner: §2 + Phase 7.1; revisit: when M5 alignment_rationale or M6 secret-justification features are proposed)* | Produced by a 2-iteration TCMM-unification panel (iter-4 + iter-5). Iter-4 surfaced the critical finding that `org_memory` is **accidentally duplicated** vs TCMM's `team/knowledge/` channel — Phase-3 incompleteness, not design choice. The lessons module writes Lance but never observes to TCMM; the dream cycle reads TCMM's dream_archive but writes Lance org_memory; the loop never closes. The boundary rule (TCMM = knowledge-graph contributors, ledger = state machine, observations may reference ledger PKs but never mirror ledger fields, never dual-write operational state) aligns Veilguard with the universal production pattern: Magentic-One Task Ledger vs working memory, MemGPT/Letta main/recall/archival, Cognition Devin ("decisions must be reconstructible exactly — RAG is unsafe"), Anthropic Multi-Agent Research (Jun 2025: lead plan vs subagent findings), and event-sourcing's one-way projection (Kafka, Datomic, EventStore). Resolves into Phase 7.1 with 4 migrations and 6 ACs. |
+| 2026-05-27 | **Phase 7.1 — 4 migrations close the TCMM-ledger duplication.** *(owner: agent-runtime/app/memory/writers.py + lessons.py + outcomes.py + proposals.py + comments.py; revisit: after each migration's AC subset passes CI)* | M1 `org_memory` → TCMM `team/knowledge/<team_id>/` (lane=org_critic, hard-include, ~80 LOC) — first because lowest risk and closes the duplication. M2 `proposal_outcomes` keeps numeric in ledger; narrative observations born in TCMM via `dream/prediction_record.py` with `tcmm_obs_id ↔ outcome_id` cross-ref (~150 LOC) — adds the cross-ref pattern M3 reuses. M3 `task_proposals` migrates `proposed_brief` + `rationale` to TCMM `archive[source_kind=proposal]`; status index stays in ledger (~200 LOC). M4 `task_comments[kind=discussion/note]` → TCMM `agent/<aid>/observations/`; SHA-chained kinds stay (~150 LOC) — must land after Phase 6.8 writer-function discipline so the lint enforces the routing split. Total ~580 LOC. |
+| 2026-05-27 | **Rejected iter-5 Critic amendments (explicit forcing-function entry to prevent drift back).** *(owner: Phase 7 reviewer; revisit: only if a real feature surfaces that motivates the rejected amendment)* | Iter-5 Critic proposed 5 additional amendments to the Phase 7 plan. After a user-driven forcing function ("the panel is finding work for itself"), four were rejected: **(a) M5 `alignment_weights[narrative]` migration** — premature; recalibration narrative isn't a feature today; add when the feature ships. **(b) "Free text bound to never-compress guarantee" clause in §2 rule** — edge case for operator-justification on secret rotation, which doesn't exist; main rule already covers via "hash-chained audit lives in ledger." **(c) "References between TCMM rows are graph edges" clause in §2 rule** — true but obvious; TCMM-internal refs are TCMM's whole point. **(d) `# boundary: split-writer` annotation discipline + fail-closed enum + 13 of the 21 proposed ACs** — over-engineered; with 3 split writers (M2, M3, future M5) the dual-write scanner hard-codes function names; AC-P7.6 is the runtime backstop. Only the "reference vs mirror" addition from iter-5 Researcher + the cross-ref protocol from iter-4 Critic survived into the rule + Phase 7.1. The rejected items are documented here so future iteration must explicitly argue against this entry. |
+| 2026-05-27 | **Evaluation lens: Veilguard is an organizational OS, not an assistant.** *(owner: any reviewer; revisit: never — this is foundational)* | Surfaced by an external review of the post-iter-3 spec: "The architecture now reads less like 'chatbot with helpers' and more like 'event-sourced cognitive operating system with semantic memory.'" Going forward, every feature is evaluated against OS properties — **replayability, authority boundaries, isolation, observability, deterministic state transitions, scheduler behavior, memory pressure, organizational throughput** — not chatbot properties (conversation quality, instruction-following, persona consistency). The chatbot properties still matter for the foreground UX (LibreChat is a chatbot), but the agent-runtime platform is graded against OS criteria. This reframing justifies: (a) Phase 6's structural completion gates over prompt engineering, (b) Phase 7's strict separation of state machine from knowledge substrate, (c) Phase 8's runtime replay determinism as a first-class requirement before self-mutating behavior ships, (d) the rejection of conversation-volume metrics in favor of APR. The single sentence that captures the lens: **"Tasks transform state through hash-chained, replayable, authority-scoped transitions; memory accumulates as a separate semantic graph; conversations are scaffolding for both."** |
+| 2026-05-27 | **Subsystem-ROI design principle added to §2.** *(owner: every PR proposing a new subsystem; revisit: each Phase post-mortem)* | Companion to APR. APR measures the system; this principle requires per-subsystem ROI. Every subsystem in `agent-runtime/app/` (proposal_taxonomies, stance_arcs, reflective_heuristics, regret_weighting, future additions) must be defensible against: "What measurable outcome moves when this subsystem is on vs off?" Qualitative answers ("richer recall") = decoration, not infrastructure. Existing subsystems audited at Phase 6 post-mortem; new subsystems must pass before merging. Mechanically enforced via a `tests/SUBSYSTEM_ROI.md` companion file naming each subsystem + its metric + on/off measurement + removal threshold. The architecture is now elegant enough that preserving abstractions because they're beautiful is the dominant failure mode — this principle is the guardrail. |
+| 2026-05-27 | **Phase 8 runtime replay determinism added as a Phase-8 sub-deliverable.** *(owner: Phase 8 implementation; revisit: before any self-mutating feature ships beyond Phase 6.9)* | Distinct from Phase 4 Replay v1 (lineage-tree counterfactual UI). Runtime replay determinism: given a complete snapshot at time T, can we reproduce the exact decision an agent made? Trigger condition: must produce deterministic reproduction of at least one full decision trace (proposal → critic decision → outcome → recalibration delta) before regret-weighted recalibration or institutional memory consolidation feature ships beyond Phase 6.9. Without it, autonomous proposal generation + self-recalibration produce an OS where you can see *that* a decision was made but not *why* — unauditable, which is existential for an organizational-OS framing. Scope: snapshot anchors at every Director decision point (content hash of all input substrates), deterministic re-execution against frozen snapshots, reproduction tolerance bounded by LLM non-determinism (compare reasoning envelopes, not exact tokens). ~600 LOC. |
+| 2026-05-28 | **Phase 7 wire-up landed — all four split-writers active in production callsites.** *(owner: agent-runtime/app/proposals/{dream_scanner,outcomes,lessons,constitution_amendments}.py + app/main.py; revisit: when TCMM comes back online to verify tcmm_obs_id cross-refs populate)* | Phase 7.1's writers were defined 2026-05-27 but the production code paths still called the low-level `_props.create_proposal` / `write_lesson` / `_write_outcome` helpers, so `tcmm_obs_id` columns stayed NULL and no TCMM observations were created from agent-runtime. **2026-05-28**: migrated all five production callsites — `dream_scanner._scan_once`, `main.py:POST /proposals`, `constitution_amendments.propose_one`, `outcomes.compute_one`, `lessons.promote_one` — to await the Phase 7 split-writers (`record_proposal_with_content`, `record_outcome_with_narrative`, `promote_lesson_to_team_knowledge`). This required cascading async through three `run_one_cycle` worker functions; their tests were updated to match. Schema migrations also extended: `task_proposals` + `proposal_outcomes` now gain `tcmm_obs_id` via the new `_migrate_add_tcmm_obs_id` recreate-merge helper (the Lance SQL-DEFAULT parser rejects the cast-from-NULL form on current versions), and `main.py:_startup` now eagerly opens every table in `TABLE_SCHEMAS` so migrations apply on container restart rather than lazily on first write. Live verification (with TCMM down): dream_scanner emitted 6 proposals through the new path, ledger commits succeeded, `tcmm_obs_id=NULL` per spec's documented fallback. When TCMM is up, cross-refs will populate automatically with no further code change. Wire-up locked in against regression by `tests/runtime_health/test_phase_7_wire_up.py` (15 source-grep tests; AST-rejects any direct `_props.create_proposal` call in wired modules). |
+| 2026-05-28 | **Phase 7 M1 final cutover landed — org_memory Lance table dropped.** *(owner: agent-runtime/app/memory/lessons_reader.py + main.py lesson endpoints + constitution_amendments.run_one_cycle; revisit: when retirement/decay/reinforcement features re-appear)* | The 1-week parallel-write soak was deemed unnecessary because production had zero lessons in org_memory (only test seeds existed). Cutover steps: (a) one-shot backfill migrated existing org_memory rows to TCMM via the M1 split-writer (1 candidate / 1 migrated); (b) `app/memory/lessons_reader.py` shipped, scanning TCMM `archive` Lance file directly for rows starting with `[lesson]` prefix and filtering by `user_id` column (tenant isolation per memory `architecture_tcmm_api.md`); (c) reader collapses multiple-observations-per-trigger into a single row with `reinforcement_count` = distinct extracted_by tags; (d) 5 main.py endpoints (review_queue, amendment_candidates, lesson_decision, work_items_view) migrated to TCMM reader; (e) `lesson_decision` now writes append-only `[lesson_kept]`/`[lesson_retired]` markers instead of mutating Lance rows in place; (f) `constitution_amendments.run_one_cycle` reads from TCMM via `find_amendment_eligible_lessons`; (g) legacy `write_lesson` call removed from `promote_lesson_to_team_knowledge` (TCMM-only); (h) `org_memory` dropped from `TABLE_SCHEMAS` + `REPOSITORY_REGISTRY` + on-disk (`db.drop_table`); (i) `update_org_memory` deprecated to asyncio-wrapped shim around Phase 7 writer for back-compat. Bonus bug caught: middleware hardcodes namespace `agent/<agent_id>/observations/<user_id>` ignoring caller's `team/knowledge/<team_id>` conv_id (`[F4c_LESSON_NAMESPACE_2026_05_28]`) — reader works around it via text-prefix + user_id filter. AC-P7.2 flipped from "transitional" to strict assertion: `'org_memory' not in TABLE_SCHEMAS`. 440 tests green. |
+| 2026-05-28 | **Q22 retired (no micro-dreams).** *(owner: spec § Q22; revisit: only if benchmarks regress past 5-min cycle)* | Original premise — "TCMM's 9-10 min `run_cycle()` is the largest architectural pressure point" — is obsolete. Live trace from `bench_F_phase3_group` (100-block cold-cache cycle, `--no-cache`, AI Studio backend): `cycle_wall=112.3s` (~1.9 min), 46 LLM calls @ 0% hit rate, top stage `_run_causal_counterfactual_52h`=11s × 2 calls, full harness 151s incl. init. With warm cache + larger workloads this stays sub-3-min. The proposed Q22 architecture (hot overlay graph + Pinot-style lambda merge at retrieval) is sized for a 10-min cycle — at <2-min the operational complexity (two graph layers + query-time merge + cycle-fold coordination) doesn't pay for itself. **Decision: retire Q22 entirely.** No micro-dream / overlay work scheduled. If a benchmark ever crosses 5-min wall-time on representative workloads the question reopens. The only surviving piece worth implementing later is event-triggered cycle firing (importance-sum threshold → fire `run_cycle` early instead of waiting for poll) — that's ~50 LOC inside the existing dream worker, not a new substrate. |
+| 2026-05-28 | **Phase 7.5 `llm_verify` check_kind landed under the paired-mechanical rule.** *(owner: app/acceptance/executors.py + tests/acceptance/test_llm_verify.py; revisit: when Critic dispatch wires `ctx['llm_judge']` to a real LLM adapter)* | Phase 6 deliberately deferred `llm_verify` per the iron rule (LLM-only verification can't be a sole gate — rubber-stamp risk). Phase 7.5 added it back under the **paired-mechanical rule**: `llm_verify` is in `CHECK_KINDS` (executable) but NOT in `MECHANICAL_CHECK_KINDS`, so the Director-side `create_task` validator (`ledger/tasks.py:130-143`) still requires ≥1 required AC of a mechanical kind. `llm_verify` becomes a *quality lift* — it can fail tasks the mechanical layer let through (catching prose quality, factual grounding, subjective ACs), but it cannot clear what the mechanical layer hasn't cleared. Executor takes `{rubric, target_path | target_text, model?, allow_large?}` and a `ctx['llm_judge']` callable; returns 3-state CheckResult with evidence carrying `rubric_sha + artifact_sha + verdict + confidence`. Cost guards: 4KB rubric cap, 50KB artifact cap (override via `allow_large=True`). Sandbox: `target_path` resolves via `_safe_path` so workspace escape attempts hit `error`, not pwn. Missing-judge / bad-verdict / judge-raised conditions all surface as `error` (block gate with diagnostic). 20 unit tests + iron-rule integration tests pass; existing AC-4 test updated to reflect the 8-kind registry (was 7). Critic dispatch must inject `ctx['llm_judge']` from a real adapter — left as a wiring TODO since the test stubs prove the contract end-to-end. |
+| 2026-05-28 | **Phase 7.5 `depends_on TEXT[]` landed — cross-lineage DAG dependencies.** *(owner: app/ledger/schemas.py + tasks.py + workers/inbox_poller.py; revisit: when the Director-tool surface gains a `verify_depends_on_acyclic` exposure for plan-time validation)* | `parent_id` + `lineage_chain` model only single-edge subtask trees (producer-of-X chain).  Real Director workflows have fan-in: Researcher A + Researcher B → Builder consumes both → Critic reviews → Director synthesises.  Phase 7.5 added a `depends_on: list<string>` column to `agent_tasks` so tasks can declare cross-lineage preconditions explicitly.  Helpers `deps_satisfied(task) -> (ready, pending_dep_ids)` and `verify_depends_on_acyclic(task_id, depends_on, ...) -> (ok, cycle_path)` live in `ledger/tasks.py`.  Inbox-poller (`_poll_once`) gained a pre-claim guard at `[PHASE_7_5_DEPENDS_ON_2026_05_28]` that calls `deps_satisfied` before `_try_claim` and skips blocked tasks with a debug log naming the pending dep_ids — closes the race window where a Builder gets dispatched before its Researcher prerequisite completes.  `create_task` validates that every dep id exists in the same (tenant, user) scope and rejects self-loops at the boundary; full cycle detection is exposed via `verify_depends_on_acyclic` for Director plan-time checks.  Generic missing-column migration extended to also run on `agent_tasks` (the previous dispatcher routed agent_tasks ONLY to the struct-aware migrator, so additive nullable columns like `depends_on` and `emergency_lane` were silently missed until a forced restart).  13 unit tests + live end-to-end smoke (task B blocked on task A, cycle detected, phantom dep rejected).  Live verified: `agent_tasks` table grew to 105 rows post-migration with `depends_on` column added in-place. |
+| 2026-05-28 | **Phase 7.5 `agent_teams` table + `team-lead` persona landed.** *(owner: app/ledger/teams.py + app/ledger/schemas.py + app/ledger/tasks.py + agents/team-lead.md; revisit: when Director gets a `create_team` MCP tool + cost rollup endpoint)* | The "organisational scaling primitive" the spec called out for Phase 7.5.  New `agent_teams` Lance table carries `(name, lead_agent_id, member_agent_ids, budget_usd, budget_cap, cost_attributed_cached_usd)`.  `agent_tasks` gains an optional `team_id` column.  CRUD module `app/ledger/teams.py` provides `create_team`, `get_team`, `list_teams`, `add_member`, `team_cost_attributed`, `budget_exceeded`.  `create_task` got a `team_id` param + three-stage guard at `[PHASE_7_5_TEAM_ID_2026_05_28]`: unknown team → ValueError; team status≠active → ValueError; cost rollup ≥ budget × cap → ValueError with the actual cost figures so Director can route the message back to the user.  `budget_cap` defaults to 1.0 (hard ceiling) and is operator-tunable per team (e.g. 1.2 = 20% slack).  `team-lead` persona added (`agents/team-lead.md`): mini-Director scoped to one team, owns within-team routing + the team's review queue, escalates cross-team / cross-budget / cross-constitution decisions to Director.  Persona registered in `VALID_OWNER_IDS`.  16 unit tests + live end-to-end smoke: team created with $50/cap=1.0, task assigned, budget check returned $0/$50 exceeded=False; forced $60 spend → budget_exceeded fired with proper figures; new `create_task` then rejected with `"team has already crossed its budget envelope (attributed=$60.00 >= ceiling=$50.00)"`.  Schema migration ran live: `agent_teams` table created from scratch + `team_id` column added to `agent_tasks` (107 rows backfilled with NULL via the generic missing-nullable-column helper). |
+| 2026-05-28 | **Phase 7.5 follow-up sweep — six small finishers landed in one turn.** *(owner: many; revisit: with the focused Phase 8 replay-harness session)* | **(1) Phase 8.0 snapshot anchor primitive** (`app/replay/snapshot_anchor.py` ~250 LOC + 18 tests): `SnapshotAnchor` dataclass + `compute_anchor()` pure-function + `record_anchor()` persistence to `agent_tasks.extras_json.snapshot_anchors`.  Hash composes 7 inputs (task_graph, approvals, tool_outputs, constitution_version, tcmm_snapshot_ref, alignment_weights_ver, dream_graph_signals_ref) + decision_point + schema version — ts and extras deliberately excluded.  **Honest scope cap**: the replay harness (frozen-snapshot reconstruction + reasoning-envelope comparison) is the multi-session piece that's been explicitly deferred to a focused follow-up; this lands only the foundation primitive other parts will compose on.  **(2) `llm_judge` adapter wired into Critic dispatch** — `app/acceptance/llm_judge.py` provides `default_llm_judge` that lazy-imports the Anthropic backend; `run_check` auto-injects it for `llm_verify` when no `ctx['llm_judge']` is provided.  Backend-unavailable RAISES so the executor catches it as `error` (preserves the existing "missing judge → error" contract).  **(3) Director MCP `create_team` / `list_teams` / `team_cost_report` tools** added to `ledger_mcp.py` (3 new tools, tool count 14 → 17).  HTTP endpoints `/teams` and `/teams/<id>/cost` added to `main.py` — sidebar can now render the teams panel and the cost-consumed gauge.  **(4) Event-triggered dream cycle firing** — `DreamScanner` gained `notify_importance(score)` and `fire_now(reason)` methods + an `_wake_evt` raced against the `interval_seconds` timeout in `run()`.  Importance threshold is env-tunable via `VEILGUARD_DREAM_IMPORTANCE_THRESHOLD` (default 5.0).  Surviving piece of the retired Q22.  **(5) Lessons.py maintenance cleanup** — `find_lessons_due_for_review`, `expire_stale_lessons`, `apply_confidence_decay`, `reinforce_lesson`, `run_maintenance_cycle` collapsed into deprecation stubs that warn once and return no-op summaries (was 245 LOC of dead code referencing the dropped `lessons_tbl`).  **(6) AC-P7.6 audit endpoint test-fixture filter** — `agent/test/*` rows now skip by default; operator can re-include via `?include_test=1`; response carries `test_fixture_skipped` count.  Closes the 19-violation noise the M4 backfill exposed.  **All six landed in one turn**; tests touched: +18 (snapshot_anchor), +3 (ledger_mcp tool count), no broken tests. |
+| 2026-05-28 | **Phase 7.5 closure — cost write-back + Director persona teams guidance + team_id propagation + snapshot-anchor decision-point wiring.** *(owner: app/ledger/tasks.py + app/runtime.py + app/middleware/tenant.py + agent/director.py + agents/director.md; revisit: with the focused Phase 8 replay-harness session)* | Four sub-deliverables shipped to close all remaining Phase 7.5 loose ends in one session: **(A) Cost write-back** — `app/ledger/tasks.py` gained `increment_cost_attributed(task_id, tenant_id, user_id, delta_usd)` which read-then-writes the per-task cost; `runtime.run_agent_query`'s turn-end hook calls it with `_cost_from_tokens(model, in, out, cc, cr)` whenever `task_id` is set.  Closes the team budget loop — `team_cost_attributed()` now sees live spend without a sweeper.  Guarded behind `if task_id:` so `/agent/query` chat turns aren't billed.  **(B) Director persona teams guidance** — `agents/director.md` got a dedicated "TEAMS (Phase 7.5 — organisational scaling)" section: when to form a team (sustained multi-task initiatives, not one-offs), team-budget discipline (`team_cost_report` before big decisions, warn at 80%, stop at 100%), team-lead delegation rule (route inbound to team-lead once the team has one; don't be the within-team router for a team that has its own lead).  **(C) `team_id` propagation** — `TenantContext` gained optional `task_id + team_id` fields; `set_tenant_context` and `run_agent_query` plumb them through; inbox-poller `_dispatch` reads `task_row['team_id']` and threads it to the dispatch context.  Downstream tool calls now see the team without re-reading the task row.  **(D) Snapshot anchor wiring at Director decision points** — `DirectorAgent.route / synthesize / propose` each call a new `_emit_anchor(decision_point, signal, task_id?)` helper that builds a `SnapshotAnchor` from the live `TenantContext` and persists via `record_anchor`.  Best-effort by design: no tenant context, replay package missing, or anchor write failure all silently skip so the Director decision is never blocked.  Anchor decision points (`director.route`, `director.synthesize`, `director.propose`) are aligned 1:1 with `DIRECTOR_METHOD_LATENCY_MS` buckets so a replay match has a corresponding latency measurement.  **Test totals**: +5 (team_id propagation) + +5 (cost write-back) + +5 (anchor wiring) = 15 net-new.  **Phase 7.5 declared closed**; the only remaining Phase 8 work is the replay harness itself (frozen-snapshot reconstruction + reasoning-envelope comparison + 1-week per-anchor test scaffolding per spec) which is honestly a focused session, not a part-of-a-sweep deliverable. |
 
 ---
 

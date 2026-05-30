@@ -17,8 +17,19 @@ dependencies = [
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+# Windows tray + toast UI.  build.bat installs this group before
+# running PyInstaller; the Linux sandbox container ignores it and uses
+# requirements-headless.txt instead (no tray on a server).
+windows = [
+    "pystray>=0.19.5,<0.20",
+    "Pillow>=10.0,<12",
+    "winotify>=1.1.0,<2",
+]
+
 [project.scripts]
 veilguard = "veilguard_client:main"
 
 [tool.setuptools]
 py-modules = ["veilguard_client", "setup_server"]
+packages = ["daemon"]

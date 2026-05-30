@@ -44,7 +44,7 @@ Usage:
 # they finished installing. From 0.2.4 onwards, right-click ->
 # Properties -> Details on VeilguardSetup.exe shows the version
 # directly, and the AppId pin makes the upgrade flow predictable.
-__version__ = "0.2.5"
+__version__ = "0.9.3"
 
 
 class CredentialsRevokedError(Exception):
@@ -85,12 +85,66 @@ try:
 except ImportError:
     httpx = None
 
+def _daemon_log_path() -> str:
+    """Where the daemon writes its rotating log file.
+
+    Windows: %LOCALAPPDATA%\\Veilguard\\daemon.log
+    Linux:   ~/.veilguard/daemon.log
+    """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~\\AppData\\Local")
+        return os.path.join(base, "Veilguard", "daemon.log")
+    return os.path.join(os.path.expanduser("~"), ".veilguard", "daemon.log")
+
+
+# Console=False in the PyInstaller spec means stdout/stderr disappear
+# when run as a tray-resident process.  We still want logs visible —
+# the tray's "Logs" tab tails the file below.  RotatingFileHandler
+# caps disk use at ~3 MB (1 MB × 3 rolls); plenty for debugging
+# without blowing up over time.
+_LOG_PATH = _daemon_log_path()
+try:
+    os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+    from logging.handlers import RotatingFileHandler
+
+    class _FlushingRotatingFileHandler(RotatingFileHandler):
+        """RotatingFileHandler that flushes after every record.
+
+        Stock behaviour buffers up to ~4 KB; on a hard process kill the
+        last ~hundred log lines are lost, which makes post-mortem
+        debugging brutal.  Flushing is cheap on the daemon's volume
+        (~dozens of records per minute) and the trade-off favours
+        observability over a few extra fsync() calls.
+        """
+        def emit(self, record):
+            super().emit(record)
+            try:
+                self.flush()
+            except Exception:
+                pass
+
+    _file_handler = _FlushingRotatingFileHandler(
+        _LOG_PATH, maxBytes=1_000_000, backupCount=3, encoding="utf-8",
+    )
+    _file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+except Exception:
+    _file_handler = None
+
+_handlers: list = [logging.StreamHandler()]   # stderr; harmless when console=False
+if _file_handler is not None:
+    _handlers.append(_file_handler)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [veilguard-client] %(message)s",
     datefmt="%H:%M:%S",
+    handlers=_handlers,
 )
 logger = logging.getLogger("veilguard-client")
+logger.info(f"[boot] daemon log file: {_LOG_PATH}")
 
 
 # ── Safety Validation (embedded from utils/safety.py) ────────────────────────
@@ -221,8 +275,30 @@ class ToolExecutor:
         limit = int(args.get("limit", 500))
         with open(full, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
+        total_lines = len(lines)
         selected = lines[offset:offset + limit]
-        return "".join(f"{offset + i + 1}\t{l}" for i, l in enumerate(selected))
+        body = "".join(f"{offset + i + 1}\t{l}" for i, l in enumerate(selected))
+        # [F13_EXPLICIT_COMPLETENESS_2026_05_27] Critic-claim consistently
+        # hallucinated "truncated at line 25" when given a 42-line file
+        # with no completeness marker, then spun re-reading the same
+        # range 12+ times.  Daemon was returning the full file every
+        # time; the model just couldn't tell.  Now we emit an explicit
+        # footer so the model has a ground-truth signal rather than
+        # having to infer completeness from the absence of a marker.
+        end_line = offset + len(selected)
+        if end_line >= total_lines:
+            footer = (
+                f"\n\n[end of file — {total_lines} line(s) total, "
+                f"all shown]"
+            )
+        else:
+            remaining = total_lines - end_line
+            footer = (
+                f"\n\n[partial read — showed lines {offset + 1}-{end_line} "
+                f"of {total_lines}; {remaining} more line(s) available, "
+                f"call again with offset={end_line}]"
+            )
+        return body + footer
 
     def _tool_write_file(self, args: dict) -> str:
         path = args.get("path", "")
@@ -711,41 +787,126 @@ async def auto_updater(server_ws_url: str, explicit_manifest_url: str = ""):
 # ── WebSocket Client ─────────────────────────────────────────────────────────
 
 async def run_daemon(config: dict):
-    """Main daemon loop — connect, authenticate, handle tool requests."""
-    server = config["server"]
-    token = config.get("token", "")
-    # user_id is REQUIRED by the server for per-user token validation.
-    # setup_server.save_config() writes it to ~/.veilguard/config.yaml;
-    # if it's missing the user needs to re-copy their QR code from
-    # LibreChat's "Connect Client" panel.
-    user_id = config.get("user_id", "")
+    """Main daemon loop — orchestrates one WS session per enabled env.
+
+    0.4+ behaviour: config can declare multiple `environments`, each
+    with its own server/token/user_id.  The daemon spawns one
+    asyncio task per enabled+complete env and runs them in parallel,
+    so a user paired with BOTH prod and a local dev stack gets tool
+    calls routed correctly to either side at the same time.
+
+    Backward compat: old configs (top-level server/token/user_id)
+    auto-migrate to a single "default" env via parse_environments().
+    """
+    from daemon.env import parse_environments
+
     client_id = config.get("client_id", "veilguard-client")
     project_root = os.path.realpath(config.get("project_root", "."))
-
     executor = ToolExecutor(project_root)
+
+    logger.info(f"Veilguard Client v{__version__}")
+    logger.info(f"Project root: {project_root}")
+
+    # Register the AppUserModelID for this process so Windows binds
+    # our toasts (winotify uses app_id="Veilguard") to a coherent
+    # identity.  Without this, Windows may not display banners + the
+    # app stays missing from Settings → Notifications even with the
+    # Start Menu shortcut having an AUMID property.  Belt-and-braces
+    # with the installer's [Icons] AppUserModelID setting.
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "Veilguard"
+            )
+            logger.info(
+                "[boot] AUMID registered: SetCurrentProcessExplicitAppUserModelID('Veilguard') OK"
+            )
+        except Exception as _e:
+            logger.warning(f"[boot] AUMID registration failed: {_e}")
+
+    envs = parse_environments(config)
+    enabled = [e for e in envs.values() if e.enabled and e.is_complete()]
+    if not enabled:
+        if envs:
+            disabled_or_incomplete = ", ".join(
+                f"{e.name}(disabled={not e.enabled},complete={e.is_complete()})"
+                for e in envs.values()
+            )
+            logger.warning(
+                f"[ENV] no enabled+complete envs to run: {disabled_or_incomplete}"
+            )
+        else:
+            logger.warning(
+                "[ENV] no environments declared — daemon will sit idle. "
+                "Pair via 'Set up Veilguard' in LibreChat, or paste a "
+                "veilguard://configure?… link."
+            )
+        # Block so the process stays alive (auto-updater + tray + handoff
+        # listener still work).  Without this, an unpaired daemon would
+        # exit immediately and Inno Setup's RestartApplications would
+        # bounce it in a loop.
+        while True:
+            await asyncio.sleep(60)
+        return
+
+    logger.info(
+        f"[ENV] spawning {len(enabled)} session(s): "
+        f"{[(e.name, e.server) for e in enabled]}"
+    )
+
+    # Per-env outgoing message queue.  The tray's set_permission_level
+    # callback writes into the env-named queue; each env's drainer
+    # task only sends from its own.  Stash on config so the tray can
+    # reach the right one.
+    import queue as _stdq
+    config["_outgoing_queues"] = {
+        e.name: _stdq.Queue(maxsize=64) for e in enabled
+    }
+
+    # Auto-updater runs once per process, independent of WS reconnects.
+    # We arbitrarily attach it to the first env's server URL — auto-
+    # update probes the manifest at $server/api/client/latest, which
+    # is the same on every env that runs sub-agents.
+    if config.get("auto_update", True):
+        asyncio.create_task(
+            auto_updater(
+                enabled[0].server,
+                config.get("update_manifest_url", ""),
+            )
+        )
+
+    # Per-env WS session tasks.  asyncio.gather keeps them all alive;
+    # if one raises, the others keep going (return_exceptions=True).
+    tasks = [
+        asyncio.create_task(
+            _run_env_session(env, executor, config, client_id),
+            name=f"veilguard-env-{env.name}",
+        )
+        for env in enabled
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _run_env_session(
+    env, executor, config: dict, client_id: str,
+):
+    """One environment's connect → auth → message loop → reconnect cycle.
+
+    Extracted from the legacy single-env run_daemon body.  Same WS
+    handling, same heartbeat / drainer / message dispatch — just
+    parameterised on `env` (server/token/user_id) and the per-env
+    outgoing queue at config["_outgoing_queues"][env.name].
+    """
+    server = env.server
+    token = env.token
+    user_id = env.user_id
     reconnect_delay = config.get("reconnect_delay", 5)
     max_delay = config.get("max_reconnect_delay", 300)
     current_delay = reconnect_delay
 
-    logger.info(f"Veilguard Client v{__version__}")
-    logger.info(f"Project root: {project_root}")
-    logger.info(f"Server: {server}")
-    if not user_id:
-        logger.warning(
-            "[AUTH] No user_id in config — server will reject auth. "
-            "Re-pair via LibreChat's 'Connect Client' panel, or add "
-            "'user_id: <your-lc-user-id>' to ~/.veilguard/config.yaml."
-        )
-    else:
-        logger.info(f"[AUTH] user_id: {user_id[:8]}...{user_id[-4:]}")
-
-    # Auto-updater runs for the lifetime of the process, independent of
-    # WebSocket reconnects. If it triggers an update it calls os._exit(0)
-    # so Inno Setup can overwrite files.
-    if config.get("auto_update", True):
-        asyncio.create_task(
-            auto_updater(server, config.get("update_manifest_url", ""))
-        )
+    logger.info(f"[ENV:{env.name}] server={server}")
+    logger.info(f"[ENV:{env.name}] [AUTH] user_id: {user_id[:8]}...{user_id[-4:]}")
 
     while True:
         try:
@@ -794,6 +955,27 @@ async def run_daemon(config: dict):
                             if os.name == "nt"
                             else os.environ.get("SHELL", "")
                         ),
+                        # [PHASE_0_0_4_CAPABILITY_HANDSHAKE_2026_05_27]
+                        # Per spec §0.4 + §0.0.4 — declare which JSON-RPC
+                        # methods this build of the daemon implements.
+                        # The server stores these on the bridge and
+                        # uses ``bridge.has_capability(name)`` to gate
+                        # feature calls.  Add a string here when you
+                        # land a new JSON-RPC handler in the daemon;
+                        # otherwise the server will see the older
+                        # build's set and gracefully degrade.  Keep
+                        # alphabetical for determinism.
+                        "capabilities": [
+                            "approval_callback",     # POSTs back to /api/client/approval_callback
+                            "bypass_rules",          # honours bypass-rule add/remove
+                            "edit_file",             # str-replace tool
+                            "execute_remote",        # runs shell tools sent by the cloud
+                            "file_io",               # read_file / write_file
+                            "host_hint",             # accepts host-hint prepending on first run_command
+                            "request_approval",      # renders toast + returns user decision
+                            "task_dispatch_drainer", # processes pending task dispatch queue
+                            "toast",                 # informational toasts (no decision required)
+                        ],
                     },
                 }))
 
@@ -819,6 +1001,14 @@ async def run_daemon(config: dict):
 
                 logger.info(f"Authenticated as '{client_id}'")
                 current_delay = reconnect_delay  # Reset on success
+                # Flip tray to "connected" — repaints from offline grey
+                # back to the task-derived idle/busy/approval state.
+                _tray_obj = config.get("_tray")
+                if _tray_obj is not None:
+                    try:
+                        _tray_obj.set_connection_state(True)
+                    except Exception:
+                        pass
 
                 # Start heartbeat
                 async def heartbeat():
@@ -831,23 +1021,128 @@ async def run_daemon(config: dict):
 
                 hb_task = asyncio.create_task(heartbeat())
 
-                # Message loop — tool calls run in parallel via asyncio tasks
+                # Drain daemon→cloud outgoing queue.  The tray feeds
+                # this when the user changes permission_level via the
+                # right-click menu.  Survives backpressure: stops
+                # consuming on WS error so the queue holds items until
+                # the next reconnect picks them up.
+                # Per-env outgoing queue.  Multi-env build (0.4+) keeps
+                # one queue per env in config["_outgoing_queues"] so the
+                # tray's set_permission_level callback can fan out to
+                # specific servers without cross-talk.
+                _q = (config.get("_outgoing_queues") or {}).get(env.name)
+                if _q is None:
+                    _q = config.get("_outgoing_queue")   # legacy fallback
+
+                async def outgoing_drainer():
+                    import queue as _qmod
+                    if _q is None:
+                        logger.warning(
+                            f"[OUTGOING] no queue for env={env.name!r} "
+                            "— drainer exiting"
+                        )
+                        return
+                    logger.info(
+                        f"[OUTGOING] drainer started env={env.name} qid={id(_q)} "
+                        f"keys={list((config.get('_outgoing_queues') or {}).keys())}"
+                    )
+                    while True:
+                        try:
+                            item = await asyncio.to_thread(_q.get, True, 1.0)
+                        except _qmod.Empty:
+                            # Idle tick — no item.  Loop.
+                            continue
+                        except Exception as _e:
+                            # Some other failure pulling from queue.
+                            logger.warning(
+                                f"[OUTGOING] queue.get failed: "
+                                f"{type(_e).__name__}: {_e}"
+                            )
+                            await asyncio.sleep(0.5)
+                            continue
+                        logger.info(
+                            f"[OUTGOING] dequeued method={item.get('method')!r} "
+                            f"— attempting ws.send"
+                        )
+                        try:
+                            await ws.send(json.dumps(item))
+                            logger.info(
+                                f"[OUTGOING] sent method={item.get('method')!r}"
+                            )
+                        except Exception as _e:
+                            # Push back so we retry on reconnect.  If
+                            # the queue is full, drop with warning —
+                            # better than blocking the drainer.
+                            logger.warning(
+                                f"[OUTGOING] ws.send failed: "
+                                f"{type(_e).__name__}: {_e}",
+                                exc_info=True,
+                            )
+                            try:
+                                _q.put_nowait(item)
+                            except Exception:
+                                logger.warning(
+                                    f"[OUTGOING] discarded {item.get('method')!r}: {_e}"
+                                )
+                            break
+
+                drain_task = asyncio.create_task(outgoing_drainer())
+
+                # Message loop — tool calls run in parallel via asyncio tasks.
+                # Active set keeps GC references to in-flight tasks; the
+                # structured TaskRegistry mirrors the same entries with
+                # full state (status / args / result preview) for the
+                # tray UI and the LLM-queryable MCP tools.
                 active_tasks = set()
+                try:
+                    from daemon.tasks import TaskRegistry as _TaskRegistry
+                    _registry = _TaskRegistry.get()
+                except Exception as _e:
+                    _registry = None
+                    logger.debug(f"[TASKS] registry unavailable: {_e}")
 
                 async def run_tool(ws, executor, req_id, tool, args):
                     """Execute a tool and send the result back over WebSocket."""
                     logger.info(f"[TOOL] {tool}({list(args.keys())}) id={req_id}")
                     start = time.time()
+                    # Register with the task tracker so the tray + MCP
+                    # tools can see it.  Lookup happens before await so
+                    # the registry sees RUNNING immediately.
+                    if _registry is not None:
+                        try:
+                            _registry.start_tool(
+                                req_id, tool, args,
+                                future=asyncio.current_task(),
+                            )
+                        except Exception as e:
+                            logger.debug(f"[TASKS] start_tool failed: {e}")
+
+                    result = ""
+                    error = ""
                     try:
                         result = await executor.execute(tool, args)
+                    except asyncio.CancelledError:
+                        if _registry is not None:
+                            _registry.finish_tool(
+                                req_id, result="", error="cancelled",
+                                cancelled=True,
+                            )
+                        raise
                     except Exception as e:
                         result = f"Error: {e}"
+                        error = str(e)
                     elapsed = time.time() - start
 
                     if len(result) > 50000:
                         result = result[:50000] + "\n... [truncated]"
 
                     logger.info(f"[TOOL] {tool} done in {elapsed:.1f}s ({len(result)} chars)")
+
+                    if _registry is not None:
+                        try:
+                            _registry.finish_tool(req_id, result=result, error=error)
+                        except Exception as e:
+                            logger.debug(f"[TASKS] finish_tool failed: {e}")
 
                     await ws.send(json.dumps({
                         "jsonrpc": "2.0",
@@ -893,6 +1188,203 @@ async def run_daemon(config: dict):
                                 "result": {"folders": executor.get_folders()},
                             }))
 
+                        elif method == "request_approval":
+                            # Cloud is asking the user to approve a client-tool
+                            # call.  Phase C: route to the toast UI when
+                            # available; fall back to Phase A auto-approve
+                            # otherwise (headless containers, missing winotify,
+                            # tray-UI degraded mode).  See daemon/toast.py for
+                            # the click-capture HTTP shim.
+                            req_id = msg.get("id", "")
+                            params = msg.get("params", {}) or {}
+                            tool = params.get("tool", "")
+                            args_dict = params.get("args") or {}
+                            conv_id = params.get("conv_id", "")
+                            agent_id = params.get("agent_id", "user")
+                            level = params.get("level", "?")
+                            policy_decision = params.get("policy_decision", "?")
+                            timeout_s = int(params.get("timeout_s", 60) or 60)
+                            arg_keys = list(args_dict.keys())
+
+                            # Register the pending approval so the tray sees
+                            # it and the icon flips to "approval needed".
+                            if _registry is not None:
+                                try:
+                                    _registry.start_approval(
+                                        req_id, tool, args_dict,
+                                        conv_id=conv_id, agent_id=agent_id,
+                                        policy_decision=policy_decision,
+                                        level=level, timeout_s=timeout_s,
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"[TASKS] start_approval failed: {e}")
+
+                            logger.info(
+                                f"[APPROVAL] req={req_id} tool={tool!r} "
+                                f"policy={policy_decision} level={level} "
+                                f"conv={conv_id[:8]} args={arg_keys}"
+                            )
+
+                            # Try the real Windows toast first.  Falls back to
+                            # auto-approve (Phase A behavior) when UI is
+                            # unavailable — headless containers, missing
+                            # winotify, etc.
+                            approved = False
+                            reason = ""
+                            persist_for_conv = False
+                            try:
+                                from daemon import toast as _toast
+                                has_ui = _toast.HAS_TOAST_UI
+                            except Exception as _e:
+                                has_ui = False
+                                logger.debug(f"[APPROVAL] toast import failed: {_e}")
+
+                            if has_ui:
+                                # Real user-driven flow.
+                                try:
+                                    decision = await _toast.ask_user_via_toast(
+                                        tool=tool, args=args_dict,
+                                        conv_id=conv_id, agent_id=agent_id,
+                                        policy_decision=policy_decision,
+                                        level=level, timeout_s=timeout_s,
+                                        # Unify token so the viewer's
+                                        # inline Approve/Deny buttons
+                                        # (keyed by req_id in
+                                        # TaskRegistry) can resolve the
+                                        # SAME future the toast banner
+                                        # would.
+                                        request_id=req_id,
+                                    )
+                                    approved = decision.approved
+                                    reason = decision.reason
+                                    persist_for_conv = decision.persist_for_conv
+                                except Exception as e:
+                                    logger.error(f"[APPROVAL] toast flow raised: {e}")
+                                    approved = False
+                                    reason = f"toast_failed: {e}"
+                            else:
+                                # Headless / no UI — same fallback as Phase A.
+                                approved = policy_decision in ("allow", "approve")
+                                reason = (
+                                    "auto-approved by daemon (no UI; policy-based)"
+                                    if approved else
+                                    f"policy {policy_decision!r} not in allow/approve set"
+                                )
+
+                            if _registry is not None:
+                                try:
+                                    _registry.finish_approval(
+                                        req_id, approved=approved, reason=reason,
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"[TASKS] finish_approval failed: {e}")
+
+                            await ws.send(json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": req_id,
+                                "result": {
+                                    "approved":         approved,
+                                    "reason":           reason,
+                                    "persist_for_conv": persist_for_conv,
+                                    "tool":             tool,
+                                    "request_id":       req_id,
+                                },
+                            }))
+
+                        elif method == "dismiss_approval":
+                            # Cloud is cancelling a pending approval (e.g.
+                            # because the parent task was cancelled and we
+                            # don't want the user to click "approve" for
+                            # work that's already irrelevant).  Best-effort:
+                            # we can't actually dismiss the Windows toast
+                            # programmatically once it's on screen, but we
+                            # mark the approval future so the user's click
+                            # (if they ever make it) is ignored.
+                            #
+                            # When toast UI is unavailable (headless /
+                            # sandbox), the cloud-side gate already
+                            # auto-decided; this method is a no-op for
+                            # those flows.
+                            req_id = (msg.get("params") or {}).get("request_id", "")
+                            dismissed = False
+                            try:
+                                from daemon import toast as _toast
+                                # Pop the per-toast future so its
+                                # eventual callback is dropped.
+                                fut = _toast._pending.pop(req_id, None)
+                                if fut is not None and not fut.done():
+                                    fut.cancel()
+                                    dismissed = True
+                            except Exception as _e:
+                                logger.debug(f"[DISMISS] toast lookup failed: {_e}")
+                            # Also clean up the daemon-local TaskRegistry
+                            # pending entry so the tray icon refreshes.
+                            try:
+                                if _registry is not None:
+                                    _registry.finish_approval(
+                                        req_id, approved=False,
+                                        reason="dismissed by cloud",
+                                    )
+                            except Exception:
+                                pass
+                            logger.info(
+                                f"[DISMISS] approval req={req_id} "
+                                f"dismissed={dismissed}"
+                            )
+                            await ws.send(json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": msg.get("id", ""),
+                                "result": {"dismissed": dismissed,
+                                           "request_id": req_id},
+                            }))
+
+                        elif method == "list_local_tasks":
+                            # Daemon-local task snapshot (Phase D MCP).
+                            # Cloud's `list_my_tasks` MCP tool round-trips
+                            # this so the LLM can see {running, pending,
+                            # completed} on the user's machine.
+                            snap = (
+                                _registry.snapshot()
+                                if _registry is not None
+                                else {"running": [], "pending": [], "completed": []}
+                            )
+                            await ws.send(json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": msg.get("id", ""),
+                                "result": snap,
+                            }))
+
+                        elif method == "task_state":
+                            # Detail view for one task_id.  Returns None when
+                            # the id has been evicted from the completed cap.
+                            tid = (msg.get("params") or {}).get("task_id", "")
+                            rec = (
+                                _registry.get_task(tid)
+                                if (_registry is not None and tid)
+                                else None
+                            )
+                            await ws.send(json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": msg.get("id", ""),
+                                "result": rec,
+                            }))
+
+                        elif method == "cancel_task":
+                            # Best-effort cancel.  Only running tool calls
+                            # can be cancelled; pending approvals are
+                            # cancelled by the user dismissing the toast.
+                            tid = (msg.get("params") or {}).get("task_id", "")
+                            ok = (
+                                _registry.cancel_running(tid)
+                                if (_registry is not None and tid)
+                                else False
+                            )
+                            await ws.send(json.dumps({
+                                "jsonrpc": "2.0",
+                                "id": msg.get("id", ""),
+                                "result": {"cancelled": ok, "task_id": tid},
+                            }))
+
                         elif method == "list_directory":
                             # List directories for the folder picker UI
                             path = msg.get("params", {}).get("path", "")
@@ -922,6 +1414,10 @@ async def run_daemon(config: dict):
                             }))
                 finally:
                     hb_task.cancel()
+                    try:
+                        drain_task.cancel()
+                    except NameError:
+                        pass
 
         except CredentialsRevokedError:
             # Don't swallow this -- main() needs to wipe creds and run
@@ -934,10 +1430,22 @@ async def run_daemon(config: dict):
             raise
         except (websockets.ConnectionClosed, ConnectionRefusedError, OSError) as e:
             logger.warning(f"Disconnected: {e}. Reconnecting in {current_delay}s...")
+            _tray_obj = config.get("_tray")
+            if _tray_obj is not None:
+                try:
+                    _tray_obj.set_connection_state(False)
+                except Exception:
+                    pass
             await asyncio.sleep(current_delay)
             current_delay = min(current_delay * 2, max_delay)
         except Exception as e:
             logger.error(f"Unexpected error: {e}. Reconnecting in {current_delay}s...")
+            _tray_obj = config.get("_tray")
+            if _tray_obj is not None:
+                try:
+                    _tray_obj.set_connection_state(False)
+                except Exception:
+                    pass
             await asyncio.sleep(current_delay)
             current_delay = min(current_delay * 2, max_delay)
 
@@ -945,7 +1453,16 @@ async def run_daemon(config: dict):
 # ── Entry Point ──────────────────────────────────────────────────────────────
 
 def load_config(args) -> dict:
-    """Load config from yaml file, overridden by CLI args."""
+    """Load config from yaml file, overridden by CLI args.
+
+    Resolution order:
+      1. Defaults (below)
+      2. yaml file at ``args.config`` (or ~/.veilguard/config.yaml)
+      3. CLI args
+      4. VEILGUARD_* env vars  (highest precedence — Phase B headless
+         mode in the server-side sandbox container ships entirely via
+         env vars, bypassing the yaml/setup-UI path)
+    """
     config = {
         "server": "ws://localhost:8809/ws/client",
         "token": "",
@@ -974,6 +1491,26 @@ def load_config(args) -> dict:
         config["client_id"] = args.client_id
     if args.project_root:
         config["project_root"] = args.project_root
+
+    # Env-var overrides (highest precedence — for sandbox container)
+    _env_map = {
+        "VEILGUARD_SERVER":       "server",
+        "VEILGUARD_TOKEN":        "token",
+        "VEILGUARD_USER_ID":      "user_id",
+        "VEILGUARD_CLIENT_ID":    "client_id",
+        "VEILGUARD_PROJECT_ROOT": "project_root",
+    }
+    for env_key, cfg_key in _env_map.items():
+        val = os.environ.get(env_key)
+        if val:
+            config[cfg_key] = val
+
+    # Headless mode: server containers have no Windows tray, no QR setup,
+    # no auto-update.  ``--headless`` (or VEILGUARD_HEADLESS=1) flips them
+    # off and tells the daemon to expect identity via env vars.
+    if getattr(args, "headless", False) or os.environ.get("VEILGUARD_HEADLESS"):
+        config["headless"] = True
+        config["auto_update"] = False    # no Inno Setup on Linux
 
     return config
 
@@ -1026,7 +1563,91 @@ def setup_and_run(server: str, token: str, project_root: str = ".", user_id: str
     asyncio.run(run_daemon(config))
 
 
+def _handle_deeplink_or_handoff(argv: list[str]) -> bool:
+    """Top-of-main hook: deal with ``veilguard://…`` invocations.
+
+    Two scenarios:
+
+      A. Daemon is NOT yet running.  We're the first instance.  Parse
+         the URL, write config, fall through to normal startup so the
+         daemon comes up with fresh creds.
+
+      B. Daemon IS already running.  Hand argv off via the
+         single_instance Listener, exit 0.  The running daemon's
+         handoff thread picks it up and re-applies config + reconnects.
+
+    Returns True when the caller should EXIT IMMEDIATELY (case B).
+    Returns False to continue with normal main() flow (case A).
+    """
+    if len(argv) < 2 or not argv[1].startswith("veilguard://"):
+        return False
+
+    try:
+        from daemon.deeplink import (
+            parse_configure, apply_configure, parse_approve,
+        )
+        from daemon import single_instance
+    except Exception as e:
+        logger.error(f"[deeplink] handler import failed: {e}")
+        return False
+
+    url = argv[1]
+
+    # Approve / Deny / Always toast-button URLs.  These ALWAYS require
+    # a running daemon (the future to resolve lives in that process's
+    # toast._pending dict).  If no daemon is running, the click is a
+    # no-op — exit silently.
+    approve_payload = parse_approve(url)
+    if approve_payload is not None:
+        if single_instance.send_handoff(argv):
+            logger.info(
+                f"[deeplink] approval handed off to running daemon "
+                f"(action={approve_payload['action']}); exiting"
+            )
+        else:
+            logger.info(
+                "[deeplink] approval URL received but no daemon running; "
+                "ignoring"
+            )
+        return True
+
+    # Configure / pairing URLs.
+    try:
+        payload = parse_configure(url)
+    except ValueError as e:
+        logger.error(f"[deeplink] bad URL {url!r}: {e}")
+        sys.exit(2)
+    if payload is None:
+        logger.warning(f"[deeplink] unrecognised URL host in {url!r}; ignoring")
+        return False
+
+    # Try handoff first.  If a daemon is already running it picks up;
+    # we exit clean.
+    if single_instance.send_handoff(argv):
+        logger.info("[deeplink] handed off to running daemon; exiting")
+        return True
+
+    # No running daemon — we ARE the first instance.  Apply config
+    # synchronously so the WS loop sees the fresh server/token.
+    try:
+        apply_configure(payload)
+    except ValueError as e:
+        # User_id mismatch / unsafe server — refuse, print, exit.
+        logger.error(f"[deeplink] config rejected: {e}")
+        sys.exit(2)
+    except Exception as e:
+        logger.error(f"[deeplink] config write failed: {e}")
+        sys.exit(2)
+    return False
+
+
 def main():
+    # First responsibility: deal with deep-link argv before any
+    # parser/setup runs.  If we hand off to a running instance, we
+    # exit cleanly here without touching the rest of main().
+    if _handle_deeplink_or_handoff(sys.argv):
+        return
+
     parser = argparse.ArgumentParser(
         description="Veilguard Client Daemon — local tool execution for cloud Veilguard",
         epilog="Quick start: veilguard --setup wss://your-server/ws/client --token YOUR_TOKEN",
@@ -1043,7 +1664,19 @@ def main():
     parser.add_argument("--config", help="Config file path (default: ~/.veilguard/config.yaml)")
     parser.add_argument("--no-auto-update", action="store_true",
                         help="Disable auto-update check (for development)")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run without tray UI / QR setup (server / Linux). "
+                             "Loads identity from VEILGUARD_SERVER + VEILGUARD_TOKEN + "
+                             "VEILGUARD_USER_ID env vars. Disables auto-update.")
     args = parser.parse_args()
+
+    # Auto-headless on non-Windows when the daemon was launched without
+    # a tty (running under systemd / docker / supervisord / k8s).  Lets
+    # the same binary work as both Windows tray daemon and Linux sandbox
+    # without an explicit flag in the unit file.
+    if not args.headless and platform.system() != "Windows":
+        if not sys.stdout.isatty() or os.environ.get("VEILGUARD_HEADLESS"):
+            args.headless = True
 
     # Quick setup mode
     if args.setup:
@@ -1067,12 +1700,189 @@ def main():
     if args.no_auto_update:
         config["auto_update"] = False
 
-    # If no token / no user_id configured (or one was just wiped after
-    # CredentialsRevokedError), launch setup UI before entering the
-    # daemon loop. After the user pastes the new QR-blob, the setup
-    # callback returns the fresh config dict.
-    if not config.get("token") or not config.get("user_id"):
+    # Pre-flight: do we have ANY pairing creds at all?  Multi-env
+    # (0.4+) means there could be N environments declared — we just
+    # need at least ONE complete + enabled to proceed.  If everything
+    # is empty we fall through to the setup UI (or fail-hard in
+    # headless mode).
+    try:
+        from daemon.env import parse_environments
+        _envs = parse_environments(config)
+        _has_any = any(e.enabled and e.is_complete() for e in _envs.values())
+    except Exception:
+        # Fallback to legacy single-env check if env module fails to load.
+        _has_any = bool(config.get("token") and config.get("user_id"))
+
+    if not _has_any:
+        if config.get("headless"):
+            logger.error(
+                "[HEADLESS] No complete env supplied via "
+                "VEILGUARD_TOKEN + VEILGUARD_USER_ID env vars (or via the "
+                "environments block in config.yaml).  Sandbox container "
+                "will exit (server cannot auth). Set "
+                "VEILGUARD_USER_ID=system:sandbox and "
+                "VEILGUARD_TOKEN=<shared secret> in your compose env."
+            )
+            sys.exit(2)
+        # Interactive: kick the QR/paste setup so the user can pair
+        # their first env.  Multi-env additions happen later via the
+        # tray's "Add server" dialog + Set up button on LibreChat.
         config = _run_first_run_setup()
+
+    # ── Single-instance handoff listener (Phase: onboarding) ─────────
+    # Accepts ``veilguard://configure?…`` argv from second-instance
+    # launches and re-applies config to the running daemon.  Skip on
+    # headless containers — they don't get URL-scheme registrations
+    # and re-pair is done via env vars.
+    if not config.get("headless"):
+        try:
+            from daemon.single_instance import start_listener
+            from daemon.deeplink import (
+                parse_configure, apply_configure, parse_approve,
+            )
+
+            def _on_handoff(handoff_argv: list[str]) -> None:
+                if len(handoff_argv) < 2 or not handoff_argv[1].startswith("veilguard://"):
+                    logger.warning(
+                        f"[HANDOFF] ignoring argv with no deep link: {handoff_argv[:3]}"
+                    )
+                    return
+                # Approval URLs — toast-button clicks coming back via
+                # the protocol scheme.  Resolve the pending future in
+                # this process's toast._pending and we're done.
+                try:
+                    approve = parse_approve(handoff_argv[1])
+                except Exception as e:
+                    approve = None
+                    logger.warning(f"[HANDOFF] parse_approve raised: {e}")
+                if approve is not None:
+                    try:
+                        from daemon import toast as _toast
+                        ok = _toast.resolve_pending(
+                            approve["token"], action=approve["action"],
+                        )
+                        logger.info(
+                            f"[HANDOFF] approval {approve['action']!r} "
+                            f"token={approve['token'][:12]} ok={ok}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"[HANDOFF] toast.resolve_pending failed: {e}",
+                            exc_info=True,
+                        )
+                    return
+
+                # Otherwise it's a configure / pairing URL.
+                try:
+                    payload = parse_configure(handoff_argv[1])
+                    if payload is None:
+                        return
+                    apply_configure(payload)
+                    logger.info(
+                        "[HANDOFF] config refreshed from deep link; "
+                        "WS will pick up on next reconnect"
+                    )
+                    # Force a reconnect by closing the current ws.  The
+                    # outer while-True loop in run_daemon catches the
+                    # disconnect and reopens with the new creds.  We
+                    # rely on the natural backoff (current_delay is
+                    # tiny right after auth, so the reconnect is fast).
+                    #
+                    # Done without a direct ws reference because the
+                    # handoff thread doesn't own one — instead we mark
+                    # the lock-file with a sentinel that the heartbeat
+                    # checks and short-circuits, OR simply rely on the
+                    # disk config being re-read on next reconnect.
+                    # For now: log + trust the user to be patient or
+                    # to bounce the daemon from the tray.  Hot-reload
+                    # of WS creds is a Phase F follow-up.
+                except Exception as e:
+                    logger.error(f"[HANDOFF] could not re-apply config: {e}")
+
+            _handoff_listener = start_listener(_on_handoff)
+            if _handoff_listener is not None:
+                logger.info(
+                    "[HANDOFF] listening for veilguard:// handoff messages"
+                )
+        except Exception as e:
+            logger.warning(f"[HANDOFF] could not start listener: {e}")
+
+    # ── Outgoing notification queue (daemon → cloud) ─────────────────
+    # Tray callbacks run on the pystray thread; the WS lives on the
+    # asyncio loop in another thread.  We bridge them with a sync
+    # ``queue.Queue`` — tray .put_nowait(), drainer task .get() with
+    # short timeout.  When the WS is disconnected the drainer holds
+    # items until reconnect, with a soft cap to avoid unbounded growth.
+    import queue as _stdq
+    _outgoing_queue: "_stdq.Queue[dict]" = _stdq.Queue(maxsize=64)
+    config["_outgoing_queue"] = _outgoing_queue
+
+    # ── Spawn Windows tray (Phase C) ──────────────────────────────────
+    # Tray lives for the whole process; survives WS reconnects.  Imports
+    # are conditional — headless / non-Windows / missing-dep builds skip.
+    _tray = None
+    if not config.get("headless") and platform.system() == "Windows":
+        try:
+            from daemon.tray import TrayController, HAS_TRAY_UI
+            if HAS_TRAY_UI:
+                def _on_set_level(level: str, scope: str) -> None:
+                    """Tray menu → broadcast permission change to ALL envs.
+
+                    Multi-env (0.4+): we fan the JSON-RPC notification
+                    out to every per-env outgoing queue so a level
+                    change from the tray applies to both prod + local
+                    pairings at once.  Each env's drainer picks it up
+                    and sends over its own WS.
+                    """
+                    payload = {
+                        "jsonrpc": "2.0",
+                        "method": "set_permission_level",
+                        "params": {
+                            "level": level,
+                            "scope": scope,
+                            "source": "tray",
+                        },
+                    }
+                    targets = list(
+                        (config.get("_outgoing_queues") or {}).items()
+                    ) or [("default", _outgoing_queue)]
+                    for env_name, q in targets:
+                        try:
+                            q.put_nowait(dict(payload))
+                            logger.info(
+                                f"[TRAY] queued set_permission_level "
+                                f"env={env_name} level={level} scope={scope}"
+                            )
+                        except _stdq.Full:
+                            try:
+                                q.get_nowait()
+                                q.put_nowait(dict(payload))
+                            except Exception:
+                                logger.warning(
+                                    f"[TRAY] outgoing queue full for env={env_name}; "
+                                    f"dropped set_permission_level level={level}"
+                                )
+
+                def _on_quit() -> None:
+                    logger.info("[TRAY] user clicked Quit")
+                    os._exit(0)
+
+                _tray = TrayController(
+                    on_quit=_on_quit,
+                    on_set_level=_on_set_level,
+                )
+                _tray.start()
+                # Stash on config so run_daemon can flip
+                # set_connection_state(True/False) at the right
+                # lifecycle points (auth-success / disconnect).
+                config["_tray"] = _tray
+                logger.info("[TRAY] system tray icon active")
+        except Exception as e:
+            import traceback
+            logger.warning(
+                f"[TRAY] failed to start: {type(e).__name__}: {e}\n"
+                f"{traceback.format_exc()}"
+            )
 
     # Recovery loop. ``run_daemon`` raises CredentialsRevokedError when
     # the cloud rejects our token (e.g. after a security rotation). On

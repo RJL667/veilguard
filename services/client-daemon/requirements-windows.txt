@@ -1,0 +1,23 @@
+# Windows-build requirement set.  Adds the tray + toast deps on top of
+# the shared headless set.  PyInstaller picks these up via the
+# veilguard.spec hidden-imports list — see build.bat for the bundle
+# command.  Keep this set narrow: every extra package bloats the
+# installer by 5-10 MB and gets shipped to every user machine.
+-r requirements-headless.txt
+
+# Tray icon — cross-platform but only used on Windows.  Drops a small
+# system-tray icon next to the clock; right-click menu surfaces task
+# status + permission-level selector.
+pystray>=0.19.5,<0.20
+
+# PIL is pulled in by pystray transitively but pin it explicitly so the
+# tray-icon renderer in daemon/tray.py has a known Image / ImageDraw
+# API surface.  10.x removed `Image.ANTIALIAS` (we don't use it but a
+# transitive could) and tightened module structure.
+Pillow>=10.0,<12
+
+# winotify — Windows toast notifications with action buttons.  We use
+# `Notification.add_actions(label, launch=url)` to embed click-callback
+# URLs that the daemon's localhost HTTP shim catches (see toast.py).
+# 1.1.x added the actions API; older versions can't show buttons.
+winotify>=1.1.0,<2

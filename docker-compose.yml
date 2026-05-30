@@ -30,6 +30,13 @@ services:
       - MEILI_HOST=http://meilisearch:7700
       - NO_INDEX=true
       - WORKSPACE_ROOT=/workspace
+      # Phase 3/4 /api/veilguard-client/* proxy → agent-runtime.  Use the
+      # compose-network DNS (fast, ~500ms) instead of the default
+      # `host.docker.internal` which has cold-DNS latency through Docker
+      # Desktop that occasionally trips the proxy's 8s timeout → HTTP 502
+      # in the Work Queue sidebar.  Caught 2026-05-27 — first refresh of
+      # the day routinely hit the slow path.
+      - VEILGUARD_AGENT_RUNTIME_URL=http://agent-runtime:5000
     volumes:
       - ./librechat.yaml:/app/librechat.yaml
       # Note: librechat.yaml mcpServers section references /app/mcp-tools/
@@ -121,6 +128,24 @@ services:
     volumes:
       # Hot-reload during dev; bake into image for prod.
       - ./agent-runtime/app:/app/app
+      # 2026-05-25: agent-runtime's runtime.py now drives the unified
+      # `Agent.run_turn` pipeline (same code as pii-proxy's ChatAgent
+      # path).  Mount the agent/ + llm/ + pii/ packages from the repo
+      # root so `from agent import agent_for, TurnContext` works inside
+      # the container.  Without these mounts the Director query fails
+      # with ModuleNotFoundError: No module named 'agent'.
+      # PYTHONPATH=/ (set under environment:) puts them on the import path.
+      - ./agent:/agent:ro
+      - ./llm:/llm:ro
+      - ./pii:/pii:ro
+      # TCMM adapter source tree — adapter.py probes TCMM_ROOT for the
+      # AnthropicGenerationAdapter via importlib.  Same read-only mount
+      # pii-proxy uses (see pii-proxy.volumes).
+      - ~/.gemini/antigravity/tcmm/TCMM:/opt/tcmm:ro
+      # OAuth bearer creds — adapter writes the long-lived setup-token
+      # into ~/.claude/.credentials.json on first use, then TCMM's
+      # adapter reads it directly.  Same RW mount pii-proxy uses.
+      - ~/.claude:/root/.claude
       # Persona files + CONSTITUTION.md — same dir LibreChat / sub-agents
       # see via different mounts.  Mounted read-only here; user edits
       # happen via the sidebar or direct file edit, never from inside
@@ -133,6 +158,12 @@ services:
       # the dir (typically rudol on prod VM — see memory:
       # architecture_lance_index_perms for the catastrophe pattern).
       - ./tcmm-data:/tcmm-data
+      # [WORKSPACE_FS_2026_05_29]  Server-side team workspace.  ICs write
+      # artifacts here (team/drafts/...) and critics read them — all
+      # server-side per spec §3.5 ("the org lives on the VM").  Replaces
+      # the broken daemon-routed read_file/write_file path that looped
+      # critics when sub-agents was offline.  Mounted writable.
+      - ./agent-workspace:/workspace
     env_file:
       - .env
     environment:
@@ -150,6 +181,66 @@ services:
       - CACHE_TTL_DEFAULT=${CACHE_TTL_DEFAULT:-1h}
       - APPROVAL_TIMEOUT_S=${APPROVAL_TIMEOUT_S:-120}
       - APPROVAL_FAIL_CLOSED=${APPROVAL_FAIL_CLOSED:-true}
+      # PYTHONPATH=/ so the bind-mounted /agent, /llm, /pii packages
+      # at the container root are importable.  Without this,
+      # `from agent import agent_for, TurnContext` (inside runtime.py)
+      # raises ModuleNotFoundError.
+      - PYTHONPATH=/
+      # OAuth bearer for the live AnthropicAdapter — same env var
+      # pii-proxy uses.  Adapter writes this into the bind-mounted
+      # ~/.claude/.credentials.json on first call so TCMM's adapter
+      # picks it up.
+      - VEILGUARD_CLAUDE_OAUTH_TOKEN=${VEILGUARD_CLAUDE_OAUTH_TOKEN:-}
+      # TCMM_ROOT points at the read-only bind mount above.
+      - TCMM_ROOT=/opt/tcmm
+      # CLAUDE_SSO=1 routes the adapter through TCMM /generate (OAuth
+      # bearer path).  Same as pii-proxy's flag.
+      - CLAUDE_SSO=1
+      # [PROMPT_CACHE_DIAG_2026_05_28] Dump every Anthropic request +
+      # response to /tmp/anthropic_dump.jsonl so we can verify
+      # cache_control markers actually leave the adapter for the API.
+      - ANTHROPIC_DUMP_REQUESTS=${ANTHROPIC_DUMP_REQUESTS:-0}
+      # [INBOX_POLLER_OPT_OUT_2026_05_29]  Disable background IC
+      # dispatch when set to 1.  Useful for pure Director latency
+      # testing — researchers/critics won't compete for the Anthropic
+      # client.  But the multi-agent flow won't execute either, so
+      # the Director will appear to create tasks that never finish.
+      # Default: ENABLED (let the org actually work).  Flip to 1 only
+      # when measuring foreground latency in isolation.
+      - VEILGUARD_INBOX_POLLER_DISABLED=${VEILGUARD_INBOX_POLLER_DISABLED:-0}
+      # [WORKSPACE_FS_2026_05_29]  Root of the server-side team workspace
+      # (bind-mounted above).  read_file/write_file/edit_file resolve
+      # paths under here, sandboxed (no escape).
+      - VEILGUARD_WORKSPACE_ROOT=/workspace
+      # [DISPATCH_TIMING_ENV_2026_05_29]  The local Windows Docker bind-mount
+      # runs Lance ~10x slower than the prod Linux VM, so a single IC
+      # dispatch (recall + multi-turn LLM + critic review) blows past the
+      # prod-tuned 270s timeout and gets WRONGLY force-cancelled.  Bump both
+      # locally (invariant: dispatch timeout < lease).  On prod these can be
+      # left unset to use the 300/270 defaults.
+      - VEILGUARD_LEASE_DURATION_S=${VEILGUARD_LEASE_DURATION_S:-1200}
+      - VEILGUARD_DISPATCH_TIMEOUT_S=${VEILGUARD_DISPATCH_TIMEOUT_S:-1080}
+      # [BLAS_THREAD_PIN_2026_05_29]  THE redaction-under-concurrency fix.
+      # spaCy/Presidio NER uses OpenBLAS, which defaults to one thread PER
+      # CORE (16 here).  When N agents redact concurrently during a fan-out
+      # (2 researchers + 2 critics), that's N×16 = 50-64 BLAS threads
+      # thrashing on an oversubscribed box → each redaction balloons ~4×
+      # (measured: realistic 30k-token redact 7.7s single → ~33s at
+      # 4-concurrent).  Pinning to 1 thread each removes the oversubscription
+      # → 4-concurrent drops to ~15s (2.2× faster).  Prod's 8 real cores
+      # oversubscribe far less, which is why redaction "works on prod" — this
+      # is a many-small-inference best practice regardless.
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
+      # [PII_PIPELINE_TRIM_2026_05_29] PERSON-name NER stays ON (default 0).
+      # Only the unused spaCy dependency PARSER is dropped (in code,
+      # unconditionally) — Presidio never consumes the parse, so this is a
+      # pure ~34% speedup with ZERO detection change. Regex-only mode
+      # (which WOULD drop PERSON) is opt-in via PII_REGEX_ONLY=1 and is
+      # NOT enabled.
+      - PII_REGEX_ONLY=${PII_REGEX_ONLY:-0}
     restart: always
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
@@ -193,13 +284,15 @@ services:
       # never writes there.  Override TCMM_ROOT env if your local
       # tree lives somewhere else.
       - ~/.gemini/antigravity/tcmm/TCMM:/opt/tcmm:ro
-      # Claude OAuth credentials — read-only.  The TCMM adapter checks
-      # CLAUDE_CREDENTIALS_PATH (defaults to ~/.claude/.credentials.json)
-      # and refreshes the access_token in place when needed.  We mount
-      # the directory (not just the file) so the adapter's atomic
-      # `.tmp → .credentials.json` rename works.  RO here means refresh
-      # won't persist to disk, but the in-process bearer is still used.
-      - ~/.claude:/root/.claude:ro
+      # Claude OAuth credentials — READ-WRITE so the adapter can
+      # persist refreshed tokens back to disk.  TCMM adapter does
+      # `.tmp → .credentials.json` atomic rename within ~/.claude/;
+      # RO breaks the refresh path silently and every token-expiry
+      # turns into an Anthropic 401.  Container runs as root and the
+      # host file is owned by the user — chmod adjustment may be
+      # required on Linux hosts.  On Windows / Docker Desktop the
+      # mount is permissive enough out of the box.
+      - ~/.claude:/root/.claude
     env_file:
       - .env
     environment:
@@ -207,10 +300,25 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
       - XAI_API_KEY=${XAI_API_KEY:-}
+      # [BLAS_THREAD_PIN_2026_05_29] Same OpenBLAS oversubscription fix as
+      # agent-runtime — the proxy runs the same Presidio/spaCy redactor and
+      # thrashes when concurrent chats redact at once. Pin to 1 thread each.
+      - OMP_NUM_THREADS=1
+      - OPENBLAS_NUM_THREADS=1
+      - MKL_NUM_THREADS=1
+      - NUMEXPR_NUM_THREADS=1
       - ANTHROPIC_API_URL=${ANTHROPIC_API_URL:-https://api.anthropic.com}
       - OPENAI_API_URL=${OPENAI_API_URL:-https://api.openai.com}
       - GEMINI_API_URL=${GEMINI_API_URL:-https://generativelanguage.googleapis.com}
       - XAI_API_URL=${XAI_API_URL:-https://api.x.ai}
+      # TCMM root is mounted RO at /opt/tcmm so the host TCMM
+      # service (8811) keeps sole ownership.  Redirect TCMM's
+      # own logger to a writable path so its `core.tcmm_logging`
+      # module can initialize.  Without this, importing TCMM's
+      # adapter raises OSError on FileHandler open, the OAuth
+      # refresh path crashes silently, and every token-expired
+      # turn returns 401 from Anthropic.
+      - TCMM_LOG_DIR=/tmp/tcmm-logs
       - PII_PROXY_PORT=4000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - MIN_SCORE=${MIN_SCORE:-0.7}
@@ -238,6 +346,59 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+
+  # ──────────────────────────────────────────────────────────────────────
+  # veilguard-sandbox — server-side headless client-daemon.
+  #
+  # Acts as the "machine" for server agents (sub-agents/tools/daemons.py,
+  # multi-agent fanout) when the user's actual Windows daemon is offline.
+  # Registers with the WS bridge as user_id="system:sandbox" using a
+  # shared secret in .env (VEILGUARD_SANDBOX_TOKEN — must NOT be empty
+  # in prod; if unset the sandbox identity is rejected by sub-agents'
+  # validate_token and the container just sits idle).
+  #
+  # Tool routing:
+  #   sub-agents.agentic.handle_tool checks SANDBOX_FALLBACK_TOOLS
+  #   (read_file / search_files / grep / run_command) and falls over
+  #   to the sandbox bridge when the user's own bridge is disconnected.
+  #   Write tools (write_file / edit_file) are deliberately excluded —
+  #   sandbox writes are ephemeral.
+  #
+  # Identity & trust:
+  #   user_id=system:sandbox is hard-coded.  The approval gate in
+  #   core/approval.py short-circuits this identity to "pre-approved"
+  #   (no toast, no UI round-trip) since the sandbox is a system
+  #   component, not a user.  Server agents that route through the
+  #   sandbox must still pass their own upstream policy check.
+  # ──────────────────────────────────────────────────────────────────────
+  veilguard-sandbox:
+    build:
+      context: .
+      dockerfile: services/client-daemon/Dockerfile.sandbox
+    container_name: veilguard-sandbox
+    environment:
+      # WS endpoint where sub-agents (host process) exposes /ws/client.
+      # Use host.docker.internal so the container can reach the host
+      # process on macOS/Windows; on Linux add "extra_hosts" to map
+      # host.docker.internal to host-gateway (already done elsewhere).
+      - VEILGUARD_SERVER=${VEILGUARD_SANDBOX_SERVER:-ws://host.docker.internal:8809/ws/client}
+      - VEILGUARD_USER_ID=system:sandbox
+      - VEILGUARD_CLIENT_ID=veilguard-sandbox
+      - VEILGUARD_TOKEN=${VEILGUARD_SANDBOX_TOKEN:-}
+      - VEILGUARD_PROJECT_ROOT=/sandbox-workspace
+      - VEILGUARD_HEADLESS=1
+    extra_hosts:
+      # Linux Docker doesn't auto-resolve host.docker.internal; this
+      # makes the daemon reach the host's sub-agents process regardless
+      # of platform.
+      - "host.docker.internal:host-gateway"
+    # Optional persistent workspace.  Commented-out by default — the
+    # sandbox is meant to be ephemeral so each container restart gets
+    # a clean slate.  To retain across restarts, uncomment the volume
+    # mount + add `sandbox-workspace:` under top-level `volumes:`.
+    # volumes:
+    #   - sandbox-workspace:/sandbox-workspace
+    restart: unless-stopped
 
 volumes:
   mongo-data:

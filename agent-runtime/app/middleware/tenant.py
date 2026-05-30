@@ -47,6 +47,12 @@ class TenantContext:
       agent_id         — which persona is driving this turn
       parent_cid       — for sub-calls; the parent conversation's cid
       is_background    — true if origin is a scheduled daemon, not chat
+      task_id          — when dispatched by inbox-poller, the Task id
+      team_id          — when the dispatched Task carries a team_id, set
+                         it here so the cost attribution endpoint, the
+                         budget guard, and any team-scoped tool know
+                         which team to bill the work to.  None when the
+                         task isn't team-scoped.
     """
 
     conversation_id: str
@@ -55,6 +61,8 @@ class TenantContext:
     agent_id: str
     parent_cid: Optional[str] = None
     is_background: bool = False
+    task_id: Optional[str] = None
+    team_id: Optional[str] = None
 
 
 _current: contextvars.ContextVar[Optional[TenantContext]] = (
@@ -96,6 +104,8 @@ def set_tenant_context(
     agent_id: str,
     parent_cid: Optional[str] = None,
     is_background: bool = False,
+    task_id: Optional[str] = None,
+    team_id: Optional[str] = None,
 ) -> Generator[TenantContext, None, None]:
     """Set the TenantContext for the duration of a with-block.
 
@@ -110,6 +120,8 @@ def set_tenant_context(
         agent_id=agent_id,
         parent_cid=parent_cid,
         is_background=is_background,
+        task_id=task_id,
+        team_id=team_id,
     )
     token = _current.set(ctx)
     try:

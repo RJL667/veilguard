@@ -148,6 +148,93 @@ class PIISessionStore:
             self._db.create_table(_TABLE_NAME, empty, mode="overwrite")
             logger.info(f"[pii] created {_TABLE_NAME} at {path}")
         self._tbl = self._db.open_table(_TABLE_NAME)
+        # [PII_MEMO_2026_05_29]  Process-level memo for (sid, entity, value)
+        # → ref_token.  add_mapping previously ran a Lance .search() on
+        # EVERY PII span — including the "already mapped?" fast-path check.
+        # A memory prefix that mentions the same person 100× did 100 Lance
+        # queries (~33ms each → 3s+ for one block; 10s+ for a full 10k-tok
+        # render).  Mappings are append-only + immutable once created, so a
+        # plain dict is safe: hit → O(1), miss → one Lance query then cache.
+        # Reduces redact of a repetitive 10k-token prefix from ~10s to
+        # <100ms (matches the proxy-side benchmark).
+        self._memo: dict[tuple, str] = {}
+        # [PII_BATCH_WRITE_2026_05_29]  Buffer new mappings and flush them
+        # in ONE Lance add() per redaction instead of one add() (= one
+        # table version) PER PII span.  A fat user-scoped memory prefix
+        # has dozens of distinct PII entities; one-version-per-span
+        # re-bloated the session table to 100+ versions within a few
+        # turns, and each subsequent write walks the whole manifest chain
+        # (1.5s on the bind mount) → redaction ballooned to 6-9s.  With
+        # batching, version growth is ~1 per redacted block, not per PII.
+        # `_counters` tracks the per-(tenant,conv,entity) sequence in
+        # memory so we don't re-query Lance (which wouldn't see buffered
+        # rows anyway) for each new token.
+        self._pending_rows: list[dict] = []
+        self._counters: dict[tuple, int] = {}
+        # Ensure scalar BTREE indexes exist on the hot lookup columns.
+        # Without these every redaction triggers a full-fragment column
+        # scan; lookups go from sub-ms to multi-second past ~10M rows.
+        # Idempotent: `replace=True` no-ops cheaply when the index is
+        # already present and freshens it when row count has grown.
+        # Cost is ~200ms per column on a small table, scaling with
+        # row count — well under the 2s/turn budget even at 100M rows.
+        self._ensure_indexes()
+
+    # ── Index maintenance ─────────────────────────────────────────────────
+
+    _INDEXED_COLS = ("conv_id", "tenant_id", "original_lc")
+
+    def _ensure_indexes(self) -> None:
+        """Idempotently create BTREE indexes on the hot lookup columns.
+
+        Called from __init__ AND from `optimize()` (the Lance maintenance
+        cron entry point).  Safe to call any time — Lance freshens an
+        existing index in place when the table has grown.
+
+        Best-effort: a failure here MUST NOT block startup, because the
+        redactor still works without indexes (just slower).  We log the
+        warning loudly so it shows up in dashboards.
+        """
+        try:
+            existing = {idx.columns[0] for idx in self._tbl.list_indices()
+                        if idx.columns}
+        except Exception as e:
+            logger.warning(f"[pii] list_indices failed: {e}")
+            existing = set()
+        for col in self._INDEXED_COLS:
+            if col in existing:
+                continue
+            try:
+                self._tbl.create_scalar_index(
+                    col, index_type="BTREE", replace=True,
+                )
+                logger.info(f"[pii] created BTREE index on {_TABLE_NAME}.{col}")
+            except Exception as e:
+                logger.warning(
+                    f"[pii] create_scalar_index({col}) failed: {e}"
+                )
+
+    def optimize(self) -> dict:
+        """Lance maintenance entry point.  Call from the weekly cron.
+
+        Refreshes scalar indexes (so they cover newly-written rows) and
+        compacts data fragments.  Both operations are MVCC-safe — they
+        run live without blocking concurrent redactor calls.
+
+        Returns a stats dict for logging / dashboard display.
+        """
+        stats: dict = {}
+        t0 = time.time()
+        self._ensure_indexes()
+        stats["index_refresh_ms"] = int((time.time() - t0) * 1000)
+        t0 = time.time()
+        try:
+            self._tbl.optimize()
+        except Exception as e:
+            logger.warning(f"[pii] optimize() failed: {e}")
+            stats["optimize_error"] = str(e)
+        stats["optimize_ms"] = int((time.time() - t0) * 1000)
+        return stats
 
     @classmethod
     def get(cls) -> "PIISessionStore":
@@ -230,20 +317,44 @@ class PIISessionStore:
         sid_root = sid.root()
         lookup_key = original.lower() if entity_type == "PERSON" else original
 
-        # Fast path: already mapped.
+        # [PII_MEMO_2026_05_29]  O(1) fast path — repeated PII (same person
+        # mentioned N times in a memory prefix) returns instantly without
+        # touching Lance.  This is the single biggest redaction speedup:
+        # the per-span Lance .search() was the bottleneck, not analyze.
+        memo_key = (sid_root.tenant_id, sid_root.conv_id, entity_type, lookup_key)
+        cached = self._memo.get(memo_key)
+        if cached is not None:
+            return cached
+
+        # Lance fast path: already mapped (cross-process / prior turn).
         existing = self._query_token(sid_root, entity_type, lookup_key)
         if existing:
+            self._memo[memo_key] = existing
             return existing
 
         # Slow path: insert under write lock.  Re-check after acquiring
         # the lock to handle the case where two threads in this process
         # raced to insert.
         with _WRITE_LOCK:
+            cached = self._memo.get(memo_key)
+            if cached is not None:
+                return cached
             existing = self._query_token(sid_root, entity_type, lookup_key)
             if existing:
+                self._memo[memo_key] = existing
                 return existing
 
-            counter = self._next_counter(sid_root, entity_type)
+            # [PII_BATCH_WRITE_2026_05_29]  Allocate the counter from the
+            # in-memory sequence (seeded once from Lance) so we don't
+            # re-query per token, and BUFFER the row instead of writing
+            # it now.  flush() persists the whole batch in one add().
+            ckey = (sid_root.tenant_id, sid_root.conv_id, entity_type)
+            if ckey not in self._counters:
+                # Seed from Lance max (next_counter returns max+1 = next
+                # free); -1 gives last-used so the +1 below is correct.
+                self._counters[ckey] = self._next_counter(sid_root, entity_type) - 1
+            self._counters[ckey] += 1
+            counter = self._counters[ckey]
             short_type = (
                 entity_type
                 .replace("_ADDRESS", "")
@@ -252,21 +363,40 @@ class PIISessionStore:
             )
             ref_token = f"REF_{short_type}_{counter}"
 
-            row = pa.Table.from_pylist(
-                [{
-                    "tenant_id":   sid_root.tenant_id,
-                    "conv_id":     sid_root.conv_id,
-                    "entity_type": entity_type,
-                    "original_lc": lookup_key,
-                    "original":    original,
-                    "ref_token":   ref_token,
-                    "counter":     counter,
-                    "created_ts":  time.time(),
-                }],
-                schema=_SCHEMA,
-            )
-            self._tbl.add(row)
+            self._pending_rows.append({
+                "tenant_id":   sid_root.tenant_id,
+                "conv_id":     sid_root.conv_id,
+                "entity_type": entity_type,
+                "original_lc": lookup_key,
+                "original":    original,
+                "ref_token":   ref_token,
+                "counter":     counter,
+                "created_ts":  time.time(),
+            })
+            self._memo[memo_key] = ref_token
             return ref_token
+
+    def flush(self) -> int:
+        """[PII_BATCH_WRITE_2026_05_29]  Persist buffered mappings in ONE
+        Lance add().  Called by the redactor at the end of a redaction so
+        all of a turn's new tokens land in a single table version.  Safe
+        to call when empty (no-op).  Returns rows flushed.
+
+        Rehydration runs in a LATER request (after the LLM call), by which
+        time this flush has committed — so rehydrate reads complete data
+        from Lance with no in-memory-buffer awareness needed.
+        """
+        with _WRITE_LOCK:
+            if not self._pending_rows:
+                return 0
+            rows = self._pending_rows
+            self._pending_rows = []
+            try:
+                self._tbl.add(pa.Table.from_pylist(rows, schema=_SCHEMA))
+                return len(rows)
+            except Exception as e:
+                logger.error(f"[pii] session-store flush failed ({len(rows)} rows): {e}")
+                return 0
 
     # ── Rehydration ───────────────────────────────────────────────────
 
@@ -278,9 +408,53 @@ class PIISessionStore:
         old in-memory store so REF_PERSON_1 can't substring-match inside
         REF_PERSON_15.
         """
+        if not text or "REF_" not in text:
+            return text
         mapping = self._rehydrate_map(sid)
         if not mapping:
             return text
+        return _REF_TOKEN_RE.sub(
+            lambda m: mapping.get(m.group(0), m.group(0)),
+            text,
+        )
+
+    def rehydrate_any(self, text: str) -> str:
+        """Best-effort, session-LESS rehydration for the proxy /rehydrate
+        endpoint (sub-agent scratchpad display), which has no SessionId.
+
+        Only the tokens PRESENT in `text` are looked up — the query is
+        bounded by token count, not table size, so this stays cheap even
+        on a large table.  Cross-session ambiguity is inherent (the same
+        REF_PERSON_1 string maps to different people in different convs);
+        most-recently-created wins, matching the old in-memory store's
+        last-writer behavior.
+        """
+        if not text or "REF_" not in text:
+            return text
+        tokens = sorted(set(_REF_TOKEN_RE.findall(text)))
+        if not tokens:
+            return text
+        in_list = ", ".join("'" + t.replace("'", "''") + "'" for t in tokens)
+        try:
+            arr = (
+                self._tbl.search()
+                .where(f"ref_token IN ({in_list})")
+                .to_arrow()
+            )
+        except Exception as e:
+            logger.warning(f"[pii] rehydrate_any query failed: {e}")
+            return text
+        if arr.num_rows == 0:
+            return text
+        toks = arr.column("ref_token").to_pylist()
+        origs = arr.column("original").to_pylist()
+        ts = arr.column("created_ts").to_pylist()
+        # most-recent wins on duplicate token across sessions
+        best: dict[str, tuple[float, str]] = {}
+        for tk, og, t in zip(toks, origs, ts):
+            if tk not in best or t >= best[tk][0]:
+                best[tk] = (t, og)
+        mapping = {tk: v[1] for tk, v in best.items()}
         return _REF_TOKEN_RE.sub(
             lambda m: mapping.get(m.group(0), m.group(0)),
             text,

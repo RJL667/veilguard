@@ -1,38 +1,42 @@
-"""Audit middleware — wraps SDK query() to capture tokens + decisions.
+"""Audit middleware — runtime-specific wrappers around the shared writer.
 
-The Claude Agent SDK doesn't expose a post-LLM-response hook (only
-PreToolUse / PostToolUse).  To capture token usage + the assistant
-turn for audit / cost roll-up, we consume the SDK's async-iterator
-ourselves and tap each message before forwarding it upstream.
+The core LanceDB writer + schema live at ``llm/audit_db.py`` (shared
+with pii-proxy).  This module adds the agent-runtime-specific bits:
 
-Writes audit rows to the SAME `pii_audit` Lance table the proxy
-writes to (per spec §3.10 and existing `audit_db.py` contract).  This
-keeps cost queries single-table.
+  - ``TurnUsage`` — accumulator populated as the agent's event stream
+    flows past (token totals, content chunks, tool calls, stop reason).
+  - ``tap_sdk_stream`` — async generator that taps every event into
+    ``TurnUsage`` and forwards it upstream unchanged.
+  - ``record_turn`` — writes one FROM_LLM summary row at end-of-turn
+    with the accumulated ``TurnUsage``.
+  - ``record_event`` — writes one row per ``audit`` event yielded by
+    ``Agent.run_turn`` (one TO_LLM + one FROM_LLM per LLM round-trip),
+    so the inbox-poller dispatch path doesn't silently drop them.
 
-Schema fields we write per call:
-  - aid (auto-assigned)
-  - user_id, conversation_id (from TenantContext)
-  - direction = "FROM_LLM" for the assistant response capture
-  - model, stream, content
-  - tokens_input, tokens_output, cache_create, cache_read
-  - extra (JSON): {agent_id, tenant_id, task_id, parent_cid, ...}
+Why both ``record_turn`` AND ``record_event``?
+  - ``record_event`` captures the rich per-LLM-call data (full envelope
+    content with [SYSTEM] / [TOOLS] / [MESSAGES] sections; tokens per
+    call) — what the admin dashboard's per-message timeline needs.
+  - ``record_turn`` captures the turn-level summary (total tokens,
+    cache hit rate, all tool calls in one row) — what cost roll-up
+    queries hit.
 
-Note: pii-proxy writes the TO_LLM direction; we write FROM_LLM.  Both
-land in the same table.
+Together they let the dashboard show "this turn made 4 LLM calls
+totalling X tokens" with click-through to each call's content.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import queue
-import threading
-import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, AsyncIterator, Optional
 
-from ..config import AUDIT_DB_PATH
+# The shared writer lives at /llm in the container (bind-mounted from
+# Documents/veilguard/llm).  Both record() and AuditDB.get() come from
+# there; this module no longer carries its own copy of the schema or
+# writer thread.
+from llm.audit_db import AuditDB, record  # noqa: F401 (record re-exported)
 
 logger = logging.getLogger("agent-runtime.middleware.audit")
 
@@ -41,18 +45,19 @@ logger = logging.getLogger("agent-runtime.middleware.audit")
 class TurnUsage:
     """Accumulator for one agent turn's token + cost stats.
 
-    Populated as the SDK yields messages.  Final flush at end-of-turn
-    writes one row to pii_audit.
+    Populated as the SDK / Agent yields messages.  Final flush at
+    end-of-turn writes one summary row to pii_audit via ``record_turn``.
 
-    Anthropic's `usage` block on the final assistant message has:
+    Anthropic's ``usage`` block on the final assistant message has:
       - input_tokens (NEW only — cache_create + cache_read are separate)
       - output_tokens
       - cache_creation_input_tokens
       - cache_read_input_tokens
 
-    Per `architecture_token_accounting` memory: tokens_input in pii_audit
-    is stored as TOTAL (input + cache_create + cache_read), not NEW-only.
-    We sum at write time to match the existing convention.
+    Per ``architecture_token_accounting`` memory: tokens_input in
+    pii_audit is stored as TOTAL (input + cache_create + cache_read),
+    not NEW-only.  We sum at write time to match the existing
+    convention.
     """
 
     tokens_input_new: int = 0
@@ -76,128 +81,7 @@ class TurnUsage:
         return "".join(self.content_chunks)
 
 
-# ── Audit DB writer (background thread, drops on overflow) ───────────────
-# Mirrors agent-proxy/app/audit_db.py shape.  Lazy init so missing Lance
-# dir (dev / tests) doesn't crash the service; the queue just no-ops.
-
-
-class _AuditWriter:
-    _instance: Optional["_AuditWriter"] = None
-    _init_lock = threading.Lock()
-
-    @classmethod
-    def get(cls) -> Optional["_AuditWriter"]:
-        if cls._instance is not None:
-            return cls._instance
-        with cls._init_lock:
-            if cls._instance is None:
-                try:
-                    cls._instance = cls()
-                except Exception as e:
-                    logger.warning(
-                        f"[audit] init failed; audit disabled: {e}"
-                    )
-                    cls._instance = _NullWriter()
-            return cls._instance
-
-    def __init__(self):
-        # Defer the heavy imports so a missing lancedb (e.g., in unit
-        # tests with mocks) doesn't crash module import.
-        import lancedb
-        import pyarrow as pa
-
-        self._db_path = str(AUDIT_DB_PATH)
-        self._table_name = "pii_audit"
-        self._db = lancedb.connect(self._db_path)
-
-        # Schema MUST match agent-proxy/app/audit_db.py _SCHEMA.
-        self._schema = pa.schema([
-            pa.field("aid", pa.int64(), nullable=False),
-            pa.field("user_id", pa.string(), nullable=True),
-            pa.field("conversation_id", pa.string(), nullable=True),
-            pa.field("direction", pa.string(), nullable=False),
-            pa.field("model", pa.string(), nullable=True),
-            pa.field("stream", pa.bool_(), nullable=True),
-            pa.field("content", pa.string(), nullable=True),
-            pa.field("created_at", pa.float64(), nullable=False),
-            pa.field("tokens_input", pa.int64(), nullable=True),
-            pa.field("tokens_output", pa.int64(), nullable=True),
-            pa.field("cache_create", pa.int64(), nullable=True),
-            pa.field("cache_read", pa.int64(), nullable=True),
-            pa.field("extra", pa.string(), nullable=True),
-        ])
-
-        try:
-            self._tbl = self._db.open_table(self._table_name)
-        except Exception:
-            self._tbl = self._db.create_table(self._table_name, schema=self._schema)
-            logger.info(
-                f"[audit] created table {self._table_name} at {self._db_path}"
-            )
-
-        self._aid_lock = threading.Lock()
-        self._next_aid = self._compute_next_aid()
-        self._q: queue.Queue = queue.Queue(maxsize=10_000)
-        self._stop_evt = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run, name="agent-runtime-audit", daemon=True
-        )
-        self._thread.start()
-        logger.info(
-            f"[audit] writer ready — {self._db_path}::{self._table_name} "
-            f"next_aid={self._next_aid}"
-        )
-
-    def _compute_next_aid(self) -> int:
-        try:
-            arr = self._tbl.to_arrow()
-            if arr.num_rows == 0:
-                return 1
-            return int(max(arr.column("aid").to_pylist())) + 1
-        except Exception:
-            return int(time.time() * 1_000_000)
-
-    def enqueue(self, row: dict) -> None:
-        with self._aid_lock:
-            row.setdefault("aid", self._next_aid)
-            if row["aid"] >= self._next_aid:
-                self._next_aid = row["aid"] + 1
-        row.setdefault("created_at", time.time())
-        for field_name in self._schema.names:
-            row.setdefault(field_name, None)
-        try:
-            self._q.put_nowait(row)
-        except queue.Full:
-            logger.warning("[audit] queue full; dropping row")
-
-    def _run(self):
-        batch: list[dict] = []
-        last_flush = time.time()
-        while not self._stop_evt.is_set():
-            timeout = max(0.0, 2.0 - (time.time() - last_flush))
-            try:
-                row = self._q.get(timeout=timeout or 0.1)
-                batch.append(row)
-            except queue.Empty:
-                pass
-            now = time.time()
-            if len(batch) >= 32 or (batch and now - last_flush >= 2.0):
-                try:
-                    self._tbl.add(batch)
-                except Exception as e:
-                    logger.warning(
-                        f"[audit] flush failed ({len(batch)} rows): {e}"
-                    )
-                batch = []
-                last_flush = now
-
-
-class _NullWriter:
-    def enqueue(self, row: dict) -> None:
-        return None
-
-
-# ── Public API ───────────────────────────────────────────────────────────
+# ── Public writers ──────────────────────────────────────────────────────
 
 
 def record_turn(
@@ -211,16 +95,14 @@ def record_turn(
     usage: TurnUsage,
     direction: str = "FROM_LLM",
 ) -> None:
-    """Write one audit row capturing this agent turn's usage.
+    """Write one summary audit row for an entire agent turn.
 
-    Direction default is FROM_LLM (we're writing the response capture).
-    Caller may pass TO_LLM for cases where agent-runtime is also
-    responsible for the prompt audit (pii-proxy normally handles that).
+    Captures aggregate token usage + the full tool-call list + the
+    final assistant text.  Called once at end-of-turn from
+    ``runtime.run_agent_query``.  For per-LLM-call detail (one row per
+    Anthropic call inside the multi-iteration tool loop), see
+    ``record_event``.
     """
-    writer = _AuditWriter.get()
-    if writer is None:
-        return
-
     extra = {
         "agent_id": agent_id,
         "tenant_id": tenant_id,
@@ -233,37 +115,87 @@ def record_turn(
         ],
         "cache_hit_rate": round(usage.cache_hit_rate(), 4),
         "source": "agent-runtime",
+        "kind": "turn_summary",
     }
+    record(
+        direction=direction,
+        conversation_id=conversation_id,
+        user_id=user_id,
+        model=usage.model,
+        stream=True,
+        content=usage.content_text()[:65_000],
+        tokens_input=usage.tokens_input_total,
+        tokens_output=usage.tokens_output,
+        cache_create=usage.cache_create,
+        cache_read=usage.cache_read,
+        # [TASK_ID_2026_05_26] Promote task_id to the typed column so
+        # cost-per-task queries can do a Lance scan with filter
+        # pushdown instead of JSON-string parse on extras.
+        task_id=task_id,
+        extra=extra,
+    )
 
-    writer.enqueue({
-        "user_id": user_id,
-        "conversation_id": conversation_id,
-        "direction": direction,
-        "model": usage.model,
-        "stream": True,
-        "content": usage.content_text()[:65_000],  # safety truncation
-        "tokens_input": usage.tokens_input_total,
-        "tokens_output": usage.tokens_output,
-        "cache_create": usage.cache_create,
-        "cache_read": usage.cache_read,
-        "extra": json.dumps(extra),
-    })
+
+def record_event(
+    *,
+    audit_ev: dict,
+    conversation_id: str,
+    user_id: str,
+    tenant_id: str,
+    agent_id: str,
+    task_id: Optional[str],
+    parent_cid: Optional[str],
+) -> None:
+    """Persist a single AUDIT event (TO_LLM | FROM_LLM | APPROVAL)
+    yielded by ``Agent.run_turn`` into pii_audit.
+
+    Mirrors ``agent-proxy/app/chat_agent_handler._write_audit`` so the
+    admin dashboard's per-message timeline gets the same rows whether
+    the agent ran via ChatAgent (pii-proxy) or via the inbox poller
+    dispatch (agent-runtime).  Best-effort — never raises.
+    """
+    try:
+        extra = {
+            "agent_id": agent_id,
+            "tenant_id": tenant_id,
+            "task_id": task_id,
+            "parent_cid": parent_cid,
+            "source": "agent-runtime",
+            "kind": "agent_event",
+        }
+        record(
+            direction=audit_ev.get("direction", "") or "",
+            conversation_id=conversation_id,
+            user_id=user_id,
+            model=audit_ev.get("model") or "",
+            stream=False,
+            content=(audit_ev.get("content") or "")[:65_000],
+            tokens_input=audit_ev.get("tokens_input_total"),
+            tokens_output=audit_ev.get("tokens_output"),
+            cache_create=audit_ev.get("cache_create"),
+            cache_read=audit_ev.get("cache_read"),
+            task_id=task_id,
+            extra=extra,
+        )
+    except Exception as e:
+        logger.warning(f"[audit] record_event failed: {e}")
+
+
+# ── SDK stream tapping ──────────────────────────────────────────────────
 
 
 async def tap_sdk_stream(
     stream: AsyncIterator[Any],
     usage: TurnUsage,
 ) -> AsyncIterator[Any]:
-    """Pass-through wrapper that taps the SDK's message iterator.
+    """Pass-through wrapper that taps the SDK's / Agent's message iterator.
 
     For each message we forward upstream UNCHANGED, while also updating
-    `usage` (in-place) with whatever stats / content we can extract.
-
-    The SDK's message types vary by version; we handle the common
-    shapes defensively (getattr-based).
+    ``usage`` in-place with whatever stats / content we can extract.
+    The shape varies by source (SDK assistant messages vs Agent dict
+    events), so we handle both defensively via getattr / .get.
     """
     async for msg in stream:
-        # AssistantMessage — capture content chunks + tool calls
         msg_type = getattr(msg, "type", None) or (
             msg.get("type") if isinstance(msg, dict) else None
         )
@@ -300,7 +232,6 @@ async def tap_sdk_stream(
                     )
                     usage.tool_calls.append({"name": name, "id": tid})
 
-            # Capture model + usage if present on inner message
             model = (
                 getattr(inner, "model", None)
                 or (inner.get("model") if isinstance(inner, dict) else None)
@@ -342,12 +273,16 @@ async def tap_sdk_stream(
             if stop_reason:
                 usage.stop_reason = stop_reason
 
-        # Always forward upstream unchanged.
         yield msg
 
 
 __all__ = [
     "TurnUsage",
     "record_turn",
+    "record_event",
     "tap_sdk_stream",
+    # Re-export the shared singleton + write fn so callers can still do
+    # ``from app.middleware.audit import record`` for one-off writes.
+    "AuditDB",
+    "record",
 ]

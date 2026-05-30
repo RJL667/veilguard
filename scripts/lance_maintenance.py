@@ -50,6 +50,12 @@ TABLES = [
     "archive.lance",
     "embeddings.lance",
     "pii_audit.lance",
+    # pii_session_mapping is small per-tenant but grows monotonically
+    # (APPEND-ONLY by design — see pii/session_store.py docstring).  It
+    # carries scalar BTREE indexes on conv_id / tenant_id / original_lc
+    # that need optimize_indices() to absorb new rows.  Without this
+    # entry the table fragments unbounded and the BTREEs go stale.
+    "pii_session_mapping.lance",
     "sparse_archive.lance",
     "sparse_claims.lance",
     "sparse_topic.lance",
@@ -60,6 +66,16 @@ TABLES = [
     "sparse_dream_topic.lance",
     "sparse_dream_entity.lance",
     "sparse.lance",
+    # [PHASE_0_0_5_NEW_TABLES_2026_05_27]  Phase 2 ledger tables.
+    # `agent_tasks` writes a row per task with high-churn `status` /
+    # `lease_until` / `updated_ts` columns — heavy fragmentation
+    # candidate.  `task_comments` is append-only but accumulates
+    # quickly (one row per status change, blocker, review_decision).
+    # Both need compact_files() to keep scans bounded.  Indexes on
+    # `agent_tasks.id` (PK) + `task_comments.task_id` need
+    # optimize_indices() so the inbox poller's pushdown stays cheap.
+    "agent_tasks.lance",
+    "task_comments.lance",
 ]
 
 
@@ -106,6 +122,24 @@ def maintain(table_path: Path) -> tuple[float, float]:
         ds.optimize.compact_files()
     except Exception as e:
         print(f"     compact failed: {e}", flush=True)
+
+    # 1b. Refresh scalar / vector / FTS indexes so newly-written rows
+    # land in the index.  Without this step, BTREEs on pii_session_mapping
+    # and FTS on sparse_archive go stale — readers fall back to full
+    # column scans and slow down catastrophically.  This is the missing
+    # call that caused sparse_archive's "FTS INDEX: pending" perf
+    # regression captured in architecture_lance_maintenance memory.
+    print("  → optimize_indices()...", flush=True)
+    try:
+        ds.optimize.optimize_indices()
+    except AttributeError:
+        # Older lance versions exposed it directly on the dataset.
+        try:
+            ds.optimize_indices()
+        except Exception as e:
+            print(f"     optimize_indices failed: {e}", flush=True)
+    except Exception as e:
+        print(f"     optimize_indices failed: {e}", flush=True)
 
     # 2. Drop old version manifests + their unique data. This is what
     # actually frees disk for tables that have been heavily updated.

@@ -132,3 +132,6 @@ veilguard_logo*.png
 services/client-daemon/build/
 services/client-daemon/dist/
 services/client-daemon/installer_output/
+
+# debug/scratch artifacts (logs, audit dumps, oauth/pii test json) — never publish
+tmp/

@@ -1,0 +1,10 @@
+{
+  "conversation_id": "uat-c1-live-001",
+  "user_id": "69c4468a1fde1abc19c7835c",
+  "tenant_id": "69c4468a1fde1abc19c7835c",
+  "agent_id": "director",
+  "stream": false,
+  "messages": [
+    {"role": "user", "content": "Decompose and delegate as parallel subtasks: produce two short (~60 word) analyses to support our Director model decision - (1) a COST analysis and (2) a LATENCY analysis comparing Claude Haiku vs Sonnet. Create ONE parent coordinator task, then TWO researcher-owned subtasks (one per analysis), each writing its own file under team/drafts/. Do not do the analyses yourself; delegate them to researchers."}
+  ]
+}

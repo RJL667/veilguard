@@ -242,33 +242,91 @@ async def observe_agent_output(
     agent_id: str,
     text: str,
     source: str = "agent",
-) -> None:
+    channel: str = "agent_private",
+) -> bool:
     """Best-effort `observe()` to TCMM with agent_id provenance.
 
-    Per spec §3.4 + Phase 0.2: agent observes go through `extracted_by`
-    field so cross-agent contradiction detection works.  Until the
-    tcmm-service `/observe` endpoint exposes `extracted_by` (spec
-    Phase 0.2 deliverable), we put it in `metadata.extracted_by` so the
-    field is available on the wire even if the server ignores it.
+    [F4_AGENT_SCOPED_OBSERVE_2026_05_26]  Was calling a non-existent
+    /observe endpoint on tcmm-service — silently 404'd for weeks, so
+    NO agent observations ever persisted.  v3/v4 confirmed via the
+    cross-conv recall probe: model said "I don't have any memory blocks
+    from a startup investigation earlier today."
 
-    Failure here is non-fatal — the agent's turn still completes.
+    Fix: route through /ingest_turn with an agent-scoped namespace
+    (`agent/<agent_id>/observations/<user_id>`) instead of the
+    per-dispatch sub-cid.  The persona prompts already promise the
+    `agent/<id>/observations/` namespace; this makes them truthful.
+
+    Recall integration is a follow-up: a /pre_request that searches
+    `<user_id>:<conv_id>` AND `<user_id>:agent/<id>/observations/<user_id>`
+    is the next step.  For now persistence is restored; recall via
+    explicit /search with namespace=`agent/<id>/observations/<user_id>`
+    works today.
+
+    `conversation_id` is kept in the per-item metadata so we can
+    cross-link an observation back to the sub-conversation that produced
+    it, but the namespace it LIVES in is agent-scoped, not conv-scoped.
+
+    Returns:
+        True  — observation persisted in TCMM
+        False — observation was NOT persisted (TCMM unreachable, 4xx/5xx,
+                empty agent_id, or TCMM disabled).  Callers MUST surface
+                this to the LLM so it doesn't spin in a "I observed
+                successfully but nothing's there" loop — that's how the
+                infinite-replan failure mode happens.  Fixed 2026-05-27
+                after a researcher burned 100+ stream events believing
+                its observations were persisted when TCMM was down.
     """
     if not TCMM_ENABLED:
-        return
+        return False
+    if not agent_id:
+        # Without an agent_id we can't build the scoped namespace —
+        # drop rather than fall back to a conv-scoped write (that's
+        # exactly the historical bug).
+        logger.warning("[tcmm] observe dropped — empty agent_id")
+        return False
 
     headers = {}
     if VEILGUARD_INTERNAL_SECRET:
         headers["x-veilguard-internal-secret"] = VEILGUARD_INTERNAL_SECRET
 
-    url = f"{TCMM_URL.rstrip('/')}/observe"
+    # Agent-scoped TCMM conversation_id.  Per the persona contracts
+    # (agents/researcher.md etc.), observations land in
+    # `agent/<agent_id>/observations/`.  We tack on user_id so the
+    # tenant_id filter at the data-access layer still applies.
+    agent_conv = f"agent/{agent_id}/observations/{user_id}"
+
+    url = f"{TCMM_URL.rstrip('/')}/ingest_turn"
+    # [F4b_INGEST_FIELD_NAMES_2026_05_28] Two silent-drop bugs fixed:
+    # (1) TCMM reads `item.get("text")` but we previously sent `content`,
+    #     so EVERY observation was skipped at line 1381 in
+    #     adapters/veilguard_adapter.py.  Verified live: ingest_turn
+    #     replied {"added": 0, "requested": 1} but the middleware
+    #     returned True because the HTTP status was 200.
+    # (2) TCMM's _ORIGIN_MAP supports "assistant_text"/"tool_use"/
+    #     "tool_result"/"system"/"user" — NOT "observation".  Unknown
+    #     origins silently fall through to "user" semantics, which is
+    #     wrong for agent-authored output.  Use "assistant_text".
     payload = {
-        "conversation_id": conversation_id,
+        "conversation_id": agent_conv,
         "user_id": user_id,
-        "text": text,
-        "source": source,
-        "metadata": {
-            "extracted_by": f"agent:{agent_id}",
-        },
+        "items": [
+            {
+                "text": text,                       # TCMM contract: `text`
+                "origin": "assistant_text",         # in _ORIGIN_MAP
+                "extracted_by": f"agent:{agent_id}",
+                # [CHANNEL_2026_05_29] spec §6.1 — top-level item field
+                # (mirrors extracted_by; NOT metadata). Routes the write
+                # to the right `channel` column at ingest; the namespace
+                # above stays the cache-stable agent-private path.
+                "channel": channel,
+                "source_kind": "TOOL_RESULT",
+                "metadata": {
+                    "source": source,
+                    "source_conversation_id": conversation_id,
+                },
+            }
+        ],
     }
 
     try:
@@ -276,11 +334,32 @@ async def observe_agent_output(
             r = await client.post(url, json=payload, headers=headers)
         if r.status_code >= 400:
             logger.warning(
-                f"[tcmm] observe returned {r.status_code}; "
-                f"agent output not persisted"
+                f"[tcmm] ingest_turn(observe) returned {r.status_code}; "
+                f"agent output not persisted: {r.text[:200]}"
             )
+            return False
+        ct = r.headers.get("content-type", "")
+        body = r.json() if ct.startswith("application/json") else {}
+        # [F4b] gate truthy return on `added > 0` so silent ingest-side
+        # drops surface to callers and the LLM-facing tool can warn the
+        # agent (instead of pretending the observation persisted).
+        added = int(body.get("added", 0) or 0)
+        requested = int(body.get("requested", 1) or 1)
+        if added <= 0:
+            logger.warning(
+                f"[tcmm] ingest_turn(observe) returned 200 but added={added}/"
+                f"{requested}; agent output NOT persisted (likely TCMM "
+                f"rejected the shape).  agent={agent_id} ns={agent_conv!r}"
+            )
+            return False
+        logger.debug(
+            f"[tcmm] observe persisted: agent={agent_id} "
+            f"ns={agent_conv!r} added={added}/{requested}"
+        )
+        return True
     except Exception as e:
         logger.warning(f"[tcmm] observe failed: {e}; agent output not persisted")
+        return False
 
 
 def invalidate_cache(parent_cid: str, agent_id: Optional[str] = None) -> None:

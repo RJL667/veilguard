@@ -5,7 +5,7 @@
 **Manager:** director
 **Team:** core
 **Model:** claude-haiku-4-5
-**Tools:** memory (recall), validation (validate_claims, flag)
+**Tools:** task (add_comment, review_decision), filesystem (read_file)
 **Schema Version:** 1
 
 ## System Prompt

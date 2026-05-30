@@ -1168,8 +1168,26 @@ async def pre_request(body: PreRequestBody):
             # also still run the full path when scope=user recall might
             # find cross-namespace candidates — that path is invoked via
             # /search, not /pre_request, and isn't affected.
+            # [USER_SCOPE_RECALL_2026_05_29]  When the platform runs
+            # USER-scoped memory (everything the user told the org is
+            # recallable in ANY conversation), a fresh conversation is
+            # NOT "nothing to recall" — it should pull the user's facts
+            # from their OTHER conversations.  So (a) don't take the
+            # cold-conv recall-skip when user-scoped, and (b) set the
+            # instance recall scope to "user" so the archive search runs
+            # `search_user` (cross-namespace) instead of per-namespace.
+            import os as _os
+            _user_scope = _os.environ.get(
+                "VEILGUARD_RECALL_SCOPE", "user"
+            ).strip().lower() == "user"
+            if _user_scope:
+                try:
+                    instance.tcmm._recall_scope = "user"
+                except Exception:
+                    pass
+
             _is_cold_conv = sess.get("turns", 0) == 0
-            if _is_cold_conv:
+            if _is_cold_conv and not _user_scope:
                 logger.info(
                     f"[PRE-COLD] session={_sid} "
                     f"q='{body.user_message[:60]}' — skipping recall (cold conv)"
@@ -1530,6 +1548,21 @@ class PinUserProfileBody(BaseModel):
     user_id: str = ""
 
 
+class PinToolDefinitionsBody(BaseModel):
+    """Pin a list of tool schemas — one IMMUTABLE block per tool.
+
+    Each schema may arrive as either a JSON-serializable dict (will be
+    canonical-JSON-serialized with sort_keys=True for fingerprint
+    stability) or as an already-stringified JSON blob (used as-is).
+    Per-tool blocks mean a single tool's schema change invalidates
+    exactly one block's cache slot — not the whole preamble or every
+    other tool.
+    """
+    tools: List[Any]
+    conversation_id: str = ""
+    user_id: str = ""
+
+
 class RenderBody(BaseModel):
     model: str = "anthropic"
     task_query: str = ""
@@ -1564,6 +1597,61 @@ async def pin_system_prompt(body: PinSystemPromptBody):
         f"kind={body.kind} bid={bid} deduped={deduped} chars={len(body.text)}"
     )
     return {"status": "ok", "block_id": bid, "deduped": deduped}
+
+
+@app.post("/pin/tool_definitions")
+async def pin_tool_definitions(body: PinToolDefinitionsBody):
+    """Pin a list of tool schemas — one IMMUTABLE block per tool.
+
+    Per-tool granularity is the point: a single tool's description /
+    input_schema tweak invalidates exactly one cached block, leaving
+    the rest of the prefix (preamble + persona + other tools + user
+    profile) byte-stable and cache-warm.  Dedup by fingerprint via
+    ``pin_immutable_block``.
+
+    Schemas serialize as ``json.dumps(schema, sort_keys=True,
+    separators=(',', ':'))`` so identical dicts in any key order give
+    identical fingerprints.  Strings pass through unchanged (caller
+    has already canonicalized).
+    """
+    import json as _json
+    if not body.tools:
+        return {"status": "ok", "block_ids": [], "deduped_count": 0,
+                "note": "empty tools — skipped"}
+    instance = pool.get(body.conversation_id, user_id=body.user_id)
+    tcmm = instance.tcmm
+    before_ids = {b.id for b in tcmm.live_blocks}
+    ids: List[int] = []
+    deduped = 0
+    for schema in body.tools:
+        if isinstance(schema, str):
+            txt = schema
+        else:
+            try:
+                txt = _json.dumps(
+                    schema, sort_keys=True,
+                    ensure_ascii=False, separators=(",", ":"),
+                )
+            except Exception:
+                continue
+        if not txt:
+            continue
+        bid = tcmm.pin_immutable_block(
+            txt,
+            priority_class="SYSTEM",
+            source="tool_def",
+            kind="tool_def",
+        )
+        if bid is None:
+            continue
+        if bid in before_ids:
+            deduped += 1
+        ids.append(bid)
+    logger.info(
+        f"[PIN] session={pool._normalize_id(body.conversation_id)} "
+        f"kind=tool_def n={len(body.tools)} bids={ids} deduped={deduped}"
+    )
+    return {"status": "ok", "block_ids": ids, "deduped_count": deduped}
 
 
 @app.post("/pin/user_profile")
@@ -1823,7 +1911,26 @@ async def render_structured(body: RenderBody):
             detail=f"Unknown render model: {model!r}",
         )
 
-    result = renderer.render_structured(body.task_query)
+    # [RENDER_RECALL_SCOPE_2026_05_29]  Recall during render defaults to
+    # "namespace" scope (per-conversation) — so a fact stated in
+    # conversation A never surfaces when the same user opens a fresh
+    # conversation B (UAT M2 cross-conv recall failed for exactly this
+    # reason).  The Veilguard agent platform wants USER-scoped memory:
+    # everything the user told the org, recallable in any conversation.
+    # Wrap the render's recall in scope_context("user") so the archive
+    # search runs `search_user` (all of the user's sessions) instead of
+    # the per-namespace path.  Env-overridable.
+    import os as _os
+    _scope = _os.environ.get("VEILGUARD_RENDER_RECALL_SCOPE", "user").strip() or "user"
+    try:
+        from core.recall.scope import scope_context as _scope_context
+    except Exception:
+        _scope_context = None
+    if _scope_context is not None and _scope in ("user", "session", "namespace"):
+        with _scope_context(_scope):
+            result = renderer.render_structured(body.task_query)
+    else:
+        result = renderer.render_structured(body.task_query)
     return {
         "status": "ok",
         "format": "anthropic-structured" if model in ("anthropic", "claude") else f"{model}-structured",
@@ -2607,8 +2714,13 @@ async def debug_session_state(conversation_id: str, user_id: str = ""):
 
     live = list(tcmm.live_blocks)
     shadow = list(getattr(tcmm, "shadow_blocks", []) or [])
+    # Pin lane — separate in-memory store, never persisted to archive
+    # or live_blocks.  See tcmm_core.pin_immutable_block for rationale.
+    pinned_fn = getattr(tcmm, "pinned_prefix_blocks", None)
+    pinned = list(pinned_fn()) if callable(pinned_fn) else []
     live_tokens = sum(_tok_count(b) for b in live)
     shadow_tokens = sum(_tok_count(b) for b in shadow)
+    pinned_tokens = sum(_tok_count(b) for b in pinned)
 
     # Show top / bottom live blocks by heat so we can predict which
     # will be evicted next.
@@ -2640,6 +2752,12 @@ async def debug_session_state(conversation_id: str, user_id: str = ""):
             "count": len(shadow),
             "tokens": shadow_tokens,
             "max_tokens": int(getattr(tcmm, "max_shadow_tokens", 0) or 0),
+        },
+        "pinned": {
+            "count": len(pinned),
+            "tokens": pinned_tokens,
+            "note": "RAM-only; not archived, not in live_blocks",
+            "blocks": [_b_brief(b) for b in pinned],
         },
         "archive": {"count": len(tcmm.archive)},
         "current_step": int(getattr(tcmm, "current_step", 0) or 0),

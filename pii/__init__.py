@@ -19,7 +19,12 @@ Public surface:
 """
 
 from .session_store import SessionId, PIISessionStore, get_store
-from .redactor import PIIRedactor, get_redactor, PII_ENTITIES
+from .redactor import (
+    PIIRedactor,
+    get_redactor,
+    PII_ENTITIES,
+    RedactionUnavailable,
+)
 
 __all__ = [
     "SessionId",
@@ -28,4 +33,5 @@ __all__ = [
     "PIIRedactor",
     "get_redactor",
     "PII_ENTITIES",
+    "RedactionUnavailable",
 ]

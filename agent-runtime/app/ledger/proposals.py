@@ -39,10 +39,91 @@ def create_proposal(
     constraint_violations: Optional[list[str]] = None,
     constitution_version: Optional[int] = None,
 ) -> str:
-    """Insert a new proposal.  Called by the dream-cycle hook."""
+    """Insert a new proposal — or bump an existing duplicate's recurrence.
+
+    [PROPOSAL_DEDUP_2026_05_28]  When DreamScanner re-encounters the same
+    `(tenant_id, user_id, signal_type, sorted(signal_node_ids))` tuple
+    while a prior proposal is still pending or deferred, we MUST NOT
+    write a duplicate row.  Instead bump the existing row's
+    `recurrence_count` and refresh `last_surfaced_ts`.  Closes the TODO
+    at `dream_scanner.py:22`.
+
+    The recurrence count drives:
+      * `lifecycle.escalated_proposals()` — rows with recurrence ≥ 5 get
+        visual emphasis in the sidebar emergency lane.
+      * recalibration outcome attribution — repeated proposals on the
+        same node cluster signal "still relevant; the user hasn't acted".
+
+    Returns the proposal id (NEW or EXISTING — caller treats both the
+    same).
+    """
     tbl = LedgerStore.get().table("task_proposals")
-    pid = _new_id()
     ts = _now()
+
+    # --- Dedup check: same (tenant, user, signal_type, node_ids) ---
+    # node_ids order doesn't matter — store/match on sorted tuple.
+    try:
+        sorted_ids = sorted(int(n) for n in (signal_node_ids or []))
+    except (TypeError, ValueError):
+        sorted_ids = []
+    if sorted_ids:
+        # Lance .where() can't compare list-of-ints inline, so we scan
+        # the small "still surfaceable" subset and dedup in Python.
+        # That subset is bounded (~10-50 rows per user) so the cost is
+        # negligible compared to writing a duplicate.
+        try:
+            where = (
+                f"tenant_id = '{tenant_id}' "
+                f"AND user_id = '{user_id}' "
+                f"AND signal_type = '{signal_type}' "
+                f"AND status IN ('pending', 'deferred')"
+            )
+            arr = tbl.search().where(where).limit(200).to_arrow()
+            for i in range(arr.num_rows):
+                row_ids = arr.column("signal_node_ids")[i].as_py() or []
+                if sorted(int(n) for n in row_ids) != sorted_ids:
+                    continue
+                # Match — bump recurrence + last_surfaced_ts + decay_score
+                # back up to current impact_score so the sidebar re-
+                # surfaces.  (Decay accumulates between sightings; a
+                # fresh emission means the signal is still warm.)
+                existing_id = arr.column("id")[i].as_py()
+                existing_rc = arr.column("recurrence_count")[i].as_py() or 1
+                new_rc = int(existing_rc) + 1
+                tbl.update(
+                    where=f"id = '{existing_id}'",
+                    values={
+                        "recurrence_count":  new_rc,
+                        "last_surfaced_ts":  ts,
+                        "updated_ts":        ts,
+                        "decay_score":       max(
+                            float(arr.column("decay_score")[i].as_py() or 0.0),
+                            float(impact_score),
+                        ),
+                    },
+                )
+                # Broadcast a status-change-style event so the sidebar
+                # bumps the row without a full re-fetch.
+                try:
+                    from ..events import broadcast
+                    broadcast({
+                        "type":             "proposal_recurrence_bumped",
+                        "tenant_id":        tenant_id,
+                        "user_id":          user_id,
+                        "id":               existing_id,
+                        "recurrence_count": new_rc,
+                        "signal_type":      signal_type,
+                    })
+                except Exception:
+                    pass
+                return existing_id
+        except Exception:
+            # On any scan error, fall through to the original create
+            # path — better to occasionally double-emit than to drop a
+            # proposal because the dedup query glitched.
+            pass
+
+    pid = _new_id()
     row = {
         "id": pid,
         "kind": "proposal",
@@ -75,6 +156,22 @@ def create_proposal(
         "extras_json": None,
     }
     tbl.add([row])
+    try:
+        from ..events import broadcast
+        broadcast({
+            "type": "proposal_created",
+            "tenant_id": tenant_id, "user_id": user_id,
+            "id": pid, "signal_type": signal_type,
+            "impact_score": impact_score, "assignee": proposed_assignee,
+            "brief": proposed_brief[:200],
+        })
+    except Exception:
+        pass
+    try:
+        from ..runtime_health import apr_record_artifact
+        apr_record_artifact()  # Phase 6.7
+    except Exception:
+        pass
     return pid
 
 
@@ -107,6 +204,16 @@ def approve_proposal(
         "director_decision_ts": _now(),
         "updated_ts": _now(),
     })
+    try:
+        from ..events import broadcast
+        broadcast({
+            "type": "proposal_status_changed",
+            "tenant_id": tenant_id, "user_id": user_id,
+            "id": proposal_id, "status": "approved",
+            "resulting_task_id": resulting_task_id,
+        })
+    except Exception:
+        pass
 
 
 def shelve_proposal(
@@ -125,6 +232,15 @@ def shelve_proposal(
         "director_decision_ts": _now(),
         "updated_ts": _now(),
     })
+    try:
+        from ..events import broadcast
+        broadcast({
+            "type": "proposal_status_changed",
+            "tenant_id": tenant_id, "user_id": user_id,
+            "id": proposal_id, "status": "shelved",
+        })
+    except Exception:
+        pass
 
 
 def defer_proposal(
@@ -141,6 +257,15 @@ def defer_proposal(
         "director_decision_ts": _now(),
         "updated_ts": _now(),
     })
+    try:
+        from ..events import broadcast
+        broadcast({
+            "type": "proposal_status_changed",
+            "tenant_id": tenant_id, "user_id": user_id,
+            "id": proposal_id, "status": "deferred",
+        })
+    except Exception:
+        pass
 
 
 def queue(

@@ -26,15 +26,24 @@ _SHARED_SKELETON_COLUMNS = {
 
 
 class TestSchemaConstruction:
-    def test_all_seven_tables_present(self):
+    def test_all_ledger_tables_present(self):
+        # Phase 3 added alignment_weights + tenant_proactive_config;
+        # Phase 5 added a2a_external_keys (registered separately);
+        # Phase 6.3 added agent_task_heartbeats.
+        # 2026-05-28: org_memory dropped (Phase 7 M1 cutover) — lessons
+        # live in TCMM archive, not Lance.
+        # 2026-05-28: agent_teams added (Phase 7.5 organisational scaling).
         assert set(TABLE_SCHEMAS.keys()) == {
             "agent_tasks",
             "task_comments",
             "task_proposals",
             "proposal_outcomes",
-            "org_memory",
             "client_tool_approvals",
             "client_tool_bypass",
+            "alignment_weights",
+            "tenant_proactive_config",
+            "agent_task_heartbeats",
+            "agent_teams",
         }
 
     def test_all_schemas_are_pa_schema_instances(self):

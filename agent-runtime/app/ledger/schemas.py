@@ -56,12 +56,40 @@ def _shared_skeleton_fields() -> list[pa.Field]:
 # ── agent_tasks ──────────────────────────────────────────────────────────
 
 
+# ── Phase 6.0 — Acceptance-criteria struct ──────────────────────────────
+#
+# Per spec §6.0, every task carries a list of AcceptanceCriterion structs.
+# Critics walk this list one-by-one; a task transitions to `state='done'`
+# only if all required ACs report `status='pass'`.  Stored as a strongly
+# typed Lance column (NOT json) so the post-deploy invariant scan
+# (AC-12 / AC-P7.3) can filter on it directly.
+#
+# `check_args` carries the executor's parameters — kind-specific schema
+# nested inside; encoded as JSON string for forward-compatibility.  See
+# `agent-runtime/app/acceptance/executors.py` for the executor contract.
+
+
+def _acceptance_criterion_struct() -> pa.StructType:
+    return pa.struct([
+        pa.field("id",         pa.string(), nullable=False),  # "AC-1", monotonic per task
+        pa.field("statement",  pa.string(), nullable=False),
+        pa.field("check_kind", pa.string(), nullable=False),  # see executors.py CHECK_KINDS
+        pa.field("check_args", pa.string(), nullable=False),  # JSON-encoded args dict
+        pa.field("required",   pa.bool_(),  nullable=False),
+        pa.field("rationale",  pa.string(), nullable=True),
+    ])
+
+
 def agent_tasks_schema() -> pa.Schema:
     """The Task entity — work items assigned to agents.
 
     Comments live in `task_comments` (separate table, append-only chain).
     Outputs are file paths in workspace; outputs[] is a list of strings.
     Inputs reference upstream task_ids or artifact paths.
+
+    Phase 6.0 added `acceptance_criteria` — the structured AC list the
+    Critic walks before allowing `state='done'`.  Phase 6.0.1 + 6.0.2
+    add the hard-gate guard + Director-side validation respectively.
     """
     return pa.schema(_shared_skeleton_fields() + [
         pa.field("owner_id", pa.string(), nullable=False),     # agent_id
@@ -83,6 +111,32 @@ def agent_tasks_schema() -> pa.Schema:
         # lease_until is in the past or null, the task is available.
         pa.field("lease_owner", pa.string(), nullable=True),
         pa.field("lease_until", pa.float64(), nullable=True),
+        # Phase 6.0 — structured acceptance criteria.  Non-nullable at the
+        # row level (always a list — may be empty for legacy/backfilled
+        # rows, but never NULL).  The Director-side validator in
+        # `create_task` rejects empty lists for new rows.
+        pa.field(
+            "acceptance_criteria",
+            pa.list_(_acceptance_criterion_struct()),
+            nullable=False,
+        ),
+        # [PHASE_7_5_TEAM_ID_2026_05_28] Optional team membership.
+        # When set, `create_task` checks the team's budget envelope
+        # before persisting.  `update_status('done')` triggers a
+        # rollup of `agent_teams.cost_attributed_cached_usd`.  Null
+        # for tasks that aren't team-scoped (legacy + ad-hoc Director
+        # work outside any team).
+        pa.field("team_id", pa.string(), nullable=True),
+        # [PHASE_7_5_DEPENDS_ON_2026_05_28] Cross-lineage DAG dependencies.
+        # `parent_id` + `lineage_chain` only model single-edge subtask
+        # relationships (the producer-of-X tree); `depends_on` lets a
+        # Task block on N sibling/cousin tasks completing first — fan-in
+        # patterns (Researcher A's draft must merge with Researcher B's
+        # findings before Builder can start).  Inbox-poller treats a task
+        # as un-claimable until every task_id in this list reports
+        # status='done'.  Cycle prevention is the Director's responsibility
+        # at create_task time; the ledger only stores + reads.
+        pa.field("depends_on", pa.list_(pa.string()), nullable=True),
         pa.field("extras_json", pa.string(), nullable=True),     # forward-compat
     ])
 
@@ -153,6 +207,19 @@ def task_proposals_schema() -> pa.Schema:
         pa.field("shelf_reason", pa.string(), nullable=True),
         pa.field("resulting_task_id", pa.string(), nullable=True),
         pa.field("constitution_version", pa.int64(), nullable=True),
+        # [PHASE_3_EMERGENCY_LANE_COLUMN_2026_05_27]  Per spec §3.7.3
+        # USER×USER contradictions bypass per-day caps + Director
+        # pre-eval and surface immediately.  Typed column lets the
+        # sidebar query split queue/emergency cleanly without the
+        # rationale-prefix heuristic the /proposals endpoint used to
+        # rely on.  Nullable so older rows just read as False.
+        pa.field("emergency_lane", pa.bool_(), nullable=True),
+        # Phase 7.1 M3 — cross-ref to TCMM observation carrying the
+        # proposal's content (proposed_brief + rationale).  Set when
+        # `record_proposal` split-writer fires; null on pre-Phase-7
+        # rows.  Ledger keeps the operational fields; TCMM gets the
+        # narrative.  Pointer-not-mirror per §2 design principle.
+        pa.field("tcmm_obs_id", pa.string(), nullable=True),
         pa.field("extras_json", pa.string(), nullable=True),
     ])
 
@@ -176,6 +243,10 @@ def proposal_outcomes_schema() -> pa.Schema:
         pa.field("regret_score", pa.float64(), nullable=False),
         pa.field("objective_deltas_json", pa.string(), nullable=True),
         pa.field("computed_at_ts", pa.float64(), nullable=False),
+        # Phase 7.1 M2 — cross-ref to TCMM observation carrying
+        # outcome narrative (regret_text, what_went_wrong,
+        # lessons_learned).  Same pointer-not-mirror discipline as M3.
+        pa.field("tcmm_obs_id", pa.string(), nullable=True),
         pa.field("extras_json", pa.string(), nullable=True),
     ])
 
@@ -274,17 +345,170 @@ def client_tool_bypass_schema() -> pa.Schema:
     ])
 
 
+# ── alignment_weights (runtime-tunable scoring weights) ────────────────
+
+
+def alignment_weights_schema() -> pa.Schema:
+    """Per spec §3.7.2 end — weekly recalibration adjusts
+    DEFAULT_ALIGNMENT_VECTORS based on proposal_outcomes regret
+    aggregates.  Storing them in Lance (instead of hardcoded in
+    `scoring.py`) lets the recalibration job persist its decisions.
+
+    One row per (tenant_id, signal_type, objective_id).  Workers read
+    all-rows-for-tenant via `get_alignment_for_tenant()` and fall back
+    to the static defaults in `scoring.DEFAULT_ALIGNMENT_VECTORS` when
+    no row exists (start-state).
+
+    `weight` is the current calibrated value [0, 1].  `last_regret_avg`
+    is the rolling 4-week mean regret_score for this (signal_type,
+    objective_id) combo — what the recalibration uses to nudge weights.
+    """
+    return pa.schema([
+        pa.field("id", pa.string(), nullable=False),
+        pa.field("tenant_id", pa.string(), nullable=False),
+        pa.field("user_id", pa.string(), nullable=False),
+        pa.field("signal_type", pa.string(), nullable=False),
+        pa.field("objective_id", pa.string(), nullable=False),
+        pa.field("weight", pa.float64(), nullable=False),
+        pa.field("default_weight", pa.float64(), nullable=False),  # for diff/audit
+        pa.field("last_regret_avg", pa.float64(), nullable=True),
+        pa.field("last_recalibrated_ts", pa.float64(), nullable=False),
+        pa.field("recalibration_count", pa.int64(), nullable=False),
+        pa.field("created_ts", pa.float64(), nullable=False),
+        pa.field("updated_ts", pa.float64(), nullable=False),
+        pa.field("extras_json", pa.string(), nullable=True),
+    ])
+
+
+# ── tenant_proactive_config (per-tenant proactive-stream gates) ─────────
+
+
+def tenant_proactive_config_schema() -> pa.Schema:
+    """Per spec §3.7.3 + Phase 3 plan — per-tenant gates on the
+    proactive stream.  Promoted from open-question to ship-requirement.
+
+    One row per (tenant_id, user_id).  Missing row → defaults apply
+    (proactive stream enabled, 12 cycles/day, 20 approvals/day cap,
+    $5/day cost ceiling).
+    """
+    return pa.schema([
+        pa.field("id", pa.string(), nullable=False),
+        pa.field("tenant_id", pa.string(), nullable=False),
+        pa.field("user_id", pa.string(), nullable=False),
+        # Master switch — when False the DreamScanner + LifecycleWorker
+        # both skip this tenant.  Dream itself still runs (no change to
+        # TCMM); proposals just don't surface.
+        pa.field("proactive_stream_enabled", pa.bool_(), nullable=False),
+        # Cycle cadence — DreamScanner / dream cycle cadence per day.
+        # Default 12 (= every 2h).  Tunable per tenant for cost control.
+        pa.field("proactive_cycles_per_day", pa.int64(), nullable=False),
+        # Approval cap — Director may approve at most this many
+        # proposals/day automatically.  User-driven Tasks bypass.
+        pa.field("proactive_approval_cap_per_day", pa.int64(), nullable=False),
+        # Cost ceiling — aggregate per-day cap from constitution
+        # constraint cost_ceiling_per_tenant_per_day; defaults to $5.
+        pa.field("cost_ceiling_per_tenant_per_day_usd", pa.float64(), nullable=False),
+        # Auto-pause state — set by signal-quality-drift watchdog
+        # (deferred Phase 3 work).  True means stream is paused.
+        pa.field("paused", pa.bool_(), nullable=False),
+        pa.field("paused_reason", pa.string(), nullable=True),
+        pa.field("paused_at_ts", pa.float64(), nullable=True),
+        pa.field("created_ts", pa.float64(), nullable=False),
+        pa.field("updated_ts", pa.float64(), nullable=False),
+        pa.field("extras_json", pa.string(), nullable=True),
+    ])
+
+
+# ── agent_task_heartbeats (Phase 6.3 lease TTL + heartbeats) ────────────
+
+
+def agent_teams_schema() -> pa.Schema:
+    """Phase 7.5 — `agent_teams` Lance schema.
+
+    A Team is a named bundle of agents with a shared lead, a budget,
+    and a cost ceiling.  Tasks may be assigned to a team via
+    `agent_tasks.team_id`; the Director-side `create_task` validator
+    rejects new work for teams whose attributed cost has crossed the
+    budget ceiling (`team_cost_attributed > budget_usd × budget_cap`).
+
+    Membership is stored inline as `member_agent_ids` — small list
+    (<20 typical), no need for a join table at v1 scale.
+    """
+    return pa.schema(_shared_skeleton_fields() + [
+        pa.field("name",             pa.string(),  nullable=False),
+        pa.field("lead_agent_id",    pa.string(),  nullable=False),
+        pa.field("member_agent_ids", pa.list_(pa.string()), nullable=True),
+        # Budget envelope.  `budget_usd` is the soft ceiling; cap=1.0
+        # means "block at exactly budget"; cap=1.2 means "20% slack
+        # before hard block".  Operator-configurable per team.
+        pa.field("budget_usd",       pa.float64(), nullable=False),
+        pa.field("budget_cap",       pa.float64(), nullable=True),
+        # Cached cost rollup — recomputed by `team_cost_attributed()`
+        # at create_task time; this column is a denormalised snapshot
+        # for the sidebar / Director's view, NOT the source of truth.
+        # Source of truth = sum(agent_tasks.cost_attributed_usd
+        # WHERE team_id = <this>).
+        pa.field("cost_attributed_cached_usd", pa.float64(), nullable=True),
+        pa.field("cost_recomputed_ts",         pa.float64(), nullable=True),
+        pa.field("extras_json",                pa.string(),  nullable=True),
+    ])
+
+
+def agent_task_heartbeats_schema() -> pa.Schema:
+    """Heartbeat ring per spec §6.3 — workers beat at every turn so the
+    inbox-poller can detect dead workers holding stale claims.
+
+    One row per (task_id, worker_id) heartbeat event.  The most-recent
+    row for a task_id is the "live" beat; the inbox-poller sweep
+    auto-reclaims tasks where `now - max(last_beat_at) > lease_ttl_s`.
+    """
+    return pa.schema([
+        pa.field("id",           pa.string(),  nullable=False),
+        pa.field("task_id",      pa.string(),  nullable=False),
+        pa.field("worker_id",    pa.string(),  nullable=False),
+        pa.field("tenant_id",    pa.string(),  nullable=False),
+        pa.field("user_id",      pa.string(),  nullable=False),
+        pa.field("last_beat_at", pa.float64(), nullable=False),
+        pa.field("lease_ttl_s",  pa.float64(), nullable=False),
+        pa.field("created_ts",   pa.float64(), nullable=False),
+        pa.field("extras_json",  pa.string(),  nullable=True),
+    ])
+
+
 # ── Registry: name → schema function ─────────────────────────────────────
 
+# [M1_CUTOVER_2026_05_28] `org_memory` removed from the active registry.
+# Lessons live in TCMM `archive` (read via `app.memory.lessons_reader`).
+# The `org_memory_schema()` function is retained below for callers that
+# need to inspect the legacy shape (one-shot migrations, archaeology)
+# but isn't registered for table-init / migration.
 TABLE_SCHEMAS = {
     "agent_tasks": agent_tasks_schema,
     "task_comments": task_comments_schema,
     "task_proposals": task_proposals_schema,
     "proposal_outcomes": proposal_outcomes_schema,
-    "org_memory": org_memory_schema,
     "client_tool_approvals": client_tool_approvals_schema,
     "client_tool_bypass": client_tool_bypass_schema,
+    "tenant_proactive_config": tenant_proactive_config_schema,
+    "alignment_weights": alignment_weights_schema,
+    "agent_task_heartbeats": agent_task_heartbeats_schema,
+    # Phase 7.5
+    "agent_teams": agent_teams_schema,
 }
+
+
+def _register_external_tables() -> None:
+    """Late-register tables defined outside this module (Phase 5+).
+
+    Modules that own non-ledger Lance schemas (e.g. `a2a_external.py`)
+    register them via this hook so `store._open_or_create` finds
+    them.  Call from main.py startup once the modules import.
+    """
+    try:
+        from ..a2a_external import a2a_external_keys_schema
+        TABLE_SCHEMAS.setdefault("a2a_external_keys", a2a_external_keys_schema)
+    except Exception:
+        pass
 
 
 __all__ = [
@@ -294,6 +518,8 @@ __all__ = [
     "task_proposals_schema",
     "proposal_outcomes_schema",
     "org_memory_schema",
+    "tenant_proactive_config_schema",
+    "agent_teams_schema",
     "client_tool_approvals_schema",
     "client_tool_bypass_schema",
 ]

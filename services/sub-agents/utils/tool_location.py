@@ -38,6 +38,37 @@ CLIENT_TOOLS = {
     # needs cookie'd / intranet fetches we'll add a per-call override.
 }
 
+# Subset of CLIENT_TOOLS that can safely fall over to the server-side
+# sandbox container when the user's daemon is offline.  Membership rule:
+#
+#   - Read-only (no host-side write) → safe by default
+#   - Scratch writes inside the sandbox's chroot → safe
+#   - Anything that needs the user's actual filesystem / browser state
+#     / personal credentials → MUST NOT be here (the sandbox is a
+#     blank container, results would mislead the LLM)
+#
+# Two practical use cases for fallback:
+#   1. Long-running daemons (services/sub-agents/tools/daemons.py) need
+#      to run autonomously when the user's Windows machine is off.
+#   2. Multi-agent fanout (Director → Researcher) wants Researcher to
+#      keep working even if the user closes their laptop.
+SANDBOX_FALLBACK_TOOLS = {
+    # Reads + searches against the sandbox container's filesystem.
+    # The sandbox's project_root is its own clean workspace; the LLM
+    # gets clear "you are reading from the sandbox, not the user's
+    # machine" framing via the host-hint prelude.
+    "read_file",
+    "search_files",
+    "grep",
+    # Sandboxed shell — runs inside the container, no host access.
+    # Use case: server agent compiles a tool, runs a test, etc.
+    "run_command",
+    # write_file / edit_file deliberately EXCLUDED — sandbox writes
+    # vanish when the container restarts; users would be confused
+    # about where their file went. Only allow if the agent explicitly
+    # opts into the sandbox as the destination.
+}
+
 # Tools that stay on the cloud (orchestration, memory, scratchpad,
 # and anything that authenticates via the VM's Vertex SA).
 CLOUD_TOOLS = {

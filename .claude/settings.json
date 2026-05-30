@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s http://localhost:*)",
+      "Bash(curl -s -m * http://localhost:*)",
+      "Bash(curl -s -o * http://localhost:*)",
+      "Bash(curl -s -X GET http://localhost:*)",
+      "Bash(python -m py_compile *)",
+      "Bash(python3 -m py_compile *)",
+      "Bash(wc -l *)",
+      "Bash(wc -c *)",
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "mcp__ccd_session__mark_chapter"
+    ]
+  }
+}

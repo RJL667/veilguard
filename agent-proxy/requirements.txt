@@ -9,3 +9,10 @@ spacy==3.8.4
 # format skew; upgrading either side requires bumping both.
 lancedb==0.30.2
 pyarrow>=15.0.0
+# anthropic SDK — required by the agent.ChatAgent path (PR #5a).  TCMM
+# adapter (loaded via sys.path import) calls
+# `anthropic.Anthropic(auth_token=...)` for OAuth bearer mode.
+# Without this in the image, the chat_agent_handler 500s with
+# ModuleNotFoundError on every container recreate (hot-install doesn't
+# persist).
+anthropic>=0.40.0

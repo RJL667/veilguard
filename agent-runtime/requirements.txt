@@ -17,15 +17,31 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 httpx==0.28.1
 
-# The agent loop runtime.  Provides query(), AgentDefinition, ClaudeAgentOptions,
-# HookMatcher, MCP client, prompt caching with cache_control.
-# See https://code.claude.com/docs/en/agent-sdk/overview
-claude-agent-sdk>=0.0.20
+# 2026-05-25 (Phase R cleanup): claude-agent-sdk is no longer required.
+# The live path drives `agent.Agent.run_turn` directly (same as
+# pii-proxy's ChatAgent), using TCMM's OAuth-bearer adapter instead of
+# the SDK's own session manager.  Leaving the pin commented out so
+# anyone resurrecting the legacy SDK path knows the version that was
+# in place last.
+# claude-agent-sdk>=0.0.20
 
 # Decision-ledger storage (agent_tasks, task_proposals, org_memory, etc.)
 # Same Lance dir as TCMM + pii_audit — bump in lockstep with both.
 lancedb==0.30.2
 pyarrow>=15.0.0
+
+# 2026-05-25: agent-runtime now mounts and imports the shared `agent/`
+# package (the 5-step pipeline) from the repo root via PYTHONPATH=/.
+# That pulls in `pii/` and `llm/` transitively.  The PII redactor needs
+# presidio + spacy at the EXACT versions pii-proxy uses; mismatched
+# tokenizers between containers produce different REF token streams
+# for the same input → broken cache stability.  Pin tight.
+presidio-analyzer==2.2.356
+presidio-anonymizer==2.2.356
+spacy==3.8.4
+# Anthropic SDK — TCMM's loaded adapter calls anthropic.Anthropic(
+# auth_token=...) for the OAuth bearer path.  Same pin as pii-proxy.
+anthropic>=0.40.0
 
 # Frontmatter parsing for agents/*.md persona files (the bold-Markdown KV
 # format the existing personas use, not YAML — per spec §0.3 Phase 0.0.2).

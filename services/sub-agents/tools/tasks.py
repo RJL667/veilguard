@@ -30,6 +30,40 @@ from utils.tool_timing import resolve_timeout, record_duration, format_hint
 logger = logging.getLogger("veilguard.tasks")
 
 
+def _shadow_mark(
+    status: str, task_id: str, dispatcher,
+    *, error: str = "", result: str = "",
+) -> None:
+    """Best-effort write of a status flip to the unified TaskStore.
+
+    Phase B-2 mirror layer.  Legacy code keeps writing into
+    ``state.tasks`` (the BackgroundTask object) AND fans status
+    changes here so the same lifecycle is visible in
+    ``list_my_tasks``.  Failures are swallowed — the legacy path is
+    the source of truth, this is just a shadow.
+    """
+    if not task_id or dispatcher is None:
+        return
+    try:
+        from core.tasks import TaskStatus
+        # Translate informal strings to TaskStatus enum.
+        smap = {
+            "pending":   TaskStatus.PENDING,
+            "running":   TaskStatus.RUNNING,
+            "completed": TaskStatus.COMPLETED,
+            "failed":    TaskStatus.FAILED,
+            "cancelled": TaskStatus.CANCELLED,
+        }
+        st = smap.get(status, TaskStatus.PENDING)
+        dispatcher._store.mark_status(
+            task_id, st,
+            error=(error or "")[:8000],
+            result=(result or "")[:8000],
+        )
+    except Exception as e:
+        logger.debug(f"[shadow_mark] {task_id} → {status}: {e}")
+
+
 async def _run_background_worker(
     sys_prompt: str,
     task: str,
@@ -88,10 +122,48 @@ def register(mcp):
         # propagation through task boundaries in this codebase.
         captured_ctx = _capture_ctx()
 
+        # ── Phase B-2 shadow: mirror to unified TaskStore ─────────────
+        # The asyncio.create_task path below still drives the work; we
+        # just write a Lance row so list_my_tasks sees this run.  In
+        # B-2.5 the dispatcher will actually OWN the spawn — for now
+        # we mirror status flips into Lance from inside _run.
+        unified_task_id: str = ""
+        unified_dispatcher = None
+        try:
+            from core.tasks import Task as _UTask, TaskKind as _UKind, TaskDispatcher as _UDisp
+            unified_dispatcher = _UDisp.get()
+            _user_id = captured_ctx.user_id if captured_ctx else ""
+            _conv_id = captured_ctx.conversation_id if captured_ctx else ""
+            _parent_tid = captured_ctx.parent_task_id if (
+                captured_ctx and hasattr(captured_ctx, "parent_task_id")
+            ) else ""
+            unified = _UTask.new(
+                kind=_UKind.SUB_AGENT,
+                executor="sub_agent",
+                user_id=_user_id,
+                conv_id=_conv_id,
+                parent_task_id=_parent_tid,
+                title=f"{role_name}: {task[:60]}",
+                payload={
+                    "role":    role or "custom",
+                    "model":   use_model,
+                    "task":    task,
+                    "tools":   bool(tools),
+                    "max_turns": int(max_turns),
+                    "system_prompt": sys_prompt[:500],
+                },
+                task_id=f"sub-{task_id}",   # tie back to legacy id
+            )
+            unified_task_id = unified.task_id
+            unified_dispatcher.record_external(unified)
+        except Exception as _e:
+            logger.debug(f"[shadow] couldn't write unified row: {_e}")
+
         async def _run():
             async with _spawn_scope(f"bgtask-{task_id}", captured=captured_ctx):
                 bg.status = TaskStatus.RUNNING
                 bg.started_at = time.time()
+                _shadow_mark("running", unified_task_id, unified_dispatcher)
                 try:
                     bg.result = await _run_background_worker(
                         sys_prompt, task,
@@ -99,11 +171,16 @@ def register(mcp):
                         tools=tools, max_turns=max_turns,
                     )
                     bg.status = TaskStatus.DONE
+                    _shadow_mark("completed", unified_task_id, unified_dispatcher,
+                                 result=bg.result)
                 except asyncio.CancelledError:
                     bg.status = TaskStatus.CANCELLED
+                    _shadow_mark("cancelled", unified_task_id, unified_dispatcher)
                 except Exception as e:
                     bg.error = str(e)
                     bg.status = TaskStatus.FAILED
+                    _shadow_mark("failed", unified_task_id, unified_dispatcher,
+                                 error=str(e))
                 finally:
                     bg.finished_at = time.time()
 

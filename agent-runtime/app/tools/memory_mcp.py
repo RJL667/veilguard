@@ -201,13 +201,33 @@ async def observe_tool(args: dict[str, Any]) -> dict[str, Any]:
         text = f"{text}\n\n{' '.join(suffix_parts)}"
 
     try:
-        await observe_agent_output(
+        persisted = await observe_agent_output(
             conversation_id=ctx.conversation_id,
             user_id=ctx.user_id,
             agent_id=ctx.agent_id,
             text=text,
             source="agent",
         )
+        if not persisted:
+            # [LOOP_FIX_2026_05_27]  observe used to silently return None
+            # even when TCMM was down → LLM saw a "success" tool_result
+            # and the next turn saw outputs[] empty → looped forever
+            # re-checking task state.  Now we surface the failure so the
+            # LLM stops calling observe() and either continues with
+            # in-context reasoning or raises a blocker via add_comment.
+            return _err(
+                "TOOL UNAVAILABLE: TCMM did not persist this observation "
+                "(memory service offline OR returned 4xx/5xx). "
+                "Do NOT retry observe() — the next call will fail the "
+                "same way and burn a turn. Instead: continue your "
+                "reasoning IN-CONTEXT for this turn, then either "
+                "(a) submit_for_review with the partial deliverable + a "
+                "blocker_raised comment explaining memory was offline, OR "
+                "(b) if your task does not require persistent claims, "
+                "complete it using attach_output / submit_for_review "
+                "directly. Multiple observe() retries when TCMM is down "
+                "is the #1 cause of non-converging agent loops."
+            )
         return _ok({
             "observed": True,
             "agent_id": ctx.agent_id,
@@ -261,6 +281,18 @@ async def read_constitution_tool(args: dict[str, Any]) -> dict[str, Any]:
 # ── Server factory ──────────────────────────────────────────────────────
 
 
+# `recall_tool` was retired 2026-05-25 (two-paths-to-memory confusion:
+# the auto-render already carried the persona's memory, so an extra
+# `recall` tool just invited redundant calls when the answer was already
+# in the rendered context).
+#
+# [CHANNEL_2026_05_29 / P4] RE-ENABLED. Channels make the tool's scope
+# DISTINCT from the auto-render: the always-on render carries the
+# persona's default channels (+ the digest), while `recall` is for
+# EXPLICIT, deeper, cross-channel pulls (e.g. "search team_knowledge for
+# X") beyond what's already in context. The tool passes agent_id, so
+# results are channel-scoped to the persona by default (spec §5.2/§5.3).
+# Models should call it only when they need memory NOT already rendered.
 _ALL_TOOLS = [recall_tool, observe_tool, read_constitution_tool]
 
 

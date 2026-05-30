@@ -23,7 +23,7 @@
 ; installer-shows-0.2.1 confusion: Inno's upgrade prompt referred to
 ; the existing install's version, not the version about to be installed).
 
-#define MyAppVersion "0.2.4"
+#define MyAppVersion "0.9.3"
 
 [Setup]
 AppId={{6A3BC56C-68CD-4F71-8466-0883395AF3EB}}
@@ -33,6 +33,14 @@ AppPublisher=Phishield
 AppPublisherURL=https://phishield.ai
 DefaultDirName={localappdata}\Veilguard
 DisableProgramGroupPage=yes
+; Start Menu group name — required for the AUMID-bound shortcut in
+; [Icons] below to land in a known location.  Without this, the
+; {group} placeholder resolves to "(Default)" and the shortcut goes
+; missing.  Windows scans Start Menu shortcuts to register apps for
+; notification eligibility — without one, Veilguard is missing from
+; Settings → Notifications, Windows treats our toasts as untrusted,
+; and banners get silently demoted to Action Center (or dropped).
+DefaultGroupName=Veilguard
 OutputDir=installer_output
 ; Version-stamped output filename. Pre-0.2.5 every release shipped as
 ; the static ``VeilguardSetup.exe`` — when a user downloaded a fresh
@@ -79,8 +87,35 @@ DirExistsWarning=no
 Source: "dist\VeilguardClient\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs
 
 [Icons]
-Name: "{userdesktop}\Veilguard Client"; Filename: "{app}\VeilguardClient.exe"
-Name: "{userstartup}\Veilguard Client"; Filename: "{app}\VeilguardClient.exe"; Comment: "Start Veilguard on login"
+; Start Menu shortcut with AppUserModelID — THIS is what registers
+; Veilguard with Windows' notification subsystem.  The AUMID
+; "Veilguard" must MATCH the app_id we pass to
+; winotify.Notification(app_id=..., ...) in daemon/toast.py.  Without
+; this shortcut Veilguard never appears in Settings → Notifications
+; and Windows demotes / silently drops our toasts.
+Name: "{group}\Veilguard Client"; Filename: "{app}\VeilguardClient.exe"; AppUserModelID: "Veilguard"
+Name: "{userdesktop}\Veilguard Client"; Filename: "{app}\VeilguardClient.exe"; AppUserModelID: "Veilguard"
+Name: "{userstartup}\Veilguard Client"; Filename: "{app}\VeilguardClient.exe"; Comment: "Start Veilguard on login"; AppUserModelID: "Veilguard"
+
+[Registry]
+; ──────────────────────────────────────────────────────────────────────
+; Custom URL scheme registration — the "Pair now" button in LibreChat's
+; onboarding banner generates a `veilguard://configure?token=...&
+; server=...&user_id=...` link.  Clicking it tells Windows to launch
+; VeilguardClient.exe with the URL as argv[1]; daemon/deeplink.py
+; parses it and writes config.yaml.  Per HKCU so we don't need admin.
+;
+; uninsdeletekey: when the user uninstalls, the scheme handler vanishes
+; cleanly (no orphan registry entries pointing at a missing .exe).
+;
+; The "" empty-name value under the scheme key holds the friendly
+; description; the "URL Protocol" empty-data value is the magic Windows
+; marker that says "this is a launchable URL handler, not a file type."
+; ──────────────────────────────────────────────────────────────────────
+Root: HKCU; Subkey: "Software\Classes\veilguard"; ValueType: string; ValueName: ""; ValueData: "URL:Veilguard Pairing Protocol"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\veilguard"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\veilguard\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\VeilguardClient.exe,0"
+Root: HKCU; Subkey: "Software\Classes\veilguard\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\VeilguardClient.exe"" ""%1"""
 
 [Run]
 ; Launch after install — opens the setup page on first install, or

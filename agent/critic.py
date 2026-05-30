@@ -25,11 +25,26 @@ from .base import Agent
 
 
 class CriticClaimAgent(Agent):
-    """Inline structural validator (Haiku)."""
+    """Inline structural validator (Haiku).
+
+    Phase 6.1 — Fresh-context critic.  This persona MUST receive its
+    dispatch prompt with ONLY (spec, acceptance_criteria, artifact).
+    The producer's per-turn reasoning, status_transition comments, and
+    narrative deliberation MUST NOT be inlined — otherwise the critic
+    inherits the producer's trajectory blind spots and rubber-stamps.
+    Enforced by `inbox_poller._make_critic_user_message` (Phase 6.1
+    dispatch path) + AC-21/AC-22/AC-23 acceptance tests.
+    """
+
+    _FRESH_CONTEXT: bool = True
 
 
 class CriticProseAgent(Agent):
-    """Async semantic reviewer (Sonnet)."""
+    """Async semantic reviewer (Sonnet).  See Phase 6.1 note on
+    CriticClaimAgent — identical fresh-context discipline applies.
+    """
+
+    _FRESH_CONTEXT: bool = True
 
 
 __all__ = ["CriticClaimAgent", "CriticProseAgent"]

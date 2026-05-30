@@ -74,24 +74,194 @@ class LedgerStore:
             pass
 
     def _open_or_create(self, name: str) -> Any:
-        """Return the Lance table; create with schema if missing."""
-        if name in self._tables:
-            return self._tables[name]
+        """Return a FRESH Lance table handle; create with schema if missing.
 
+        IMPORTANT: we deliberately do NOT cache the table handle.  Lance
+        table handles hold a fixed dataset version — rows written by
+        OTHER processes (e.g. the inbox_poller in a sibling container,
+        or our test-injection docker exec) are invisible on a cached
+        handle until it's re-opened.  Re-opening on every access is
+        cheap (microseconds: Lance just re-reads the manifest) and
+        eliminates the entire class of stale-read bugs.
+
+        We still TRACK which tables we've seen in `self._tables` so the
+        creation-if-missing branch only runs once per name — but the
+        actual handle we return is always fresh from
+        `self._db.open_table(name)`.
+        """
         if name not in TABLE_SCHEMAS:
             raise LanceStoreError(f"unknown ledger table: {name}")
 
+        # Ensure the table exists once.  Subsequent calls go straight
+        # to open_table without trying create_table.
+        if name not in self._tables:
+            try:
+                self._db.open_table(name)
+                self._tables[name] = True  # sentinel — we know it exists
+                # Run Phase 6.0 schema migrations (idempotent, log on apply).
+                self._migrate_phase_6_0(name)
+            except Exception:
+                schema = TABLE_SCHEMAS[name]()
+                self._db.create_table(name, schema=schema)
+                self._tables[name] = True
+                logger.info(f"[ledger] created table {name}")
+
+        # Always return a fresh handle.
+        return self._db.open_table(name)
+
+    def _migrate_phase_6_0(self, name: str) -> None:
+        """Idempotent schema migrations for Phase 6.0 + Phase 7.1.
+
+        Two stages:
+        1. `agent_tasks` first runs the struct-aware migrator for the
+           typed `acceptance_criteria` column (the SQL-DEFAULT cast
+           generics don't parse on current Lance, so recreate-merge
+           handles it specifically).
+        2. EVERY table — including agent_tasks after stage 1 — runs
+           the generic missing-nullable-column sync that diffs the
+           live schema against `TABLE_SCHEMAS[name]()` and adds
+           anything missing as NULL.  Catches Phase 3 emergency_lane,
+           Phase 7 tcmm_obs_id, Phase 7.5 depends_on, and any future
+           additive change in one place.  Drops are still a manual
+           operation (we never auto-remove columns).
+
+        Safe to call on every startup.  No-op when schemas match.
+        """
+        if name == "agent_tasks":
+            self._migrate_agent_tasks(name)
+        # All tables (including agent_tasks after the struct stage)
+        # get the generic additive sync so future additive changes
+        # land without touching this dispatcher.
+        self._migrate_add_missing_nullable_columns(name)
+
+    def _migrate_agent_tasks(self, name: str) -> None:
         try:
             tbl = self._db.open_table(name)
-        except Exception:
-            schema = TABLE_SCHEMAS[name]()
-            tbl = self._db.create_table(name, schema=schema)
-            logger.info(f"[ledger] created table {name}")
-        self._tables[name] = tbl
-        return tbl
+            existing_fields = {f.name for f in tbl.schema}
+            if "acceptance_criteria" in existing_fields:
+                return  # already migrated
+
+            # Lance `add_columns` with a SQL DEFAULT — produces an empty
+            # list for every existing row.  Lance 0.13+ supports this.
+            # Fallback: re-create the table with new schema + merge data.
+            try:
+                tbl.add_columns({
+                    "acceptance_criteria": "cast([] as list<struct<"
+                    "id string, statement string, check_kind string, "
+                    "check_args string, required boolean, "
+                    "rationale string>>)"
+                })
+                logger.info(
+                    f"[ledger] migrated {name}: added acceptance_criteria column "
+                    f"(backfilled {tbl.count_rows()} rows with [])"
+                )
+            except Exception as e:
+                # Newer Lance rejects the SQL DEFAULT generics syntax;
+                # fall through to manual recreate.
+                logger.warning(
+                    f"[ledger] add_columns failed ({e}); doing recreate-merge"
+                )
+                self._recreate_with_acceptance_criteria(name)
+        except Exception as e:
+            # Migration MUST NOT block table open.  Log loudly; ops will
+            # see the warning + AC-1 in CI will catch a missing manifest.
+            logger.exception(
+                f"[ledger] Phase 6.0 migration failed for {name}: {e}"
+            )
+
+    def _migrate_add_missing_nullable_columns(self, name: str) -> None:
+        """Generic additive-schema-sync — bring `name` up to current
+        `TABLE_SCHEMAS[name]()` by adding ANY missing column as NULL.
+
+        Catches every additive change in one place: Phase 3 emergency_lane,
+        Phase 7 tcmm_obs_id, and future additions.  Uses recreate-merge
+        (proven path on current Lance) to avoid the SQL-DEFAULT generics
+        parse bug that breaks `add_columns` for non-trivial types.
+        """
+        try:
+            tbl = self._db.open_table(name)
+            existing_fields = {f.name for f in tbl.schema}
+            target = TABLE_SCHEMAS[name]()
+            expected_fields = {f.name for f in target}
+            missing = expected_fields - existing_fields
+            if not missing:
+                return  # already in sync
+            logger.info(
+                f"[ledger] schema drift on {name}: missing columns "
+                f"{sorted(missing)} — running recreate-merge to add as NULL"
+            )
+            self._recreate_with_added_column(name, ",".join(sorted(missing)))
+        except Exception as e:
+            logger.exception(
+                f"[ledger] additive-sync migration failed for {name}: {e}"
+            )
+
+    def _recreate_with_added_column(self, name: str, col_name: str) -> None:
+        """Generic recreate-merge: rebuild table with new schema, copying
+        every existing column and adding the new one as NULL.
+
+        Used for Phase 7.1 nullable-string column adds where Lance's
+        SQL-DEFAULT parser chokes on the cast syntax.
+        """
+        import pyarrow as pa
+        old = self._db.open_table(name).to_arrow()
+        new_schema = TABLE_SCHEMAS[name]()
+        n = old.num_rows
+        # Existing columns first
+        cols: list[Any] = [old.column(c) for c in old.column_names]
+        names = list(old.column_names)
+        # Add any missing columns as NULL of the right type.
+        for fld in new_schema:
+            if fld.name in names:
+                continue
+            cols.append(pa.array([None] * n, type=fld.type))
+            names.append(fld.name)
+        new_table = pa.Table.from_arrays(cols, names=names)
+        # Reorder to match schema.
+        new_table = new_table.select([f.name for f in new_schema])
+        self._db.drop_table(name)
+        self._db.create_table(name, data=new_table, schema=new_schema)
+        logger.info(
+            f"[ledger] migrated {name}: recreated with added column "
+            f"{col_name!r} ({n} rows backfilled with NULL)"
+        )
+
+    def _recreate_with_acceptance_criteria(self, name: str) -> None:
+        """Fallback migration: recreate `agent_tasks` with new schema, merge data.
+
+        Reads existing rows, builds the new schema, populates
+        `acceptance_criteria=[]` for every row, writes a new table with
+        the new schema, drops the old.  Cost: O(N) data copy.  Run-once.
+        """
+        import pyarrow as pa
+        old = self._db.open_table(name).to_arrow()
+        new_schema = TABLE_SCHEMAS[name]()
+        # Build the new column: empty list per row.
+        n = old.num_rows
+        empty_acs = pa.array(
+            [[] for _ in range(n)],
+            type=new_schema.field("acceptance_criteria").type,
+        )
+        # Combine: drop nothing from old, append the new column.
+        cols = [old.column(c) for c in old.column_names] + [empty_acs]
+        names = list(old.column_names) + ["acceptance_criteria"]
+        new_table = pa.Table.from_arrays(cols, names=names)
+        # Reorder to match new schema field order.
+        new_table = new_table.select([f.name for f in new_schema])
+        # Drop + create.
+        self._db.drop_table(name)
+        self._db.create_table(name, data=new_table, schema=new_schema)
+        logger.info(
+            f"[ledger] migrated {name}: recreated with acceptance_criteria "
+            f"({n} rows backfilled with [])"
+        )
 
     def table(self, name: str) -> Any:
-        """Public accessor — same as _open_or_create but explicitly named."""
+        """Public accessor — returns a fresh table handle every call.
+
+        See `_open_or_create` for why caching the handle is the wrong
+        choice (silent cross-process stale reads).
+        """
         return self._open_or_create(name)
 
 

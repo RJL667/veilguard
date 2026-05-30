@@ -37,11 +37,48 @@ async def _daemon_loop(daemon: Daemon):
             daemon.action_count += 1
             daemon.next_run = now + daemon.interval_seconds
 
+            # ── Phase B-2: child SUB_AGENT row per tick ───────────────
+            tick_uid = ""
+            try:
+                from core.tasks import Task as _UTask, TaskKind as _UKind, TaskDispatcher as _UDisp, TaskStatus as _UStat
+                _parent = getattr(daemon, "_unified_task_id", "") or f"dmn-{daemon.name}"
+                child = _UTask.new(
+                    kind=_UKind.SUB_AGENT,
+                    executor="sub_agent",
+                    user_id="",   # daemons don't carry user yet (Q2 bug)
+                    parent_task_id=_parent,
+                    root_task_id=_parent,
+                    title=f"{daemon.name}: tick #{daemon.run_count}",
+                    payload={
+                        "role":   daemon.role,
+                        "model":  daemon.model,
+                        "backend": daemon.backend,
+                        "task":   daemon.task[:400],
+                    },
+                )
+                tick_uid = child.task_id
+                child.status = _UStat.RUNNING.value
+                child.started_at = now
+                _UDisp.get().record_external(child)
+            except Exception as _e:
+                logger.debug(f"[shadow] tick row write failed: {_e}")
+
             role_prompt = ROLES.get(daemon.role, ROLES.get("researcher", {})).get("system", "You are a helpful assistant.")
             result = await call_llm(
                 role_prompt + "\n\nYou are running as a background daemon. Be concise. Report only findings or anomalies.",
                 daemon.task, backend=daemon.backend, model=daemon.model, role=daemon.role,
             )
+
+            # Mark the tick row terminal.
+            try:
+                from core.tasks import TaskDispatcher as _UDisp, TaskStatus as _UStat
+                if tick_uid:
+                    _UDisp.get()._store.mark_status(
+                        tick_uid, _UStat.COMPLETED, result=(result or "")[:8000],
+                    )
+            except Exception as _e:
+                logger.debug(f"[shadow] tick row terminal failed: {_e}")
+
             observation = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "run": daemon.run_count, "result": result[:2000]}
             daemon.observations.append(observation)
             if len(daemon.observations) > 50: daemon.observations = daemon.observations[-50:]
@@ -75,6 +112,45 @@ def register(mcp):
                         next_run=time.time() + 5, window_start=time.time())
         daemon.asyncio_task = asyncio.create_task(_daemon_loop(daemon))
         state.daemons[daemon_id] = daemon
+
+        # ── Phase B-2 shadow: a SCHEDULED Task per server-side daemon ──
+        # The existing _daemon_loop continues to drive ticks; we just
+        # write a parent row so list_my_tasks shows the daemon, and
+        # each tick can mark its child SUB_AGENT row under it.  Child
+        # observations are still appended to state.daemons[id].
+        # observations for now — full migration is B-2.5.
+        try:
+            from core.tasks import Task as _UTask, TaskKind as _UKind, TaskDispatcher as _UDisp
+            from core.request_ctx import get_user_id, get_conversation_id
+            _disp = _UDisp.get()
+            unified = _UTask.new(
+                kind=_UKind.SCHEDULED,
+                executor="scheduler",
+                user_id=get_user_id() or "",
+                conv_id=get_conversation_id() or "",
+                title=f"daemon: {daemon_id}",
+                description=task[:300],
+                payload={
+                    "role":    role,
+                    "model":   use_model,
+                    "backend": (backend or DEFAULT_BACKEND).lower(),
+                    "task":    task,
+                    "max_actions_per_window": max(max_actions_per_hour, 1),
+                },
+                task_id=f"dmn-{daemon_id}",
+                interval_seconds=int(daemon.interval_seconds),
+                next_run_at=float(daemon.next_run),
+            )
+            # Mark RUNNING immediately — daemons enter the wait loop
+            # right away in _daemon_loop.
+            from core.tasks import TaskStatus
+            unified.status = TaskStatus.RUNNING.value
+            unified.started_at = time.time()
+            _disp.record_external(unified)
+            daemon._unified_task_id = unified.task_id   # type: ignore[attr-defined]
+        except Exception as _e:
+            logger.debug(f"[shadow] couldn't write daemon row: {_e}")
+
         return f"Daemon `{daemon_id}` started. Every {interval_minutes}min, role={role}."
 
     @mcp.tool()
@@ -85,6 +161,15 @@ def register(mcp):
         d = state.daemons[daemon_id]
         d.enabled = False
         if d.asyncio_task and not d.asyncio_task.done(): d.asyncio_task.cancel()
+
+        # ── Phase B-2 shadow: terminal-state the unified row ──────────
+        try:
+            from core.tasks import TaskDispatcher as _UDisp, TaskStatus
+            _uid = getattr(d, "_unified_task_id", "") or f"dmn-{daemon_id}"
+            _UDisp.get()._store.mark_status(_uid, TaskStatus.CANCELLED)
+        except Exception as _e:
+            logger.debug(f"[shadow] couldn't terminal-state daemon row: {_e}")
+
         return f"Daemon `{daemon_id}` stopped after {d.run_count} runs."
 
     @mcp.tool()

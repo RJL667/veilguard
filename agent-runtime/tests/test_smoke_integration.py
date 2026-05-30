@@ -36,7 +36,6 @@ from app.middleware import tenant
 from app.middleware.audit import TurnUsage, tap_sdk_stream
 from app.middleware.tcmm import get_system_prefix, invalidate_cache
 from app.middleware.cache_control import normalize_cache_control
-from app.hooks.approval_gate import approval_gate_hook
 from app.personas.loader import PersonaSpec, PersonaRegistry
 
 
@@ -279,96 +278,9 @@ class TestTCMMMiddleware:
 # ── Approval gate hook tests ────────────────────────────────────────────
 
 
-class TestApprovalGateHook:
-    @pytest.mark.asyncio
-    async def test_no_context_fail_closed(self):
-        # No TenantContext established → must deny.
-        # (Don't enter a set_tenant_context block.)
-        result = await approval_gate_hook(
-            input_data={
-                "hook_event_name": "PreToolUse",
-                "tool_name": "mcp__client_daemon__run_command",
-                "tool_input": {"command": "ls"},
-            },
-            tool_use_id="tu_xyz",
-            context=None,
-        )
-        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-        assert "TenantContext" in result["hookSpecificOutput"]["permissionDecisionReason"]
-
-    @pytest.mark.asyncio
-    async def test_foreground_director_allows_shell(self):
-        with tenant.set_tenant_context(
-            conversation_id="conv-1",
-            user_id="u-1",
-            tenant_id="t-1",
-            agent_id="director",
-            is_background=False,
-        ):
-            result = await approval_gate_hook(
-                input_data={
-                    "hook_event_name": "PreToolUse",
-                    "tool_name": "mcp__client_daemon__run_command",
-                    "tool_input": {"command": "ls"},
-                },
-                tool_use_id="tu_x",
-                context=None,
-            )
-            # Foreground → ALLOW → return {} (no override needed)
-            assert result == {}
-
-    @pytest.mark.asyncio
-    async def test_background_researcher_shell_denies(self):
-        with tenant.set_tenant_context(
-            conversation_id="sub-c-1xx-bgt-dead",
-            user_id="u-1",
-            tenant_id="t-1",
-            agent_id="researcher",
-            is_background=True,
-        ):
-            result = await approval_gate_hook(
-                input_data={
-                    "hook_event_name": "PreToolUse",
-                    "tool_name": "mcp__client_daemon__run_command",
-                    "tool_input": {"command": "ls"},
-                },
-                tool_use_id="tu_x",
-                context=None,
-            )
-            assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-
-    @pytest.mark.asyncio
-    async def test_background_builder_shell_calls_approval(self):
-        # Builder shell call should hit the approval path → stub denies.
-        with tenant.set_tenant_context(
-            conversation_id="sub-c-1xx-bgt-dead",
-            user_id="u-1",
-            tenant_id="t-1",
-            agent_id="builder",
-            is_background=True,
-        ):
-            result = await approval_gate_hook(
-                input_data={
-                    "hook_event_name": "PreToolUse",
-                    "tool_name": "mcp__client_daemon__run_command",
-                    "tool_input": {"command": "git status"},
-                },
-                tool_use_id="tu_x",
-                context=None,
-            )
-            # Stub fails closed → deny with reason mentioning stub.
-            assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-            assert "STUB" in result["hookSpecificOutput"]["permissionDecisionReason"]
-
-    @pytest.mark.asyncio
-    async def test_non_pretooluse_event_passthrough(self):
-        result = await approval_gate_hook(
-            input_data={"hook_event_name": "PostToolUse"},
-            tool_use_id="tu_x",
-            context=None,
-        )
-        # Hook only cares about PreToolUse; everything else is noop.
-        assert result == {}
+# TestApprovalGateHook removed 2026-05-25 — approval_gate_hook deprecated.
+# Local SDK PreToolUse path is dead; canonical gate is sub-agents/core/approval.py.
+# Approval behaviour is exercised by the e2e Director/IC/Critic loop test.
 
 
 # ── Cache_control normalization end-to-end ──────────────────────────────

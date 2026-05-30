@@ -22,6 +22,7 @@ TOOL_DISPATCH  = "tool_dispatch"
 TOOL_RESULT    = "tool_result"
 FINAL_RESULT   = "final_result"
 USAGE          = "usage"
+AUDIT          = "audit"            # pii_audit row (one per TO_LLM + FROM_LLM)
 RUN_END        = "run_end"
 ERROR          = "error"
 
@@ -88,6 +89,35 @@ def usage(*, tokens_input_total: int = 0, tokens_input_new: int = 0,
     }
 
 
+def audit(
+    *,
+    direction: str,            # "TO_LLM" | "FROM_LLM"
+    content: str,
+    model: str,
+    tokens_input_total: int = 0,
+    tokens_output: int = 0,
+    cache_create: int = 0,
+    cache_read: int = 0,
+) -> dict:
+    """Audit row payload — one TO_LLM + one FROM_LLM per turn.
+
+    The handler that drains run_turn() decides where to persist these
+    (LanceDB ``pii_audit`` table for the LibreChat path, JSON log file
+    for multi-agent paths, etc.).  Stream-or-not is set by the writer
+    since the agent doesn't know how its output will be framed.
+    """
+    return {
+        "type": AUDIT,
+        "direction": direction,
+        "content": content,
+        "model": model,
+        "tokens_input_total": tokens_input_total,
+        "tokens_output": tokens_output,
+        "cache_create": cache_create,
+        "cache_read": cache_read,
+    }
+
+
 def run_end(*, run_id: str, ended_at: float, stop_reason: str) -> dict:
     return {
         "type": RUN_END,
@@ -104,8 +134,8 @@ def error(code: str, message: str) -> dict:
 __all__ = [
     "RUN_START", "ASSISTANT_TEXT", "ASSISTANT", "TOOL_CALL",
     "TOOL_DISPATCH", "TOOL_RESULT", "FINAL_RESULT", "USAGE",
-    "RUN_END", "ERROR",
+    "AUDIT", "RUN_END", "ERROR",
     "run_start", "assistant_text", "assistant", "tool_call",
     "tool_dispatch", "tool_result", "final_result", "usage",
-    "run_end", "error",
+    "audit", "run_end", "error",
 ]

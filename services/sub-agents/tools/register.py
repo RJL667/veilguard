@@ -6,7 +6,7 @@ def register_all(mcp):
     from tools import clipboard, notifications, schedules, agents, tasks
     from tools import managed_tasks, daemons, teams, messaging
     from tools import utility, verify, transcripts, playbooks, file_tools
-    from tools import ask_user, tool_search, plans
+    from tools import ask_user, tool_search, plans, client_admin
 
     # NOTE: scratchpad NOT registered as MCP tool — Claude misuses it to "save" user info.
     # Scratchpad is available inside spawn_agentic via the agentic tool handler.
@@ -15,5 +15,9 @@ def register_all(mcp):
     for mod in [clipboard, notifications, schedules, agents, tasks,
                 managed_tasks, daemons, teams, messaging,
                 utility, verify, transcripts, playbooks, file_tools,
-                ask_user, tool_search, plans]:
+                ask_user, tool_search, plans,
+                # Phase C/D: daemon task introspection + permission_level
+                # MCP tools (list_my_tasks / task_status / cancel_task /
+                # get_permission_level / set_permission_level).
+                client_admin]:
         mod.register(mcp)

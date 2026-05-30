@@ -1,0 +1,79 @@
+# Veilguard sandbox container — Linux/headless build of the client daemon.
+#
+# Same Python source as the Windows installer (veilguard_client.py) but
+# without PyInstaller / Inno Setup / tray UI deps.  Runs alongside the
+# rest of the stack and acts as a fallback "machine" for server-side
+# agents (daemons, multi-agent fanout) when the user's actual Windows
+# daemon is offline.
+#
+# Mounts: nothing host-side by default — the sandbox is meant to be a
+# clean, throwaway workspace.  If you want a server agent's writes to
+# persist across container restarts, add a named volume in
+# docker-compose.yml (the SANDBOX_FALLBACK_TOOLS allow-list deliberately
+# excludes write tools today; revisit when you wire that).
+
+FROM python:3.12-slim
+
+LABEL org.opencontainers.image.title="Veilguard Sandbox Daemon"
+LABEL org.opencontainers.image.description="Headless client-daemon for server-side agent tool execution"
+LABEL org.opencontainers.image.source="https://github.com/RJL667/veilguard"
+
+# Minimal toolchain so `run_command` actually has something to call.
+# git + bash + ripgrep cover the common server-agent workloads (search,
+# small shell ops).  Keep the layer tight — pull more in only when a
+# specific use case demands it.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        git \
+        ripgrep \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Headless requirement set — websockets + yaml + sane deps for tool
+# execution, NO pystray / winotify / pyinstaller / Inno-Setup-specific
+# packages.  See requirements-headless.txt for the full pin list.
+COPY services/client-daemon/requirements-headless.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Daemon source.  We copy the entrypoint + the daemon/ subpackage from
+# the local tree rather than fetch the published installer because the
+# installer ships a PyInstaller bundle that's Windows-only.  When
+# publish_release.py bumps the Windows installer, also rebuild this
+# image — versions stay in lock-step so the dashboard can show
+# "sandbox: vX.Y.Z" matching the user's daemon.
+#
+# Note: daemon/tasks.py is loaded in headless mode (task registry has
+# no GUI deps); daemon/toast.py and daemon/tray.py guard their own UI
+# imports and silently no-op when winotify / pystray are absent (they
+# aren't in requirements-headless.txt).  That's the same code path
+# that runs on a Windows host without the Phase C deps installed.
+COPY services/client-daemon/veilguard_client.py /app/
+COPY services/client-daemon/daemon /app/daemon
+
+# The sandbox identity is fixed and the token comes from a shared
+# secret in env.  Compose passes both via the veilguard-sandbox service
+# block; values live in `.env` (NOT committed) and never on the
+# container's filesystem.
+ENV VEILGUARD_HEADLESS=1
+ENV VEILGUARD_USER_ID=system:sandbox
+ENV VEILGUARD_CLIENT_ID=veilguard-sandbox
+ENV VEILGUARD_PROJECT_ROOT=/sandbox-workspace
+ENV PYTHONUNBUFFERED=1
+
+# Sandbox's project_root — every read_file / search_files / grep is
+# scoped here.  Mount a named volume in compose if you want persistence
+# across restarts; default is ephemeral.
+RUN mkdir -p /sandbox-workspace && \
+    echo "Veilguard sandbox container — clean workspace." \
+        > /sandbox-workspace/README.md
+
+# Daemon runs as non-root so any `run_command` shell-out can't poke at
+# the container's own filesystem outside /sandbox-workspace.
+RUN useradd --create-home --shell /bin/bash sandbox && \
+    chown -R sandbox:sandbox /sandbox-workspace /app
+USER sandbox
+
+ENTRYPOINT ["python", "-u", "/app/veilguard_client.py", "--headless"]

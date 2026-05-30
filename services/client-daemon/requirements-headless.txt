@@ -1,0 +1,8 @@
+# Headless / sandbox-container requirement set.  Strict pins — these
+# get baked into the Dockerfile.sandbox image so reproducibility wins
+# over "always latest".  Keep in sync with the Windows pyproject.toml
+# `dependencies` list; the Windows installer + this image should run
+# the same daemon code against the same WS server contract.
+websockets>=12.0,<14
+httpx>=0.25.0,<0.30
+pyyaml>=6.0,<7

@@ -82,3 +82,179 @@ async def api_teams(request):
             if mt: tasks.append({"id": mt.id, "title": mt.title, "status": mt.status})
         teams.append({"name": tid, "members": members, "tasks": tasks})
     return JSONResponse({"teams": teams})
+
+
+async def api_agents(request):
+    """Phase 1 — Sidebar Agents view (read-only).
+
+    Per `MULTI_AGENT_PLATFORM.md` §Phase 1: "Shows registered agents,
+    last-active timestamp, the org chart, recent approvals.  No Task
+    UI yet."  Sources:
+      - agents/*.md persona files (canonical org structure)
+      - agent_tasks Lance table (last-active inferred from updated_ts)
+      - task_comments Lance table (recent-approvals via review_decision)
+
+    The endpoint is dependency-tolerant: if Lance isn't reachable we
+    still return the persona list with empty timestamps, because the
+    UI shouldn't blank-out on a transient DB hiccup.
+    """
+    import os
+    import re
+    import time as _time
+    from pathlib import Path
+
+    # ── 1. Discover personas ─────────────────────────────────────────
+    agents_dir_candidates = [
+        Path(os.environ.get("VEILGUARD_AGENTS_DIR", "")) if os.environ.get("VEILGUARD_AGENTS_DIR") else None,
+        Path(__file__).resolve().parents[3] / "agents",
+        Path("C:/Users/rudol/Documents/veilguard/agents"),
+        Path("/home/rudol/veilguard/agents"),
+    ]
+    agents_dir = next((p for p in agents_dir_candidates if p and p.is_dir()), None)
+    personas: list[dict] = []
+    if agents_dir is not None:
+        for md in sorted(agents_dir.glob("*.md")):
+            stem = md.stem
+            # Skip the constitution / prompts notes — they're not personas
+            if stem.upper() in ("CONSTITUTION", "PROMPTS", "README"):
+                continue
+            try:
+                txt = md.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                txt = ""
+            # Bold-Markdown KV frontmatter per spec §0.0.2.
+            def _kv(key: str, default: str = "") -> str:
+                m = re.search(rf"\*\*{re.escape(key)}\*\*[:：]?\s*(.+)", txt)
+                return (m.group(1).strip() if m else default).strip("`")
+            personas.append({
+                "agent_id":   _kv("agent_id", stem),
+                "role":       _kv("role", "consultant"),
+                "manager_id": _kv("manager_id", ""),
+                "team_id":    _kv("team_id", ""),
+                "model":      _kv("Model", _kv("model", "")),
+                "tools":      _kv("Tools", _kv("tools", "")),
+                "source_path": str(md),
+            })
+
+    # ── 2. Last-active + task counts from agent_tasks ───────────────
+    now = _time.time()
+    by_owner: dict[str, dict] = {}
+    try:
+        import lancedb
+        for db_path in (
+            os.environ.get("VEILGUARD_AUDIT_DB_PATH"),
+            "/tcmm-data/veilguard/tcmm.db",
+            "C:/Users/rudol/Documents/veilguard/tcmm-data/veilguard/tcmm.db",
+            "/home/rudol/veilguard/tcmm-data/veilguard/tcmm.db",
+        ):
+            if not db_path:
+                continue
+            try:
+                db = lancedb.connect(db_path)
+                t = db.open_table("agent_tasks")
+                arr = (
+                    t.search()
+                    .select(["owner_id","status","updated_ts","id"])
+                    .limit(2000)
+                    .to_arrow()
+                )
+                for i in range(arr.num_rows):
+                    owner = arr.column("owner_id")[i].as_py() or ""
+                    if not owner:
+                        continue
+                    rec = by_owner.setdefault(owner, {
+                        "tasks_total": 0, "tasks_active": 0,
+                        "tasks_done": 0, "tasks_cancelled": 0,
+                        "last_active_ts": 0.0,
+                    })
+                    rec["tasks_total"] += 1
+                    st = arr.column("status")[i].as_py() or ""
+                    if st in ("open","accepted","in_progress","review"):
+                        rec["tasks_active"] += 1
+                    elif st == "done":
+                        rec["tasks_done"] += 1
+                    elif st == "cancelled":
+                        rec["tasks_cancelled"] += 1
+                    ts = arr.column("updated_ts")[i].as_py() or 0.0
+                    if ts > rec["last_active_ts"]:
+                        rec["last_active_ts"] = ts
+                break  # first reachable DB wins
+            except Exception:
+                continue
+    except ImportError:
+        pass  # lancedb not installed; degrade gracefully
+
+    # ── 3. Recent approvals (last 5 review_decision comments) ──────
+    recent_approvals: list[dict] = []
+    try:
+        import lancedb
+        for db_path in (
+            os.environ.get("VEILGUARD_AUDIT_DB_PATH"),
+            "/tcmm-data/veilguard/tcmm.db",
+            "C:/Users/rudol/Documents/veilguard/tcmm-data/veilguard/tcmm.db",
+            "/home/rudol/veilguard/tcmm-data/veilguard/tcmm.db",
+        ):
+            if not db_path:
+                continue
+            try:
+                db = lancedb.connect(db_path)
+                c = db.open_table("task_comments")
+                arr = (
+                    c.search()
+                    .where("kind = 'review_decision'")
+                    .select(["ts","author_id","task_id","body"])
+                    .limit(200)
+                    .to_arrow()
+                )
+                rows = []
+                for i in range(arr.num_rows):
+                    rows.append({
+                        "ts":         arr.column("ts")[i].as_py(),
+                        "by":         arr.column("author_id")[i].as_py(),
+                        "task_id":    arr.column("task_id")[i].as_py(),
+                        "verdict":    (arr.column("body")[i].as_py() or "")[:60],
+                    })
+                rows.sort(key=lambda r: r["ts"], reverse=True)
+                recent_approvals = rows[:5]
+                break
+            except Exception:
+                continue
+    except ImportError:
+        pass
+
+    # ── 4. Bridge / capability info per connected daemon (Phase 0.0.4) ─
+    bridges_info: list[dict] = []
+    try:
+        from core.client_bridge import all_bridges
+        for uid, b in all_bridges().items():
+            bridges_info.append({
+                "user_id":  uid,
+                "client_id": getattr(b, "client_id", "") or "",
+                "platform": getattr(b, "platform", "") or "",
+                "client_capabilities": sorted(getattr(b, "capabilities", set()) or []),
+                "server_capabilities_advertised": sorted(
+                    getattr(b, "server_capabilities_advertised", set()) or []
+                ),
+                "connected": bool(getattr(b, "connected", False)),
+            })
+    except Exception:
+        pass
+
+    # ── 5. Compose response ─────────────────────────────────────────
+    for p in personas:
+        rec = by_owner.get(p["agent_id"], {})
+        p["tasks_total"]    = rec.get("tasks_total", 0)
+        p["tasks_active"]   = rec.get("tasks_active", 0)
+        p["tasks_done"]     = rec.get("tasks_done", 0)
+        p["tasks_cancelled"] = rec.get("tasks_cancelled", 0)
+        last = rec.get("last_active_ts", 0.0) or 0.0
+        p["last_active_ts"]    = last
+        p["last_active_age_s"] = int(now - last) if last > 0 else None
+
+    return JSONResponse({
+        "agents":           personas,
+        "agents_dir":       str(agents_dir) if agents_dir else None,
+        "recent_approvals": recent_approvals,
+        "bridges":          bridges_info,
+        "generated_ts":     now,
+    })

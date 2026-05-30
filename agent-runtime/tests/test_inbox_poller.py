@@ -98,9 +98,13 @@ class TestPollerInit:
         assert a._worker_id != b._worker_id
         assert a._worker_id.startswith("worker-")
 
-    def test_semaphore_respects_max_concurrent(self):
-        from app.workers.inbox_poller import MAX_CONCURRENT_DISPATCHES
+    def test_semaphore_respects_total_concurrent(self):
+        # Phase 6.2 — global cap replaced by per-persona caps; total
+        # semaphore == sum of per-persona caps.
+        from app.workers.inbox_poller import (
+            PERSONA_CAPS, _TOTAL_CONCURRENT_DISPATCHES,
+        )
         registry = PersonaRegistry({})
         poller = InboxPoller(registry)
-        # Semaphore initial value should equal the cap
-        assert poller._semaphore._value == MAX_CONCURRENT_DISPATCHES
+        assert _TOTAL_CONCURRENT_DISPATCHES == sum(PERSONA_CAPS.values())
+        assert poller._semaphore._value == _TOTAL_CONCURRENT_DISPATCHES

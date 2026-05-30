@@ -10,8 +10,39 @@ Start: python server.py --sse --port 8809
 import logging
 import os
 import sys
+from pathlib import Path
 
 LOCAL_MODE = "--local" in sys.argv
+
+# Auto-load .env BEFORE anything else reads from os.environ.  Without
+# this, launching `python server.py` from a shell that didn't first
+# source the project .env leaves VEILGUARD_INTERNAL_SECRET (and
+# everything else) unset — /api/client/* then 503s and the Windows
+# daemon can't authenticate its WebSocket.  Caught 2026-05-26 after a
+# Docker process kill swept up the previously-launched sub-agents and
+# the relaunch came up unauthenticated.  python-dotenv is search-up
+# from this file so editor / scheduled-task / batch / interactive
+# invocations all work without a wrapper.
+try:
+    from dotenv import load_dotenv
+    _here = Path(__file__).resolve()
+    for _candidate in (
+        _here.parent / ".env",                      # services/sub-agents/.env
+        _here.parent.parent / ".env",               # services/.env
+        _here.parent.parent.parent / ".env",        # repo root .env (the canonical one)
+    ):
+        if _candidate.exists():
+            load_dotenv(dotenv_path=_candidate, override=False)
+            print(f"[sub-agents bootstrap] loaded env from {_candidate}", file=sys.stderr)
+            break
+except ImportError:
+    print(
+        "[sub-agents bootstrap] python-dotenv not installed; "
+        "relying on inherited env.  If /api/client/* returns 503, "
+        "run `pip install python-dotenv` and restart, or source the "
+        ".env into your shell before launching.",
+        file=sys.stderr,
+    )
 
 from mcp.server.fastmcp import FastMCP
 
@@ -193,7 +224,7 @@ if __name__ == "__main__":
                 return JSONResponse({"status": "executed", "result": result[:500]})
 
         # Import API endpoints
-        from api.endpoints import api_stats, api_tasks, api_scratchpad, api_daemons, api_teams
+        from api.endpoints import api_stats, api_tasks, api_scratchpad, api_daemons, api_teams, api_agents
 
         # ── Client Daemon WebSocket ─────────────────────────────────────
         from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -436,6 +467,35 @@ if __name__ == "__main__":
                 bridge.os_name = params.get("os_name", "") or ""
                 bridge.os_release = params.get("os_release", "") or ""
                 bridge.shell = params.get("shell", "") or ""
+
+                # [PHASE_0_0_4_CAPABILITY_HANDSHAKE_2026_05_27] §0.0.4.
+                # Daemon advertises its supported features in
+                # ``params.capabilities`` (list[str]).  Server stores
+                # the set on the bridge and advertises back the
+                # SERVER-side set so the daemon knows the server
+                # enforces (e.g.) the approval gate — which means the
+                # daemon must NOT silently bypass it locally.
+                _raw_caps = params.get("capabilities") or []
+                if isinstance(_raw_caps, list):
+                    bridge.capabilities = frozenset(
+                        str(c).strip() for c in _raw_caps if isinstance(c, (str, bytes)) and str(c).strip()
+                    )
+                else:
+                    bridge.capabilities = frozenset()
+                # Server-side capability advertisement.  Edit this tuple
+                # when adding a new server feature so daemons learn the
+                # contract at connect time.  Order is alphabetical for
+                # determinism (helps daemon-side caching).
+                SERVER_CAPABILITIES = (
+                    "approval_gate_enforced",   # server WILL gate sensitive tools
+                    "bidirectional_approval",   # /api/client/approval_callback exists
+                    "bypass_rules_audit",       # bypass decisions are persisted
+                    "execute_remote",           # server expects daemon to exec tools
+                    "task_dispatch",            # inbox poller dispatches tasks
+                    "tcmm_recall",              # server-side memory recall
+                )
+                bridge.server_capabilities_advertised = frozenset(SERVER_CAPABILITIES)
+
                 set_bridge(bridge, user_id=user_id)
                 registered_user_id = user_id
 
@@ -445,12 +505,39 @@ if __name__ == "__main__":
                         "status": "authenticated",
                         "client_id": bridge.client_id,
                         "user_id": user_id,
+                        # §0.0.4 — tell the daemon what the server
+                        # supports.  Daemons can use this to know,
+                        # e.g., that the server WILL gate approvals
+                        # and they MUST forward to the server rather
+                        # than silently auto-approving locally.
+                        "server_capabilities": list(SERVER_CAPABILITIES),
                     },
                 }))
-                logger.info(
-                    f"[WS] Client daemon connected: user={user_id} client={client_id} "
-                    f"platform={bridge.platform or '?'} shell={bridge.shell or '?'}"
+                # Log negotiated capabilities so ops sees what's wired
+                # for each connecting daemon.  Older daemons (pre-0.0.4)
+                # will have an empty client_capabilities set — that's
+                # the diagnostic the spec calls for.
+                _client_caps_str = (
+                    ",".join(sorted(bridge.capabilities))
+                    if bridge.capabilities else "(none — vintage daemon)"
                 )
+                logger.info(
+                    f"[WS] Client daemon connected: user={user_id} "
+                    f"client={client_id} platform={bridge.platform or '?'} "
+                    f"shell={bridge.shell or '?'} "
+                    f"client_caps=[{_client_caps_str}] "
+                    f"server_caps_advertised={len(SERVER_CAPABILITIES)}"
+                )
+                # If approval-related calls will be made and the daemon
+                # didn't advertise it, log a clear warning now (vs.
+                # silently failing on the first approval request).
+                if "request_approval" not in bridge.capabilities:
+                    logger.warning(
+                        f"[WS] daemon {client_id!r} did NOT advertise "
+                        f"'request_approval' capability — approval "
+                        f"requests will degrade to DENY for background "
+                        f"tools.  Upgrade the daemon to land §0.0.4."
+                    )
 
             except Exception as e:
                 logger.error(f"[WS] Auth failed: {e}")
@@ -646,6 +733,69 @@ if __name__ == "__main__":
                 media_type="application/octet-stream",
             )
 
+        # ── Cross-process tool dispatch for agent-runtime ──────────────
+        # When agent-runtime's Director / IC tries to call a client tool
+        # (file_write, run_command, etc.), its in-process tool_dispatcher
+        # forwards here.  We route through the same agentic.handle_tool
+        # the LibreChat MCP path uses — approval gate, daemon bridge,
+        # client-settings level lookup, audit row.  Agent-runtime never
+        # holds the daemon WS itself; sub-agents owns that connection.
+        async def api_agent_runtime_dispatch_tool(request):
+            rej = _check_internal_secret(request)
+            if rej is not None:
+                return rej
+            try:
+                body = await request.json()
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"invalid JSON: {e}"}, status_code=400,
+                )
+            tool_name = body.get("tool_name", "")
+            tool_input = body.get("tool_input") or {}
+            if not tool_name:
+                return JSONResponse(
+                    {"error": "tool_name required"}, status_code=400,
+                )
+
+            # Forwarded by agent-runtime; identity comes via headers
+            # so the per-request contextvar holds the right user_id +
+            # conv_id (needed by agentic.handle_tool to look up the
+            # right daemon bridge + permission level).
+            from core.request_ctx import (
+                current_user_id, current_conversation_id,
+            )
+            user_id = request.headers.get("x-user-id", "")
+            conv_id = request.headers.get("x-conversation-id", "")
+            tok_u = current_user_id.set(user_id)
+            tok_c = current_conversation_id.set(conv_id)
+            try:
+                # Reuse the same dispatcher LibreChat-MCP calls into.
+                # Approval gate + bridge lookup + audit all live there.
+                from core.agentic import handle_tool
+                result = await handle_tool(tool_name, tool_input)
+            except Exception as e:
+                logger.exception(
+                    f"[agent_runtime] dispatch {tool_name!r} raised: {e}"
+                )
+                return JSONResponse({
+                    "content": [{"type": "text", "text": f"ERROR: {e}"}],
+                    "isError": True,
+                })
+            finally:
+                current_user_id.reset(tok_u)
+                current_conversation_id.reset(tok_c)
+
+            # handle_tool returns a string (sometimes "Error: ...").
+            # Wrap in the MCP content envelope agent-runtime's
+            # tool_dispatcher expects.
+            is_error = (
+                isinstance(result, str) and result.startswith("Error:")
+            )
+            return JSONResponse({
+                "content": [{"type": "text", "text": str(result)}],
+                "isError": is_error,
+            })
+
         # ── Client version manifest ─────────────────────────────────────
         # The daemon polls this every 30min. Shape:
         #   {"version": "0.2.0",
@@ -703,6 +853,14 @@ if __name__ == "__main__":
             Route("/api/scratchpad", endpoint=_gated(api_scratchpad)),
             Route("/api/daemons", endpoint=_gated(api_daemons)),
             Route("/api/teams", endpoint=_gated(api_teams)),
+            # [PHASE_1_SIDEBAR_AGENTS_VIEW_2026_05_27] Per spec Phase 1
+            # — read-only view of registered agents + last-active +
+            # recent approvals + bridge capability state.  No mutation.
+            Route("/api/agents", endpoint=_gated(api_agents)),
+            # Same endpoint exposed under the veilguard-client namespace
+            # so LibreChat's sidebar (which fetches /api/veilguard-client/
+            # paths) sees it without a separate fork patch.
+            Route("/api/veilguard-client/agents", endpoint=_gated(api_agents)),
             Route("/api/tools/openai_schemas", endpoint=api_tools_openai_schemas),
             Route("/api/client/status", endpoint=api_client_status),
             Route("/api/client/install", endpoint=api_client_install),
@@ -711,6 +869,14 @@ if __name__ == "__main__":
             Route("/api/client/browse", endpoint=api_client_browse),
             Route("/api/client/latest", endpoint=api_client_latest),
             Route("/download/{filename}", endpoint=api_download),
+            # 2026-05-25: cross-process tool dispatch — agent-runtime
+            # POSTs here to invoke client tools (file_write, run_command,
+            # etc.) on its behalf, going through the same agentic.handle_tool
+            # path that LibreChat-MCP uses (approval gate + bridge to
+            # daemon).  Without this, Director's Builder couldn't touch
+            # the user's filesystem.
+            Route("/api/agent_runtime/dispatch_tool",
+                  endpoint=api_agent_runtime_dispatch_tool, methods=["POST"]),
             WebSocketRoute("/ws/client", endpoint=ws_client),
         ]
 

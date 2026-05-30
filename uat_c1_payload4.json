@@ -1,0 +1,10 @@
+{
+  "conversation_id": "uat-c1-live-004",
+  "user_id": "69c4468a1fde1abc19c7835c",
+  "tenant_id": "69c4468a1fde1abc19c7835c",
+  "agent_id": "director",
+  "stream": false,
+  "messages": [
+    {"role": "user", "content": "Decompose and delegate as a parallel fanout, then synthesize: produce a combined briefing for our Director model decision that compares Claude Haiku vs Sonnet on (1) COST and (2) LATENCY. Fan out the two analyses to researchers, then have a synthesis subtask combine them into one recommendation file. Each piece writes its own file under team/drafts/. Do not do the work yourself; delegate it."}
+  ]
+}

@@ -59,13 +59,17 @@ _SECTION_RE = re.compile(
 # clearer error messages.
 
 
-def load_constitution(path: Path) -> dict[str, Any]:
+def load_constitution(
+    path: Path,
+    *,
+    require_evaluator_id: bool = False,
+) -> dict[str, Any]:
     """Parse the constitution file at `path`.
 
     Returns a dict shape:
       {
-        "objectives":  [ {id, weight, description}, ... ],
-        "constraints": [ {id, rule}, ... ],
+        "objectives":  [ {id, weight, description, evaluator_id?}, ... ],
+        "constraints": [ {id, rule, evaluator_id?}, ... ],
         "metrics":     [ {id, unit, source, description}, ... ],
         "version":     int,
       }
@@ -73,6 +77,13 @@ def load_constitution(path: Path) -> dict[str, Any]:
     Raises ConstitutionError if the file is structurally invalid in a
     way that would prevent the scorer from running.  Warnings (e.g.,
     weights don't sum to 1.0 exactly) are logged but don't fail load.
+
+    Phase 6.9 — when `require_evaluator_id=True`, every objective and
+    constraint must have an `evaluator_id` referencing a registered
+    evaluator in `constitution/evaluators.py`.  Entries without an
+    evaluator are aspiration, not policy; the loader refuses them.
+    Default is False (legacy-compat for existing CONSTITUTION.md files
+    that haven't been migrated yet); flip to True post-migration.
     """
     if not path.exists():
         raise ConstitutionError(f"file not found: {path}")
@@ -106,6 +117,20 @@ def load_constitution(path: Path) -> dict[str, Any]:
         )
 
     version = _extract_version(text)
+
+    # Phase 6.9 — evaluator_id validation (iron rule).
+    if require_evaluator_id:
+        from .evaluators import validate_constitution_evaluators
+        errors = validate_constitution_evaluators(
+            objectives, constraints, legacy_exempt=False,
+        )
+        if errors:
+            joined = "\n  - ".join(errors)
+            raise ConstitutionError(
+                "Phase 6.9 evaluator_id validation failed (entries without "
+                "an evaluator are aspiration, not policy):\n  - "
+                + joined
+            )
 
     return {
         "objectives": objectives,

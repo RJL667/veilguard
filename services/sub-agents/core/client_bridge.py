@@ -127,6 +127,27 @@ def register_user_token(user_id: str, regenerate: bool = False) -> str:
     return _tokens[user_id]
 
 
+SANDBOX_USER_ID = "system:sandbox"
+
+
+def _sandbox_token_from_env() -> Optional[str]:
+    """The sandbox container ships with a pre-shared secret in env.
+
+    Both sides (sub-agents process AND veilguard-sandbox container) read
+    ``VEILGUARD_SANDBOX_TOKEN`` from the same `.env` file via Docker
+    Compose.  If the env var is unset the sandbox identity is disabled
+    — sub-agents won't accept WS auth as ``system:sandbox``, server
+    agents fall back to "no daemon" errors when the user is offline.
+
+    This is intentional: the sandbox is a TRUSTED SYSTEM COMPONENT, not
+    a per-user identity, so it gets a separate auth channel from the
+    per-user QR-token store.  Anyone with VEILGUARD_SANDBOX_TOKEN can
+    impersonate the sandbox — keep it out of source control.
+    """
+    tok = os.environ.get("VEILGUARD_SANDBOX_TOKEN", "").strip()
+    return tok or None
+
+
 def validate_token(user_id: str, token: str) -> bool:
     """Constant-time check that ``token`` matches ``user_id``'s record.
 
@@ -136,9 +157,19 @@ def validate_token(user_id: str, token: str) -> bool:
     shared secret, which meant one leaked value gave impersonation
     across every not-yet-registered identity. Per-user tokens are the
     only path now; unknown user_ids fail closed.
+
+    Exception: ``user_id == "system:sandbox"`` authenticates against the
+    process-wide ``VEILGUARD_SANDBOX_TOKEN`` env var (Phase B).  This is
+    a TRUSTED INTERNAL identity used by the sandbox container, not by
+    end users.  When the env var is unset the sandbox path is closed.
     """
     if not user_id or not token:
         return False
+    if user_id == SANDBOX_USER_ID:
+        expected = _sandbox_token_from_env()
+        if expected is None:
+            return False
+        return hmac.compare_digest(expected, token)
     expected = get_user_token(user_id)
     if expected is None:
         return False
@@ -176,6 +207,33 @@ class ClientBridge:
         self.os_release: str = ""
         self.shell: str = ""
         self._host_hint_sent: bool = False
+        # [PHASE_0_0_4_CAPABILITY_HANDSHAKE_2026_05_27] Per-spec §0.4 +
+        # §0.0.4 in MULTI_AGENT_PLATFORM.md.  The daemon declares its
+        # supported features in its auth payload (capabilities=[…]);
+        # the server stores them so call sites can degrade gracefully
+        # for older daemons that pre-date a feature.  Empty set means
+        # "vintage daemon, assume nothing".  Common feature names:
+        #   - "request_approval"   — daemon can render toast + return user decision
+        #   - "toast"              — daemon can show informational toasts
+        #   - "execute_remote"     — daemon will exec shell tools (vs. local-only)
+        #   - "file_io"            — daemon owns read_file / write_file / edit_file
+        #   - "bypass_rules"       — daemon honours bypass-rule API
+        self.capabilities: frozenset[str] = frozenset()
+        # Spec §0.0.4: bidirectional handshake — track which capabilities
+        # the SERVER advertised back to this daemon so admin tools can
+        # show the negotiated set.
+        self.server_capabilities_advertised: frozenset[str] = frozenset()
+
+    def has_capability(self, name: str) -> bool:
+        """Return True if the connected daemon advertised ``name``.
+
+        Call sites should use this BEFORE invoking a feature path so we
+        can fall back / log instead of timing out a feature the daemon
+        doesn't support.  Always False when ``self.connected`` is False.
+        """
+        if not self.connected:
+            return False
+        return name in self.capabilities
 
     async def send_command(self, method: str, params: dict, timeout: float = 10.0):
         """Send a generic JSON-RPC command to the daemon and await result."""
@@ -211,6 +269,118 @@ class ClientBridge:
         except asyncio.TimeoutError:
             self.pending.pop(request_id, None)
             return None
+
+    async def request_approval(
+        self,
+        *,
+        tool: str,
+        args: dict,
+        conv_id: str = "",
+        agent_id: str = "user",
+        request_id: str = "",
+        policy_decision: str = "",
+        policy_reason: str = "",
+        level: str = "",
+        timeout_s: int = 60,
+    ) -> dict:
+        """Ask the daemon for user approval on a tool call.
+
+        Round-trips a JSON-RPC ``request_approval`` to the daemon and
+        awaits the user's click.  Mirrors ``execute_remote``'s future
+        plumbing but uses a dedicated method name so the daemon can
+        route to its toast/UI layer instead of the tool executor.
+
+        Returns:
+            {"approved": bool, "reason": str, "tool": str,
+             "request_id": str} on success.
+            {"approved": false, "reason": "<error>"} on transport failure.
+
+        Caller is responsible for the outer timeout wrap — we still set
+        one here as a defensive backstop in case the daemon's UI hangs.
+        """
+        if not self.connected or self.ws is None:
+            return {"approved": False, "reason": "client daemon not connected"}
+
+        # [PHASE_0_0_4_CAPABILITY_HANDSHAKE_2026_05_27]  Vintage daemons
+        # that pre-date the handshake won't have advertised
+        # 'request_approval' — sending a request_approval method to
+        # them will deadlock (they don't know to reply).  Per spec
+        # §0.0.4: fall back to DENY for background-routed tools when
+        # the daemon can't gate.  Foreground (browser-driven) tools
+        # still go through their own ALLOW path before reaching here.
+        if not self.has_capability("request_approval"):
+            logger.warning(
+                "[bridge] daemon %r missing 'request_approval' "
+                "capability (pre-§0.0.4 daemon) — denying %s",
+                self.client_id or "?", tool,
+            )
+            return {
+                "approved": False,
+                "reason": (
+                    "daemon does not advertise request_approval "
+                    "capability (upgrade the Veilguard client to "
+                    "land §0.0.4)"
+                ),
+                "tool": tool,
+                "request_id": request_id or "",
+            }
+
+        # Use the caller's request_id when supplied so the audit row and
+        # the daemon log line match.
+        req_id = request_id or f"appr-{uuid.uuid4().hex[:8]}"
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        self.pending[req_id] = future
+
+        msg = json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "request_approval",
+            "params": {
+                "tool":            tool,
+                "args":            args,
+                "conv_id":         conv_id,
+                "agent_id":        agent_id,
+                "policy_decision": policy_decision,
+                "policy_reason":   policy_reason,
+                "level":           level,
+                "timeout_s":       timeout_s,
+            },
+        })
+
+        try:
+            await self.ws.send_text(msg)
+            logger.info(
+                f"[BRIDGE] request_approval id={req_id} tool={tool!r} "
+                f"conv={conv_id[:8]} level={level} timeout={timeout_s}s"
+            )
+        except Exception as e:
+            self.pending.pop(req_id, None)
+            return {"approved": False, "reason": f"send failed: {e}"}
+
+        # +5s slack so the daemon-side timeout (timeout_s) fires first
+        # and gives us a structured response instead of TimeoutError.
+        try:
+            result = await asyncio.wait_for(future, timeout=timeout_s + 5)
+        except asyncio.TimeoutError:
+            self.pending.pop(req_id, None)
+            return {
+                "approved": False,
+                "reason": f"daemon did not respond in {timeout_s + 5}s",
+            }
+
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            # Daemon returned a bare string — treat as denial.
+            return {"approved": False, "reason": result}
+        return {"approved": False, "reason": "unparseable daemon response"}
 
     async def execute_remote(self, tool: str, args: dict, timeout: float = 60.0) -> str:
         """Send a tool call to the client daemon and await the result."""
@@ -320,9 +490,19 @@ class ClientBridge:
     def on_message(self, data: dict):
         """Handle an incoming message from the client daemon."""
         msg_id = data.get("id")
+        method = data.get("method", "") or ""
 
-        if data.get("method") == "pong" or data.get("result") == "pong":
+        if method == "pong" or data.get("result") == "pong":
             self.last_ping = time.time()
+            return
+
+        # Daemon-initiated notifications.  Until 2026-05-25 the bridge
+        # was strictly cloud-asks/daemon-answers; the tray menu now
+        # lets the user change permission_level directly, so we accept
+        # a small set of inbound methods.  Anything not whitelisted
+        # falls through to the response-future path below.
+        if method == "set_permission_level":
+            self._handle_inbound_set_permission_level(data.get("params") or {})
             return
 
         if msg_id and msg_id in self.pending:
@@ -336,6 +516,39 @@ class ClientBridge:
                 future.set_result(f"Error: {msg}")
             else:
                 future.set_result(data.get("result", ""))
+
+    def _handle_inbound_set_permission_level(self, params: dict) -> None:
+        """User changed permission_level from the tray.  Persist it."""
+        try:
+            level = (params.get("level") or "").lower()
+            scope = (params.get("scope") or "user").lower()
+            source = params.get("source", "tray")
+            conv_id = params.get("conv_id", "") or ""
+            # Import locally so the bridge module stays lightweight
+            # and tests don't pay the lance startup cost.
+            from .client_settings import ClientSettingsStore, PERMISSION_LEVELS
+            if level not in PERMISSION_LEVELS:
+                logger.warning(
+                    f"[BRIDGE] inbound set_permission_level: bad level "
+                    f"{level!r} from user={self.user_id[:8]}"
+                )
+                return
+            store = ClientSettingsStore.get()
+            if scope == "conv" and conv_id:
+                store.set_conv_override(self.user_id, conv_id, level)
+                logger.info(
+                    f"[BRIDGE] tray set conv override "
+                    f"user={self.user_id[:8]} conv={conv_id[:8]} "
+                    f"level={level} src={source}"
+                )
+            else:
+                store.set_user_level(self.user_id, level)
+                logger.info(
+                    f"[BRIDGE] tray set user default "
+                    f"user={self.user_id[:8]} level={level} src={source}"
+                )
+        except Exception as e:
+            logger.warning(f"[BRIDGE] inbound set_permission_level failed: {e}")
 
     def on_disconnect(self):
         """Handle client daemon disconnection."""

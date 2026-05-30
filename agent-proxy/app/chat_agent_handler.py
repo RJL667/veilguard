@@ -68,6 +68,38 @@ for candidate in _PATH_CANDIDATES:
 logger = logging.getLogger("pii-proxy.chat_agent")
 
 
+def _write_audit(
+    audit_ev: dict,
+    *,
+    conversation_id: str,
+    user_id: str,
+    is_stream: bool,
+) -> None:
+    """Persist one AUDIT event from Agent.run_turn to the pii_audit
+    LanceDB table.  Best-effort — never raises out of the handler.
+
+    The handler owns is_stream because the agent doesn't know whether
+    its caller will frame the response as SSE or non-stream JSON.
+    """
+    try:
+        from app import audit_db as _audit_db
+        _audit_db.record(
+            direction=audit_ev.get("direction", ""),
+            conversation_id=conversation_id or "",
+            user_id=user_id or "",
+            model=audit_ev.get("model") or "",
+            stream=bool(is_stream),
+            content=audit_ev.get("content") or "",
+            tokens_input=audit_ev.get("tokens_input_total") or None,
+            tokens_output=audit_ev.get("tokens_output") or None,
+            cache_create=audit_ev.get("cache_create") or None,
+            cache_read=audit_ev.get("cache_read") or None,
+            extra={"path": "chat_agent"},
+        )
+    except Exception as e:
+        logger.warning(f"[chat_agent] audit_db record failed: {e}")
+
+
 # ── Feature flag ────────────────────────────────────────────────────────
 
 
@@ -97,6 +129,60 @@ async def handle_chat_request(
     On agent error, returns an Anthropic-shaped error in the matching
     format so LibreChat surfaces the issue instead of spinning.
     """
+    # [F9_FAIL_CLOSED_2026_05_26] Refuse unauthenticated traffic.  The
+    # previous code fell through to user_id="anonymous" + tenant_id=
+    # "default" — those rows then sit in pii_audit invisible to any
+    # tenant filter on user_id and could leak across users.  LibreChat
+    # is the only legitimate caller; its veilguardClient route injects
+    # x-user-id after requireJwtAuth validates the session.  If we got
+    # here without one, either upstream auth is broken or someone is
+    # hitting the route directly — both are 401 cases.
+    if not user_id:
+        logger.warning(
+            "[chat_agent] missing x-user-id header — refusing request. "
+            "If you're testing locally, set x-user-id to your hex-24 "
+            "tenant id."
+        )
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": {
+                    "type": "unauthenticated",
+                    "message": (
+                        "x-user-id header required. The chat_agent path "
+                        "refuses to write audit rows without a real user "
+                        "identifier (preventing pii_audit cross-tenant "
+                        "leak via anonymous tagging)."
+                    ),
+                }
+            },
+        )
+
+    # ── Workspace state injection ──────────────────────────────────────
+    # Fetch the user's connected-daemon working folders + OS hint and
+    # inject them into the request body as a final SYSTEM block.  The
+    # legacy /handle_sso_request path does this at main.py:3361; the
+    # ChatAgent path was missing it, so Claude saw no folders and
+    # reported "I can't see your workspace".
+    #
+    # NEVER blocks the request — if the workspace fetch fails (sub-
+    # agents down, daemon offline, network hiccup), we proceed without
+    # the block.  The user's chat keeps working; the LLM just won't
+    # know which folders are pinned.
+    if user_id:
+        try:
+            from app.main import _fetch_workspace_state, _inject_workspace_state
+            ws_state = await _fetch_workspace_state(user_id)
+            if ws_state:
+                _inject_workspace_state(body, "anthropic", ws_state)
+                logger.info(
+                    f"[chat_agent] injected workspace state: "
+                    f"folders={len(ws_state.get('folders') or [])} "
+                    f"client={ws_state.get('client_id', '?')}"
+                )
+        except Exception as _e:
+            logger.debug(f"[chat_agent] workspace fetch failed: {_e}")
+
     try:
         from agent import ChatAgent, TurnContext
     except ImportError as e:
@@ -115,10 +201,14 @@ async def handle_chat_request(
     # Agent.preamble() → render_preamble(self.tools()) — no need to
     # pre-render here.
     chat = ChatAgent.from_libre_chat_request(body)
+    # [F9_FAIL_CLOSED_2026_05_26] user_id is now guaranteed non-empty
+    # by the early-return above.  tenant_id defaults to user_id when
+    # not explicitly supplied (single-tenant-per-user is the common
+    # case); "default" is no longer a valid fallback.
     ctx = TurnContext(
         conversation_id=conversation_id or f"conv-{uuid.uuid4().hex[:8]}",
-        user_id=user_id or "anonymous",
-        tenant_id=tenant_id or user_id or "default",
+        user_id=user_id,
+        tenant_id=tenant_id or user_id,
     )
 
     logger.info(
@@ -168,6 +258,13 @@ async def _build_anthropic_json(chat, messages: list, ctx):
             content = msg.get("content") or []
             usage = msg.get("usage") or {}
             stop_reason = msg.get("stop_reason") or stop_reason
+        elif et == "audit":
+            _write_audit(
+                ev,
+                conversation_id=ctx.conversation_id,
+                user_id=ctx.user_id,
+                is_stream=False,
+            )
         elif et == "error":
             error = {
                 "type": ev.get("code", "api_error"),
@@ -249,6 +346,13 @@ async def _stream_anthropic_sse(chat, messages: list, ctx) -> AsyncIterator[str]
             content = inner.get("content") or []
             usage = inner.get("usage") or {}
             stop_reason = inner.get("stop_reason") or stop_reason
+        elif et == "audit":
+            _write_audit(
+                ev,
+                conversation_id=ctx.conversation_id,
+                user_id=ctx.user_id,
+                is_stream=True,
+            )
         elif et == "error":
             error = {
                 "type": ev.get("code", "api_error"),

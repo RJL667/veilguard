@@ -123,6 +123,28 @@ def add_comment(
         values={"comments_head_hash": self_hash, "updated_ts": ts},
     )
 
+    try:
+        from ..events import broadcast
+        broadcast({
+            "type": "task_comment_added",
+            "tenant_id": tenant_id, "user_id": user_id,
+            "task_id": task_id, "comment_id": cid,
+            "author_id": author_id, "kind": kind,
+            "body": body[:240],
+        })
+    except Exception:
+        pass
+    # Phase 6.7 — comments are state mutations.  Discussion/note kinds
+    # are pure narration (don't count); state-machine kinds count.
+    try:
+        if kind in ("status_change", "review_decision",
+                    "blocker_raised", "blocker_cleared",
+                    "review_request", "criterion_check"):
+            from ..runtime_health import apr_record_artifact
+            apr_record_artifact()
+    except Exception:
+        pass
+
     return cid
 
 

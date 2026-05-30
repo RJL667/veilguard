@@ -1613,3 +1613,116 @@ MPI
 OpenMP
 POSIX Threads
 pthread
+
+# ══════════════════════════════════════════════════════════════════════
+# PRIVACY / DATA-PROTECTION POLICY VOCAB
+# ══════════════════════════════════════════════════════════════════════
+# Capitalised data-protection terms that spaCy NER flags as PERSON
+# (e.g. "Minimisation also builds…" — Presidio reads sentence-leading
+# capitalised abstract nouns as proper-noun-like).  Caught in v8
+# org-test as F18 (the "Minimisation" bare token leak).  POPIA, GDPR,
+# CCPA, and PIPEDA terms — all variants (US/UK spelling).
+POPIA
+POPI
+GDPR
+CCPA
+CPRA
+PIPEDA
+LGPD
+PDPA
+PDPO
+DPDP
+Consent
+Lawful
+Lawfulness
+Processing
+Minimisation
+Minimization
+Rectification
+Erasure
+Portability
+Restriction
+Objection
+Profiling
+Pseudonymisation
+Pseudonymization
+Anonymisation
+Anonymization
+Accountability
+Transparency
+Fairness
+Purpose
+Storage
+Integrity
+Confidentiality
+Necessity
+Proportionality
+Notification
+Authorisation
+Authorization
+Disclosure
+Retention
+Disposal
+Destruction
+Encryption
+Decryption
+Redaction
+Tokenization
+Tokenisation
+Aggregation
+Differential Privacy
+Privacy Impact Assessment
+Data Protection Impact Assessment
+Data Subject Access Request
+Data Subject Participation
+Cross-border Transfer
+Standard Contractual Clauses
+Binding Corporate Rules
+Information Officer
+Information Regulator
+Responsible Party
+Operator
+Data Subject
+Data Controller
+Data Processor
+Special Personal Information
+Sensitive Personal Information
+Personal Information
+Personally Identifiable Information
+PII
+DPIA
+PIA
+DPO
+SCC
+BCR
+SAR
+DSR
+DSAR
+ROPA
+RTO
+RPO
+KYC
+FICA
+AML
+CDD
+EDD
+PEP
+
+# ══════════════════════════════════════════════════════════════════════
+# FINANCIAL / FINTECH COMMON NOUNS
+# ══════════════════════════════════════════════════════════════════════
+# "Fintech" cards often capitalise feature names that NER mis-types.
+Fintech
+Open Banking
+Open Finance
+Account Opening
+Onboarding
+Underwriting
+Reconciliation
+Settlement
+Disbursement
+Chargeback
+Clearing
+Custody
+Issuance
+Acquiring

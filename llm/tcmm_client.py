@@ -92,9 +92,17 @@ async def render_structured(
         "task_query": task_query,
         "model": model,
     }
+    if _tcmm_unreachable():
+        # Skip the round-trip entirely; caller's degraded path (magic
+        # prefix + persona inline) handles the empty render.
+        raise RuntimeError(
+            f"TCMM marked unreachable (recent ConnectError); "
+            f"will re-probe after {_TCMM_REPROBE_AFTER_S:.0f}s"
+        )
     try:
         resp = await _client().post(f"{TCMM_URL}/render_structured", json=body)
     except httpx.ConnectError as e:
+        _mark_tcmm_unreachable()
         raise RuntimeError(
             f"TCMM unreachable at {TCMM_URL}/render_structured: {e}. "
             "Start the local stack (start.bat) or set TCMM_URL."
@@ -130,6 +138,8 @@ async def pin_system_prompt(
     """
     if not conv_id or not content:
         return
+    if _tcmm_unreachable():
+        return  # short-circuit: TCMM was just down; don't waste 250ms
     try:
         # TCMM's PinSystemPromptBody expects `text`, not `content`.
         # Misnaming the field returns 422 Unprocessable Entity which
@@ -145,8 +155,38 @@ async def pin_system_prompt(
             },
             timeout=TCMM_TIMEOUT,
         )
+    except httpx.ConnectError as e:
+        _mark_tcmm_unreachable()
+        logger.debug(f"[tcmm] pin_system_prompt({kind}) connect failed: {e}")
     except Exception as e:
         logger.debug(f"[tcmm] pin_system_prompt({kind}) failed: {e}")
+
+
+_TOOL_DEFS_ENDPOINT_AVAILABLE: Optional[bool] = None
+
+# [TCMM_UNREACHABLE_FAST_PATH_2026_05_29]  Track recent ConnectError so
+# we stop hammering TCMM endpoints when the service is known-down.  Each
+# agent turn does ~3 pin calls + 1 render + 2 ingest = 6 HTTP round-
+# trips.  Even at the "fast" connection-refused rate of 250ms/call
+# (httpx connection setup + retry probe), that's 1.5s of wasted wall
+# clock per turn — directly observable in `[agent.timing]` logs as
+# `prepare_session=984ms`.  This flag turns those into <1ms no-ops
+# after a single failure, with a 30s re-probe to recover if TCMM comes
+# back online.
+_TCMM_LAST_CONNECT_FAIL_TS: float = 0.0
+_TCMM_REPROBE_AFTER_S: float = 30.0
+
+
+def _tcmm_unreachable() -> bool:
+    """True if a recent TCMM call hit a ConnectError; re-probe after 30s."""
+    import time as _t
+    return (_t.time() - _TCMM_LAST_CONNECT_FAIL_TS) < _TCMM_REPROBE_AFTER_S
+
+
+def _mark_tcmm_unreachable() -> None:
+    global _TCMM_LAST_CONNECT_FAIL_TS
+    import time as _t
+    _TCMM_LAST_CONNECT_FAIL_TS = _t.time()
 
 
 async def pin_tool_definitions(
@@ -154,14 +194,24 @@ async def pin_tool_definitions(
 ) -> None:
     """Pin tool schemas to TCMM so the rendered prefix includes them.
 
-    Older TCMM builds may 404 on this endpoint; we log and continue.
-    Pinning is best-effort: tools are also sent in the API request
-    body, so missing the pin only loses cache-stable bundling.
+    Older TCMM builds 404 on this endpoint.  After the first 404 we
+    flip a process-local flag and short-circuit every subsequent call —
+    this saves ~15ms per agent turn (1× per agent in a multi-agent
+    fanout, repeated for every dispatch) that we were burning round-
+    tripping to TCMM only to get 404 back.
+
+    Pinning is best-effort: tools are also sent in the API request body,
+    so missing the pin only loses cache-stable bundling.
     """
+    global _TOOL_DEFS_ENDPOINT_AVAILABLE
+    if _TOOL_DEFS_ENDPOINT_AVAILABLE is False:
+        return  # known 404 — don't waste a round-trip
     if not conv_id or not tools:
         return
+    if _tcmm_unreachable():
+        return
     try:
-        await _client().post(
+        resp = await _client().post(
             f"{TCMM_URL}/pin/tool_definitions",
             json={
                 "conversation_id": conv_id,
@@ -170,6 +220,19 @@ async def pin_tool_definitions(
             },
             timeout=TCMM_TIMEOUT,
         )
+        # Latch the result so we don't repeat the round-trip.
+        if resp.status_code == 404:
+            if _TOOL_DEFS_ENDPOINT_AVAILABLE is not False:
+                logger.info(
+                    "[tcmm] pin/tool_definitions returned 404 once; "
+                    "disabling further calls this process lifetime"
+                )
+            _TOOL_DEFS_ENDPOINT_AVAILABLE = False
+        else:
+            _TOOL_DEFS_ENDPOINT_AVAILABLE = True
+    except httpx.ConnectError as e:
+        _mark_tcmm_unreachable()
+        logger.debug(f"[tcmm] pin_tool_definitions connect failed: {e}")
     except Exception as e:
         logger.debug(f"[tcmm] pin_tool_definitions failed: {e}")
 
@@ -186,6 +249,8 @@ async def ingest_user(
     """
     if not conv_id or not user_msg:
         return
+    if _tcmm_unreachable():
+        return
     try:
         await _client().post(
             f"{TCMM_URL}/pre_request",
@@ -198,6 +263,9 @@ async def ingest_user(
             },
             timeout=TCMM_TIMEOUT,
         )
+    except httpx.ConnectError as e:
+        _mark_tcmm_unreachable()
+        logger.debug(f"[tcmm] ingest_user connect failed: {e}")
     except Exception as e:
         logger.debug(f"[tcmm] ingest_user failed (continuing): {e}")
 
@@ -229,10 +297,15 @@ async def ingest_assistant(
         body["model"] = model
     if flag_obj and isinstance(flag_obj, dict):
         body["flag_obj"] = flag_obj
+    if _tcmm_unreachable():
+        return
     try:
         await _client().post(
             f"{TCMM_URL}/post_response", json=body, timeout=TCMM_TIMEOUT,
         )
+    except httpx.ConnectError as e:
+        _mark_tcmm_unreachable()
+        logger.debug(f"[tcmm] ingest_assistant connect failed: {e}")
     except Exception as e:
         logger.debug(f"[tcmm] ingest_assistant failed (continuing): {e}")
 

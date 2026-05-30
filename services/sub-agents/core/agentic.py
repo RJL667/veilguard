@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import subprocess
+import time
 import uuid
 
 import httpx
@@ -120,23 +121,146 @@ async def handle_tool(name: str, args: dict) -> str:
     args = await _rehydrate_args(args)
 
     # Check if this tool should be routed to the client daemon
-    from utils.tool_location import is_client_tool
+    from utils.tool_location import is_client_tool, SANDBOX_FALLBACK_TOOLS
+    from core.client_bridge import SANDBOX_USER_ID
     import server as _srv
     if not getattr(_srv, "LOCAL_MODE", True) and is_client_tool(name):
         from core.client_bridge import get_bridge
-        from core.request_ctx import get_user_id
+        from core.request_ctx import get_user_id, get_conversation_id
         # Per-user routing: each LibreChat user's tool calls only reach
         # their own registered client daemon.  Without this, whoever's
         # daemon connected last would receive every user's tool calls.
         user_id = get_user_id()
+        conv_id = get_conversation_id() or ""
         bridge = get_bridge(user_id)
-        if bridge and bridge.connected:
-            return await bridge.execute_remote(name, args)
         if not user_id:
             return (
                 "Error: No user context — MCP request missing x-user-id "
                 "header. Reconnect LibreChat so it forwards user identity."
             )
+
+        # Sandbox fallback — RESERVED for server-side identities.
+        #
+        # 2026-05-25 incident: a real user's daemon flapped offline for a
+        # few seconds between connect / heartbeat.  Their next tool call
+        # silently routed to the sandbox container (Linux), so the LLM
+        # saw `/sandbox-workspace` instead of their actual Windows
+        # filesystem.  Pretty bad — felt like the chat was lying about
+        # what it could see.
+        #
+        # New rule: fallback fires only when the caller is a server-side
+        # identity (background daemons, scheduled workers, Director runs
+        # — anything where there's no human in the loop to notice the
+        # silent reroute).  Interactive chat users always see their own
+        # machine OR a clean "no daemon connected" error.
+        if (not bridge or not bridge.connected) and name in SANDBOX_FALLBACK_TOOLS:
+            # Heuristic for "server-side": user_id is a colon-namespaced
+            # synthetic ID (e.g. "system:sandbox", "daemon:inbox-watcher"),
+            # NOT a MongoDB ObjectId from LibreChat (24 hex chars).
+            is_server_caller = (
+                ":" in user_id
+                or user_id.startswith(("system:", "daemon:", "schedule:"))
+            )
+            if is_server_caller:
+                sandbox = get_bridge(SANDBOX_USER_ID)
+                if sandbox and sandbox.connected:
+                    logger.info(
+                        f"[agentic] server caller {user_id[:16]!r} daemon "
+                        f"offline; routing {name!r} to server sandbox"
+                    )
+                    bridge = sandbox
+            else:
+                logger.warning(
+                    f"[agentic] user {user_id[:8]} daemon transiently "
+                    f"offline; NOT falling back to sandbox (interactive "
+                    f"caller — failing loud)"
+                )
+
+        # ── Approval gate ────────────────────────────────────────────────
+        # Run BEFORE dispatching to the bridge.  Combines static policy
+        # (CLIENT_TOOLS risk class) with the user's permission_level
+        # (auto / confirm / strict) and the conv-level override.  DENY /
+        # timeout / user-refused → return an Error string the LLM sees
+        # in the next message.  Approved → fall through to the bridge.
+        try:
+            from core.approval import gate as _approval_gate
+            gate_result = await _approval_gate(
+                tool=name, args=args,
+                user_id=user_id, conv_id=conv_id,
+                bridge=bridge, agent_id="user",
+                is_background=False,
+            )
+        except Exception as e:
+            logger.warning(f"[approval] gate raised; defaulting to deny: {e}")
+            return f"Error: Approval gate failed: {e}"
+
+        if not gate_result.proceed:
+            return f"Error: Tool call blocked — {gate_result.reason}"
+
+        # ── Submit through TaskDispatcher (Phase B-1) ───────────────────
+        # Single ledger row per tool call means list_my_tasks / cancel /
+        # subtree queries see every routing decision.  Executor picked
+        # by which bridge we actually landed on (user's daemon vs the
+        # server sandbox).  Falls back to direct bridge.execute_remote
+        # if the dispatcher path errors — keeps tool calls working when
+        # the unified store has a transient hiccup.
+        if bridge and bridge.connected:
+            try:
+                from core.tasks import Task, TaskKind, TaskDispatcher
+                # Pick executor name based on which bridge we resolved.
+                # bridge.user_id was set at WS-auth time, so it's the
+                # authoritative source of truth for "who am I routing to."
+                exec_name = (
+                    "sandbox" if bridge.user_id == SANDBOX_USER_ID
+                    else "daemon"
+                )
+                # Pull parent task id from the contextvar if a caller
+                # (e.g. a sub-agent runner) populated it.  Empty parent
+                # is fine — task becomes its own root.
+                from core.request_ctx import current_child_conversation_id
+                parent_tid = ""   # populated by future B-2 sub-agent runner
+
+                task = Task.new(
+                    kind=TaskKind.TOOL_CALL,
+                    executor=exec_name,
+                    user_id=user_id,
+                    conv_id=conv_id,
+                    parent_task_id=parent_tid,
+                    title=f"{name}({','.join(list(args.keys())[:3])})",
+                    payload={"tool": name, "args": args},
+                )
+                dispatcher = TaskDispatcher.get()
+                await dispatcher.submit(task)
+                # The dispatcher spawns the executor and returns
+                # immediately.  We need the result synchronously to
+                # hand back to the LLM, so poll the store until the
+                # task is terminal.  Short polling loop with backoff —
+                # tool calls typically complete in <2s.  Cap at 90s to
+                # match bridge.execute_remote's default timeout + slack.
+                import asyncio as _asyncio
+                deadline = time.time() + 90
+                while time.time() < deadline:
+                    fresh = dispatcher.get_task(task.task_id)
+                    if fresh is not None and fresh.is_terminal:
+                        return fresh.result or (
+                            f"Error: {fresh.error}" if fresh.error else ""
+                        )
+                    await _asyncio.sleep(0.1)
+                # Timeout — return what we have + a marker for the LLM.
+                logger.warning(
+                    f"[agentic] dispatcher task {task.task_id} did not "
+                    "reach terminal state within 90s"
+                )
+                return "Error: Tool call timed out (dispatcher 90s)"
+            except Exception as e:
+                # Dispatcher unavailable / Lance hiccup → degrade to
+                # direct bridge call so chat keeps working.  Log
+                # loudly so the regression is visible.
+                logger.exception(
+                    f"[agentic] dispatcher failed for {name!r}; "
+                    f"falling back to direct bridge: {e}"
+                )
+                return await bridge.execute_remote(name, args)
         return (
             "Error: No client daemon connected for this user. "
             "Install and start the Veilguard client daemon from the "
