@@ -158,6 +158,10 @@ async def startup():
             "ID 8001015009087 and account 1234567890.",
             "_warmup_session_",
         )
+        # [PII_LARGE_WARM_2026_05_30]  Also warm the LARGE-doc NER path so the
+        # first real render (warm_batch over accumulated memory) doesn't pay
+        # the one-time first-large-doc tax.  Zero recall cost.
+        redactor_inst.warm()
         logger.info(
             f"Presidio pre-warm complete in {(_pt.time() - _t) * 1000:.0f}ms"
         )

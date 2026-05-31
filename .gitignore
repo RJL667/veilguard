@@ -135,3 +135,7 @@ services/client-daemon/installer_output/
 
 # debug/scratch artifacts (logs, audit dumps, oauth/pii test json) — never publish
 tmp/
+
+# runtime/scratch logs — never publish
+*.log
+*.err.log

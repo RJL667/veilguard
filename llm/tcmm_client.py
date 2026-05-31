@@ -78,6 +78,7 @@ async def render_structured(
     user_id: str,
     task_query: str,
     model: str = "anthropic",
+    pii_sid: str = "",
 ) -> RenderResult:
     """Render the conversation's memory into SDK-ready blocks.
 
@@ -85,12 +86,18 @@ async def render_structured(
     placed by TCMM's renderer.  Caller is expected to run the blocks
     through `pii.PIIRedactor.redact_blocks(...)` before sending to the
     LLM adapter — that's the cache-stable boundary.
+
+    [PII_SID_CONTRACT_2026_05_30]  When the server-side render-layer
+    redaction hook is enabled, `pii_sid` (= caller's `SessionId.canonical()`)
+    tells the server which session to mint REF tokens under — the SAME sid
+    the caller will rehydrate with.  Harmless when the hook is off.
     """
     body = {
         "conversation_id": conv_id,
         "user_id": user_id or "",
         "task_query": task_query,
         "model": model,
+        "pii_sid": pii_sid or "",
     }
     if _tcmm_unreachable():
         # Skip the round-trip entirely; caller's degraded path (magic

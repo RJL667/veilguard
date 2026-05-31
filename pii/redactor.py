@@ -81,7 +81,13 @@ SKIP_KEYS = {
 # "this block is PII-free" sentinel; `_vg_*` is the richer render-time
 # contract (see PII_FAST_REDACTION_SPEC.md §3.2) that activates
 # automatically once TCMM's renderer emits it.
-_META_KEYS = {"_skip_pii", "_vg_id", "_vg_immutable", "_vg_pii"}
+_META_KEYS = {
+    "_skip_pii", "_vg_id", "_vg_immutable", "_vg_pii",
+    # [PII_AID_CACHE_2026_05_30] live-memory-block render tags:
+    "_vg_aid",        # origin_archive_id — the redaction cache key
+    "_vg_clean",      # True = immutable/static (preamble, tools) — never redact
+    "_vg_stability",  # stability_class (byte_stable, …) — informational
+}
 
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -200,19 +206,19 @@ class PIIRedactor:
         self.allow_list = _load_allow_list()
         self.store = _get_store()
 
-        # [PII_BLOCK_CACHE_2026_05_29]  THE blazingly-fast layer.
-        # Key: (sid.root(), blake2b(text)).  Value: fully-redacted text.
-        # Token assignment is deterministic + append-only per session, so
-        # the redacted form of a block is a pure function of (text, sid):
-        # once we've redacted these exact bytes for this session, replay
-        # them with ZERO Presidio / line-split / token-mint / Lance I/O.
-        # Frozen memory tiers + past `[Memory index=N]` fragments are
-        # byte-stable across turns → permanent hits.  A miss just recomputes
-        # (never wrong), so LRU eviction is free.  See PII_FAST_REDACTION_SPEC.md.
-        self._block_cache: "OrderedDict[tuple, str]" = OrderedDict()
-        self._block_cache_max = int(os.environ.get("PII_BLOCK_CACHE_MAX", "2048"))
-        self._block_hits = 0
-        self._block_misses = 0
+        # [PII_AID_CACHE_2026_05_30]  THE blazingly-fast layer, keyed on the
+        # LIVE MEMORY BLOCK id (origin_archive_id / `aid`) — NOT on rendered
+        # or cache-marked bytes.  A live memory block keeps its aid as it
+        # migrates tiers (live → stable → frozen), so once redacted it stays
+        # cached forever.  Cache markers (cache_control TTL, breakpoint
+        # placement, re-bundling) churn turn-to-turn and MUST NOT be part of
+        # the key — that was the old content-hash bug.  Key: (sid.root(), aid).
+        # Value: redacted block text.  See PII_FAST_REDACTION_SPEC.md.
+        self._aid_cache: "OrderedDict[tuple, str]" = OrderedDict()
+        self._aid_cache_max = int(os.environ.get("PII_AID_CACHE_MAX", "8192"))
+        self._aid_hits = 0
+        self._aid_misses = 0
+        self._uncached_redactions = 0   # blocks with no aid + not clean
         self._clean_skipped = 0
         # CLEAN-skip is provenance-anchored, NOT heuristic: we only skip
         # blocks that EXACTLY match a known system-authored static template
@@ -222,12 +228,30 @@ class PIIRedactor:
             "PII_CLEAN_SKIP", "1"
         ).lower() in ("1", "true", "yes", "on")
         self._clean_fingerprints = self._load_clean_fingerprints()
+        # [REDACT_IN_RENDER_2026_05_30]  When TCMM's render-layer hook
+        # (policy.redact) is active, memory blocks arrive ALREADY redacted.
+        # The boundary then SKIPS re-scanning system/memory blocks (it would
+        # be duplicate work, and tier-blob blocks have no aid to cache on) —
+        # it only strips wire metadata and passes them through.  The latest
+        # user PROMPT is still redacted (redact_messages, always).  Operator
+        # enables this ONLY after wiring set_pii_hook server-side.
+        self._redact_in_render = os.environ.get(
+            "VEILGUARD_REDACT_IN_RENDER", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        # [PII_WARM_BATCH_2026_05_30]  Content memo keyed on (sid, RAW block
+        # text) → redacted text.  RAW block text is stable per aid (it's the
+        # live-memory content, NOT the rendered/cache-marked bytes), so this
+        # is safe.  warm_batch() fills it for many blocks in ONE Presidio
+        # pass — collapsing the cold-render cost from N analyze() calls (N×
+        # ~80ms pipeline overhead) to ~1.  redact_text() reads it first.
+        self._content_memo: "OrderedDict[tuple, str]" = OrderedDict()
+        self._content_memo_max = int(os.environ.get("PII_CONTENT_MEMO_MAX", "8192"))
 
         logger.info(
             f"[pii] redactor ready (Presidio + SA recognizers + "
             f"{len(self.allow_list)} allow_list terms; "
             f"fail_closed={self._fail_closed} clean_skip={self._clean_skip} "
-            f"block_cache_max={self._block_cache_max})"
+            f"redact_in_render={self._redact_in_render} aid_cache_max={self._aid_cache_max})"
         )
 
     @staticmethod
@@ -273,10 +297,12 @@ class PIIRedactor:
         return SessionId(tenant_id=legacy_tenant, conv_id=str(sid or "pii-default"))
 
     @staticmethod
-    def _block_key(sid: SessionId, text: str) -> tuple:
-        h = hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).hexdigest()
+    def _aid_key(sid: SessionId, aid) -> tuple:
+        """Cache key = (session root, live-memory-block aid).  Stable across
+        turns and tier migration; independent of rendered/cache-marked bytes.
+        """
         r = sid.root()
-        return (r.tenant_id, r.conv_id, h)
+        return (r.tenant_id, r.conv_id, str(aid))
 
     def _is_clean(self, text: str) -> bool:
         """True iff `text` is a system-authored static template (never
@@ -291,12 +317,10 @@ class PIIRedactor:
     def _analyze(self, text: str):
         """Single whole-text Presidio pass.
 
-        [LINE_CACHE_REMOVED_2026_05_29]  The per-line analyzer cache was
-        deleted: TCMM memory blocks are immutable, so a block is either a
-        block-cache HIT (already redacted, never re-analyzed) or BRAND NEW
-        (every line is new anyway → line caching bought nothing).  The
-        block-output cache (`_block_cache`) is the only layer that earns
-        its keep.  One analyze() per new block — simpler and correct.
+        Redaction caching happens one level up, keyed by live-memory-block
+        aid (`redact_memory_blocks`) — a block is either an aid-cache HIT
+        (never re-analyzed) or new (analyzed once).  This is just the raw
+        analyze.
 
         Fail-closed: a genuine analyzer failure raises RedactionUnavailable
         (unless built with fail_closed=False) — never silently "no PII".
@@ -332,37 +356,23 @@ class PIIRedactor:
         if not text or len(text.strip()) < 5:
             return text
         sid = self._coerce_sid(sid)
+        mk = self._memo_key(sid, text)
+        memoed = self._content_memo.get(mk)
+        if memoed is not None:
+            self._content_memo.move_to_end(mk)
+            return memoed
 
         try:
             results = self._analyze(text)
-            if not results:
-                return text
-
-            # Don't re-redact our own REF tokens.
-            results = [
-                r for r in results
-                if not text[r.start:r.end].startswith("REF_")
-            ]
-            if not results:
-                return text
-
-            # Replace end-to-start so later positions aren't shifted.
-            results.sort(key=lambda r: r.start, reverse=True)
-
-            redacted = text
-            for r in results:
-                original = text[r.start:r.end]
-                token = self.store.add_mapping(sid, r.entity_type, original)
-                redacted = redacted[:r.start] + token + redacted[r.end:]
-            # [PII_BATCH_WRITE_2026_05_29]  Persist all the tokens minted
-            # for this text in ONE Lance write (add_mapping buffered them)
-            # instead of one write per PII span.  Flush BEFORE returning
-            # so the mappings are committed well before rehydration (which
-            # happens in a later request after the LLM responds).
+            spans = [(r.entity_type, r.start, r.end) for r in results]
+            redacted = self._apply_spans(text, spans, sid)
+            # [PII_BATCH_WRITE_2026_05_29]  Persist all minted tokens in ONE
+            # Lance write (add_mapping buffered them) before returning.
             try:
                 self.store.flush()
             except Exception:
                 pass
+            self._memoize(mk, redacted)
             return redacted
 
         except RedactionUnavailable:
@@ -376,6 +386,91 @@ class PIIRedactor:
                     f"PII redaction failed: {type(e).__name__}: {e}"
                 ) from e
             return text
+
+    # ── Batched cold-path redaction (PII_WARM_BATCH_2026_05_30) ────────
+
+    def _memo_key(self, sid: SessionId, text: str) -> tuple:
+        r = sid.root()
+        h = hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=16).hexdigest()
+        return (r.tenant_id, r.conv_id, h)
+
+    def _memoize(self, key: tuple, value: str) -> None:
+        self._content_memo[key] = value
+        if len(self._content_memo) > self._content_memo_max:
+            self._content_memo.popitem(last=False)
+
+    def _apply_spans(self, text: str, spans, sid: SessionId) -> str:
+        """Substitute REF tokens for PII spans (entity_type, start, end) in
+        text-local coords.  Skips our own REF_ tokens; replaces end→start so
+        offsets don't shift; mints/reuses deterministic tokens.  Does NOT
+        flush (caller batches the Lance write)."""
+        spans = [s for s in spans if not text[s[1]:s[2]].startswith("REF_")]
+        if not spans:
+            return text
+        spans.sort(key=lambda s: s[1], reverse=True)
+        out = text
+        for (et, a, b) in spans:
+            token = self.store.add_mapping(sid, et, text[a:b])
+            out = out[:a] + token + out[b:]
+        return out
+
+    def warm_batch(self, texts, sid: Union[SessionId, str]) -> int:
+        """Redact MANY live-memory block texts in ONE Presidio pass and
+        memoize each (by raw text) so a later per-block redact_text() is a
+        cache hit.  This is THE cold-start fix: instead of N analyze() calls
+        (N × ~80ms fixed pipeline overhead), one analyze over the joined
+        texts, spans split back per block by offset.  Call this before
+        rendering with the live_blocks' raw texts.  Returns #blocks redacted.
+
+        Fail-closed: a Presidio failure raises RedactionUnavailable.
+        Determinism: produces byte-identical output to per-block redact_text
+        (same _apply_spans + deterministic token store); a hard separator
+        prevents cross-block span bleed.
+        """
+        sid = self._coerce_sid(sid)
+        todo, keys, seen = [], [], set()
+        for t in texts:
+            if not isinstance(t, str) or len(t.strip()) < 5:
+                continue
+            k = self._memo_key(sid, t)
+            if k in self._content_memo or k in seen:
+                continue
+            seen.add(k); todo.append(t); keys.append(k)
+        if not todo:
+            return 0
+        SEP = "\n\x1f\x1f\n"        # unit separators — never PII, hard boundary
+        ranges, pos = [], 0
+        for t in todo:
+            ranges.append((pos, pos + len(t)))
+            pos += len(t) + len(SEP)
+        results = self._analyze(SEP.join(todo))     # ONE analyze (fail-closed)
+        per = [[] for _ in todo]
+        for r in results:
+            for i, (a, b) in enumerate(ranges):
+                if a <= r.start < b:
+                    per[i].append((r.entity_type, r.start - a, min(r.end - a, b - a)))
+                    break
+        for i, t in enumerate(todo):
+            self._memoize(keys[i], self._apply_spans(t, per[i], sid))
+        try:
+            self.store.flush()
+        except Exception:
+            pass
+        return len(todo)
+
+    def warm(self) -> None:
+        """Prewarm spaCy's LARGE-document path at startup.  The first NER
+        pass over a big doc pays a one-time JIT/allocation tax (~2× a
+        steady-state analyze) — paying it here at boot means the first real
+        render doesn't.  Zero recall cost.  Host calls this once at startup
+        (alongside the existing small Presidio prewarm).  Best-effort."""
+        sample = ("Alice Johnson emailed alice.johnson@acme.co.za and called "
+                  "+27 21 555 0100 about ID 8001015009087 and card "
+                  "4111 1111 1111 1111 at the Cape Town branch on the 3rd. ") * 60
+        try:
+            self._analyze(sample)
+        except Exception as e:
+            logger.debug("[pii] large-doc warm skipped: %s", e)
 
     def rehydrate_text(self, text: str, sid: Union[SessionId, str]) -> str:
         # [PII_REHYDRATE_FASTPATH_2026_05_29]  No tokens → no work, no Lance.
@@ -397,101 +492,116 @@ class PIIRedactor:
             nb["text"] = new_text
         return nb
 
-    def _classify(self, blk: dict) -> str:
-        """CLEAN | FROZEN | VOLATILE for a text block.
-
-        Tier-2 (TCMM-emitted `_vg_*`) is authoritative when present;
-        Tier-1 falls back to provenance fingerprints + the block cache's
-        own self-validating hash (handled in redact_render_blocks).
+    def _is_block_clean(self, blk: dict) -> bool:
+        """True = immutable/static block that must NEVER be redacted:
+        preamble, tool schemas, boundary markers.  Identified by the
+        TCMM render tag `_vg_clean` / `_vg_pii=="clean"` / legacy
+        `_skip_pii`, or the magic-prefix fingerprint fallback.
         """
-        pii = blk.get("_vg_pii")
-        if pii == "clean":
-            return "CLEAN"
+        if blk.get("_vg_clean") is True or blk.get("_skip_pii") is True:
+            return True
+        if blk.get("_vg_pii") == "clean":
+            return True
         text = blk.get("text", "")
-        if isinstance(text, str) and self._is_clean(text):
-            return "CLEAN"
-        # FROZEN vs VOLATILE is decided by the cache (hash hit) in
-        # redact_render_blocks; the explicit `_vg_immutable` only biases
-        # logging.  Both go through the cache path safely.
-        return "FROZEN" if blk.get("_vg_immutable") else "VOLATILE"
+        return isinstance(text, str) and self._is_clean(text)
 
-    def redact_render_blocks(
+    def redact_memory_blocks(
         self, blocks: list[dict], sid: Union[SessionId, str]
     ) -> list[dict]:
-        """THE fast entry point for a TCMM-rendered system-block list.
+        """THE entry point for a TCMM-rendered system-block list.
 
-        Per block:
-          CLEAN     → emit verbatim (never scanned).  Provenance-anchored.
-          else      → block-output cache lookup by (sid, hash(text)).
-                      HIT  → replay redacted bytes (zero Presidio/Lance).
-                      MISS → redact_text (line-cache + memo + batch write),
-                             store, emit.
-        Strips `_skip_pii`/`_vg_*`.  Preserves cache_control + structure.
-        Non-text blocks pass through unchanged.
+        Redaction is keyed on the LIVE MEMORY BLOCK id (`_vg_aid` =
+        origin_archive_id), NOT on rendered or cache-marked bytes:
 
-        Fail-closed propagates from redact_text on a real analyzer failure.
+          clean (preamble/tools/markers)  → emit verbatim, never scanned.
+          has _vg_aid                     → aid-cache by (sid, aid):
+                                              HIT  → reuse redacted text
+                                                     (zero Presidio/Lance);
+                                              MISS → redact once, cache by aid.
+          no aid + not clean              → unknown live content: redact
+                                            every turn (fail-safe), never
+                                            cached on rendered bytes.
+
+        A live memory block keeps its aid as it migrates tiers, so it is
+        redacted exactly ONCE in its lifetime.  cache_control / marker churn
+        cannot cause a miss — the aid is the only key.
+
+        Strips `_vg_*` / `_skip_pii`.  Preserves cache_control + structure.
+        Non-text blocks pass through unchanged.  Fail-closed propagates from
+        redact_text on a real analyzer failure.
         """
         sid = self._coerce_sid(sid)
+        # [REDACT_IN_RENDER_2026_05_30]  Memory already redacted at render →
+        # strip wire metadata + pass through; do NOT re-scan.  (The latest
+        # prompt is redacted separately via redact_messages.)
+        if self._redact_in_render:
+            return [self._emit_block(b) if isinstance(b, dict) else b for b in blocks]
         out: list[dict] = []
         for blk in blocks:
-            if not isinstance(blk, dict):
-                out.append(blk)
-                continue
-            if blk.get("type") != "text":
+            if not isinstance(blk, dict) or blk.get("type") != "text":
                 out.append(blk)
                 continue
             text = blk.get("text", "")
             if not isinstance(text, str):
                 out.append(self._emit_block(blk))
                 continue
-            # Legacy sentinel: caller guaranteed PII-free.
-            if blk.get("_skip_pii") is True or self._classify(blk) == "CLEAN":
+            if self._is_block_clean(blk):
                 self._clean_skipped += 1
                 out.append(self._emit_block(blk))
                 continue
-            key = self._block_key(sid, text)
-            cached = self._block_cache.get(key)
-            if cached is not None:
-                self._block_hits += 1
-                self._block_cache.move_to_end(key)        # LRU touch
-                out.append(self._emit_block(blk, cached))
+            aid = blk.get("_vg_aid")
+            if aid is not None:
+                key = self._aid_key(sid, aid)
+                cached = self._aid_cache.get(key)
+                if cached is not None:
+                    self._aid_hits += 1
+                    self._aid_cache.move_to_end(key)          # LRU touch
+                    out.append(self._emit_block(blk, cached))
+                    continue
+                self._aid_misses += 1
+                redacted = self.redact_text(text, sid)
+                self._aid_cache[key] = redacted
+                if len(self._aid_cache) > self._aid_cache_max:
+                    self._aid_cache.popitem(last=False)       # evict LRU
+                out.append(self._emit_block(blk, redacted))
                 continue
-            self._block_misses += 1
-            redacted = self.redact_text(text, sid)
-            self._block_cache[key] = redacted
-            if len(self._block_cache) > self._block_cache_max:
-                self._block_cache.popitem(last=False)     # evict LRU
-            out.append(self._emit_block(blk, redacted))
+            # No aid + not clean → can't cache safely on a stable key.
+            # Redact every turn rather than risk keying on churning bytes.
+            self._uncached_redactions += 1
+            out.append(self._emit_block(blk, self.redact_text(text, sid)))
         self._log_block_stats()
         return out
 
+    # Back-compat alias — old callers said redact_render_blocks.
+    redact_render_blocks = redact_memory_blocks
+
     def _log_block_stats(self) -> None:
-        total = self._block_hits + self._block_misses
+        total = self._aid_hits + self._aid_misses
         if total and total % 50 == 0:
-            pct = self._block_hits / total * 100
+            pct = self._aid_hits / total * 100
             logger.info(
-                "[pii] block_cache hits=%d misses=%d (%.0f%%)  "
-                "clean_skipped=%d  size=%d/%d",
-                self._block_hits, self._block_misses, pct,
-                self._clean_skipped, len(self._block_cache),
-                self._block_cache_max,
+                "[pii] aid_cache hits=%d misses=%d (%.0f%%)  clean_skipped=%d  "
+                "uncached=%d  size=%d/%d",
+                self._aid_hits, self._aid_misses, pct, self._clean_skipped,
+                self._uncached_redactions, len(self._aid_cache), self._aid_cache_max,
             )
 
     def redact_blocks(self, blocks: list[dict], sid: Union[SessionId, str]) -> list[dict]:
-        """Redact each text block in place-shape, preserving structure.
-
-        Each block is a dict like:
-          {"type": "text", "text": "...", "cache_control": {...}}
-
-        ONLY the `.text` field is mutated.  Every other key — type,
-        cache_control, etc. — is copied through unchanged (metadata keys
-        stripped).  This is the cache-stability contract.
-
-        Non-text blocks (images, tool_use, tool_result) are returned
-        unchanged.  Delegates to redact_render_blocks so the block cache +
-        clean-skip apply here too.
+        """Redact MESSAGE-content block lists (no aids — these are live
+        conversation content, e.g. the latest user turn, redacted every
+        turn).  Only `.text` is mutated; non-text blocks pass through.
+        For SYSTEM/memory blocks use redact_memory_blocks (aid-keyed).
         """
-        return self.redact_render_blocks(blocks, sid)
+        sid = self._coerce_sid(sid)
+        out: list[dict] = []
+        for blk in blocks:
+            if not isinstance(blk, dict) or blk.get("type") != "text":
+                out.append(blk)
+                continue
+            text = blk.get("text", "")
+            new_text = self.redact_text(text, sid) if isinstance(text, str) else None
+            out.append(self._emit_block(blk, new_text))
+        return out
 
     def rehydrate_blocks(self, blocks: list[dict], sid: SessionId) -> list[dict]:
         """Reverse of redact_blocks.  Also rehydrates tool_use input args

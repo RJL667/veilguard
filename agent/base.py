@@ -401,6 +401,10 @@ class Agent(ABC):
                         conv_id=ctx.conversation_id,
                         user_id=ctx.user_id,
                         task_query=raw_user_msg,
+                        # [PII_SID_CONTRACT_2026_05_30]  Tell the render layer
+                        # the EXACT sid we'll rehydrate with, so render-time
+                        # redaction (when enabled) mints matching REF tokens.
+                        pii_sid=sid.canonical(),
                     )
                     raw_blocks = list(rendered.blocks)
                     _RENDER_CACHE[_rk] = (
@@ -554,7 +558,11 @@ class Agent(ABC):
         redactor = get_redactor()
         def _do_redact():
             return (
-                redactor.redact_blocks(raw_blocks, sid),
+                # [PII_AID_CACHE_2026_05_30] system = TCMM live-memory blocks
+                # → redact keyed by live-memory-block aid (_vg_aid), not by
+                # rendered/cache-marked bytes.  messages = latest prompt etc.
+                # → redacted every turn (no aid).
+                redactor.redact_memory_blocks(raw_blocks, sid),
                 redactor.redact_messages(messages, sid),
             )
         # [FAIL_CLOSED_2026_05_29]  The shared redactor refuses (raises

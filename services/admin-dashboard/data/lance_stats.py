@@ -92,7 +92,7 @@ def overview() -> dict[str, Any]:
         return out
 
     try:
-        names = list(db.table_names())
+        names = list(db.table_names(limit=100_000))  # default limit=10 truncates the list
     except Exception:
         try:
             names = list(db.list_tables())

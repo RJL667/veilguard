@@ -191,7 +191,7 @@ def migrate_table(db, table_name: str, embedder, batch_size: int, dry_run: bool)
                 "embed_secs": embed_secs, "rows_per_sec": len(df) / embed_secs}
 
     # Drop any leftover __migrating__ artefact from a previous interrupted run.
-    if new_table_name in db.table_names():
+    if new_table_name in db.table_names(limit=100_000):  # default limit=10 hides late tables
         log(f"  cleaning up stale {new_table_name} from prior interrupted run")
         db.drop_table(new_table_name)
 
@@ -244,7 +244,7 @@ def update_tcmm_meta(db, dry_run: bool):
         return
 
     table_name = "_tcmm_meta"
-    if table_name in db.table_names():
+    if table_name in db.table_names(limit=100_000):  # default limit=10 hides late tables
         log(f"  dropping existing {table_name} so fresh rows aren't duplicated")
         db.drop_table(table_name)
     db.create_table(table_name, rows, schema=meta_schema)
@@ -253,7 +253,7 @@ def update_tcmm_meta(db, dry_run: bool):
 
 def cleanup_backup_tables(db, dry_run: bool):
     """Drop all *_old_*d_* tables. Run only after the new embedder is validated."""
-    backups = [n for n in db.table_names() if "_old_" in n and "d_" in n]
+    backups = [n for n in db.table_names(limit=100_000) if "_old_" in n and "d_" in n]  # default limit=10 truncates
     if not backups:
         log("no backup tables to clean up")
         return
@@ -311,7 +311,7 @@ def main():
     log("")
 
     log("=== existing tables ===")
-    for n in sorted(db.table_names()):
+    for n in sorted(db.table_names(limit=100_000)):  # default limit=10 truncates
         try:
             log(f"  {n}: {db.open_table(n).count_rows():>10,} rows")
         except Exception as e:
@@ -321,7 +321,7 @@ def main():
     log("=== migrating ===")
     results = []
     for tbl in args.tables:
-        if tbl not in db.table_names():
+        if tbl not in db.table_names(limit=100_000):  # default limit=10 hides late tables
             log(f"  {tbl}: not in db, SKIP")
             continue
         results.append(migrate_table(db, tbl, embedder, args.batch_size, args.dry_run))

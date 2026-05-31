@@ -115,6 +115,27 @@ class SessionId:
                 return SessionId(self.tenant_id, parts[1])
         return self
 
+    # [PII_SID_CONTRACT_2026_05_30]  Unambiguous wire form so the render
+    # layer (which mints REF tokens) and the boundary (which rehydrates
+    # them) key on the IDENTICAL SessionId.  The boundary passes
+    # `sid.canonical()` in the /render request; the server does
+    # `set_redact_sid(SessionId.parse(...))`; the boundary rehydrates with
+    # the same `sid`.  No re-derivation from (user_id, conv_id) → no drift.
+    _CANON_SEP = "\x1f"     # unit separator — never appears in ids
+
+    def canonical(self) -> str:
+        return f"{self.tenant_id}{self._CANON_SEP}{self.conv_id}"
+
+    @classmethod
+    def parse(cls, s: str) -> "SessionId":
+        """Inverse of canonical().  A bare string with no separator is
+        treated as a conv_id under the legacy `_proxy` tenant (matches
+        PIIRedactor._coerce_sid), so older callers still resolve."""
+        if s and cls._CANON_SEP in s:
+            tenant, conv = s.split(cls._CANON_SEP, 1)
+            return cls(tenant, conv)
+        return cls("_proxy", s or "pii-default")
+
 
 # ── Lance store ─────────────────────────────────────────────────────────
 
@@ -142,12 +163,23 @@ class PIISessionStore:
         )
         Path(path).mkdir(parents=True, exist_ok=True)
         self._db = lancedb.connect(path)
-        if _TABLE_NAME not in self._db.table_names():
-            # Create empty table with schema.
-            empty = pa.Table.from_pylist([], schema=_SCHEMA)
-            self._db.create_table(_TABLE_NAME, empty, mode="overwrite")
-            logger.info(f"[pii] created {_TABLE_NAME} at {path}")
-        self._tbl = self._db.open_table(_TABLE_NAME)
+        # [PII_PERSIST_FIX_2026_05_31]  Do NOT pre-create an EMPTY table —
+        # create the table lazily WITH data on the first flush() so it
+        # commits real rows to disk; here we just OPEN it if a prior process
+        # already persisted it (else None → reads return empty until the
+        # first write).
+        #
+        # ROOT CAUSE of the original cross-process rehydration miss: the old
+        # code gated existence on `_TABLE_NAME in self._db.table_names()`.
+        # Existence is instead decided by TRYING to open the table, NEVER via
+        # open the table, NEVER via `_TABLE_NAME in self._db.table_names()`.
+        # lancedb 0.30.x `table_names()` defaults to limit=10 and returns
+        # names alphabetically — with >10 sibling tables in this DB,
+        # `pii_session_mapping` sorts PAST the first page and is invisible to
+        # a membership check even though it exists on disk.  That false
+        # "missing" verdict is the whole bug: reads returned empty and the
+        # write path overwrote real rows.  open_table is authoritative.
+        self._tbl = self._open_existing()
         # [PII_MEMO_2026_05_29]  Process-level memo for (sid, entity, value)
         # → ref_token.  add_mapping previously ran a Lance .search() on
         # EVERY PII span — including the "already mapped?" fast-path check.
@@ -178,7 +210,8 @@ class PIISessionStore:
         # already present and freshens it when row count has grown.
         # Cost is ~200ms per column on a small table, scaling with
         # row count — well under the 2s/turn budget even at 100M rows.
-        self._ensure_indexes()
+        if self._tbl is not None:
+            self._ensure_indexes()
 
     # ── Index maintenance ─────────────────────────────────────────────────
 
@@ -224,6 +257,10 @@ class PIISessionStore:
         Returns a stats dict for logging / dashboard display.
         """
         stats: dict = {}
+        if self._get_tbl() is None:
+            # Table not created yet (no PII ever redacted) → nothing to do.
+            stats["skipped"] = "no_table"
+            return stats
         t0 = time.time()
         self._ensure_indexes()
         stats["index_refresh_ms"] = int((time.time() - t0) * 1000)
@@ -245,15 +282,62 @@ class PIISessionStore:
 
     # ── Lookup ────────────────────────────────────────────────────────
 
+    def _open_existing(self):
+        """Open the mapping table if it exists, else None.
+
+        AUTHORITATIVE existence check: try to open and treat any failure as
+        'not present'.  Must NOT use `_TABLE_NAME in self._db.table_names()`
+        — lancedb 0.30.x table_names() is paginated (default limit=10) and
+        alphabetical, so a table sorting past the first page is silently
+        absent from the membership test even though it exists on disk.  That
+        false-missing verdict is the root cause of the cross-process
+        rehydration miss AND of an overwrite that wiped real mappings.
+        """
+        try:
+            return self._db.open_table(_TABLE_NAME)
+        except Exception:
+            return None
+
+    def _get_tbl(self):
+        """[PII_PERSIST_FIX_2026_05_31]  Return the live table handle,
+        REFRESHED so writes from OTHER processes (e.g. the host TCMM
+        render-side redactor) are visible to this reader.  Returns None ONLY
+        when the table genuinely does not exist yet.  Without the
+        checkout_latest()/re-open a reader's handle is pinned to the version
+        it opened and never sees cross-process tokens.
+        """
+        try:
+            if self._tbl is None:
+                self._tbl = self._open_existing()
+                if self._tbl is None:
+                    return None
+                try:
+                    self._ensure_indexes()
+                except Exception:
+                    pass
+                return self._tbl
+            try:
+                self._tbl.checkout_latest()
+            except Exception:
+                reopened = self._open_existing()
+                if reopened is not None:
+                    self._tbl = reopened
+            return self._tbl
+        except Exception:
+            return None
+
     def _query_token(
         self, sid: SessionId, entity_type: str, original_lc: str
     ) -> Optional[str]:
         """Return existing ref_token for this PII, or None."""
+        tbl = self._get_tbl()
+        if tbl is None:
+            return None
         sid_root = sid.root()
         # Lance where supports == with string literals; escape single quotes.
         oq = original_lc.replace("'", "''")
         arr = (
-            self._tbl.search()
+            tbl.search()
             .where(
                 f"tenant_id = '{sid_root.tenant_id}' "
                 f"AND conv_id = '{sid_root.conv_id}' "
@@ -268,9 +352,12 @@ class PIISessionStore:
 
     def _next_counter(self, sid: SessionId, entity_type: str) -> int:
         """Return the next counter for this (sid, entity_type)."""
+        tbl = self._get_tbl()
+        if tbl is None:
+            return 1
         sid_root = sid.root()
         arr = (
-            self._tbl.search()
+            tbl.search()
             .where(
                 f"tenant_id = '{sid_root.tenant_id}' "
                 f"AND conv_id = '{sid_root.conv_id}' "
@@ -285,9 +372,12 @@ class PIISessionStore:
 
     def _rehydrate_map(self, sid: SessionId) -> dict[str, str]:
         """All token→original mappings for this session."""
+        tbl = self._get_tbl()
+        if tbl is None:
+            return {}
         sid_root = sid.root()
         arr = (
-            self._tbl.search()
+            tbl.search()
             .where(
                 f"tenant_id = '{sid_root.tenant_id}' "
                 f"AND conv_id = '{sid_root.conv_id}'"
@@ -392,7 +482,38 @@ class PIISessionStore:
             rows = self._pending_rows
             self._pending_rows = []
             try:
-                self._tbl.add(pa.Table.from_pylist(rows, schema=_SCHEMA))
+                arrow = pa.Table.from_pylist(rows, schema=_SCHEMA)
+                # [PII_PERSIST_FIX_2026_05_31]  Create the table WITH data the
+                # FIRST time so it durably commits to disk and becomes visible
+                # to other processes (an empty create_table never persists —
+                # see __init__).  Append on every later flush.
+                #
+                # Resolve the handle through _get_tbl() (open_table-based, so
+                # it sees the table even when our own self._tbl is still None
+                # or table_names() can't page to it).  Create only when the
+                # table genuinely cannot be opened.
+                #
+                # mode="create" (NOT "overwrite"): if existence detection is
+                # ever wrong (a race, a stale handle), create raises
+                # "already exists" and we fall back to append.  We must NEVER
+                # overwrite — that destroys every prior session's REF
+                # mappings, which is exactly what the table_names() bug did.
+                tbl = self._get_tbl()
+                if tbl is None:
+                    try:
+                        self._tbl = self._db.create_table(_TABLE_NAME, arrow)
+                    except Exception:
+                        # Lost the create race / mis-detected: append instead.
+                        self._tbl = self._open_existing()
+                        if self._tbl is None:
+                            raise
+                        self._tbl.add(arrow)
+                    try:
+                        self._ensure_indexes()
+                    except Exception:
+                        pass
+                else:
+                    tbl.add(arrow)
                 return len(rows)
             except Exception as e:
                 logger.error(f"[pii] session-store flush failed ({len(rows)} rows): {e}")

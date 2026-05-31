@@ -80,7 +80,7 @@ def main():
 
     # Embeddings table (if present) — dense retrieval hits this too.
     for table_name in ("embeddings", "sparse_archive"):
-        if table_name not in db.table_names():
+        if table_name not in db.table_names(limit=100_000):  # default limit=10 hides sparse_archive
             continue
         tt = db.open_table(table_name)
         print(f"\n{table_name} rows: {tt.count_rows()}")
@@ -92,7 +92,7 @@ def main():
                 print(f"  skip scalar {col}: {e}")
 
     print("\n=== final state ===")
-    for name in db.table_names():
+    for name in db.table_names(limit=100_000):  # default limit=10 truncates
         try:
             tbl = db.open_table(name)
             idx = tbl.list_indices()

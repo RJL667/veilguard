@@ -33,7 +33,7 @@ body = {
         {"type": "text",
          "text": "--- MEMORY ---\nContact: Bob Jones, bob@acme.com, +27 21 555 0100",
          "cache_control": {"type": "ephemeral", "ttl": "1h"},
-         "_vg_id": "frag:7", "_vg_immutable": True, "_skip_pii": False},
+         "_vg_aid": 7, "_vg_stability": "byte_stable"},
     ],
     "messages": [
         {"role": "user", "content": "Call Carol Wang on 0821234567 please."},
@@ -49,11 +49,14 @@ check("2d _vg_*/_skip_pii stripped before wire", not any(k.startswith("_vg") or 
 check("2e user message redacted", "REF_" in red["messages"][0]["content"])
 check("2f assistant message NOT re-redacted (verbatim)", red["messages"][1]["content"] == body["messages"][1]["content"])
 
-# 3. FROZEN block cache: redact same body again → byte-identical + a cache hit.
-hits_before = r._block_hits
-red2 = r.redact_json(body, sid)
-check("3a second pass byte-identical (deterministic)", json.dumps(red2["system"]) == json.dumps(red["system"]))
-check("3b block cache registered a hit", r._block_hits > hits_before)
+# 3. AID cache: redact same body again → byte-identical + an aid-cache hit.
+hits_before = r._aid_hits
+# also flip the cache marker to prove the aid key ignores marker churn
+body2 = json.loads(json.dumps(body)); body2["system"][1]["cache_control"]["ttl"] = "5m"
+red2 = r.redact_json(body2, sid)
+check("3a second pass redaction byte-identical (deterministic)",
+      red2["system"][1]["text"] == red["system"][1]["text"])
+check("3b aid cache hit despite cache-marker flip", r._aid_hits > hits_before)
 
 # 4. Rehydrate round-trips the memory block.
 rehydrated = r.rehydrate_text(sysblocks[1]["text"], sid)

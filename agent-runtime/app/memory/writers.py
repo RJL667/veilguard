@@ -144,7 +144,7 @@ def record_heartbeat(
     worker_id: str,
     tenant_id: str,
     user_id: str,
-    lease_ttl_s: float = 300.0,
+    lease_ttl_s: float | None = None,
 ) -> str:
     """Phase 6.3 — write one heartbeat row.
 
@@ -153,11 +153,25 @@ def record_heartbeat(
     most-recent row per task_id, and auto-reclaims tasks whose
     `now - last_beat_at > lease_ttl_s` with an audit comment.
 
+    [HEARTBEAT_TTL_TRACKS_LEASE_2026_05_29]  The staleness threshold MUST
+    track the dispatch lease (VEILGUARD_LEASE_DURATION_S).  Previously it
+    was a hardcoded 300s while the lease was env-bumped to 1200s on slow
+    envs — so a dispatch whose cold first turn (model load + cold
+    redaction + a contended LLM call) ran >300s between turn-events got
+    reclaimed mid-work, cancelling live IC tasks (caught live 2026-05-29:
+    C1 analyses force-cancelled at ~300s despite a 1200s lease).  Default
+    now reads the same env so the two stay consistent.
+
     Returns the heartbeat row id.
     """
     if not (task_id and worker_id and tenant_id and user_id):
         raise WriterError(
             "record_heartbeat requires task_id/worker_id/tenant_id/user_id"
+        )
+    if lease_ttl_s is None:
+        import os
+        lease_ttl_s = float(
+            os.environ.get("VEILGUARD_LEASE_DURATION_S", "300")
         )
     from ..ledger.store import LedgerStore  # sanctioned
     import uuid

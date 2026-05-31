@@ -976,7 +976,11 @@ async def startup():
                 "sparse_archive": [("namespace", "scalar"), ("user_id", "scalar"), ("text", "fts")],
                 "embeddings":     [("namespace", "scalar"), ("user_id", "scalar"), ("aid", "scalar")],
             }
-            _existing_tables = set(_db.table_names())
+            # limit=100_000: lancedb table_names() DEFAULTS to limit=10 and
+            # returns names alphabetically — with >10 tables, late-sorting
+            # names like `sparse_archive` fall off page 1 and their indexes
+            # would be silently skipped below (the recurring "FTS pending").
+            _existing_tables = set(_db.table_names(limit=100_000))
             _created = []
             _missing = []
             for _tname, _specs in _idx_specs.items():
@@ -1871,6 +1875,77 @@ async def generate(body: GenerateBody):
     }
 
 
+# [RENDER_PII_HOOK_2026_05_30]  In-render PII redaction.  TCMM's renderer
+# exposes a host hook (core.renderers.base_renderer.set_pii_hook) that it
+# calls per-fragment during projection (policy.redact).  Wiring it here lets
+# each LIVE MEMORY FRAGMENT be redacted ONCE, cached by its (sid, text) —
+# fragment text is byte-stable so this never churns — instead of the
+# agent-runtime re-scanning the whole bundled tier blocks every turn.
+#   - Tokens are minted under SessionId(user_id, conv_id) so they match the
+#     agent-runtime side (base.py:308 SessionId(tenant_id, conv_id); for this
+#     platform tenant_id == user_id) → rehydration stays consistent.
+#   - Gated behind VEILGUARD_RENDER_PII_HOOK (default OFF) so this is INERT
+#     until explicitly enabled; the agent-runtime VEILGUARD_REDACT_IN_RENDER
+#     flag then flips it from double-redact (safe) to pass-through (the win).
+_RENDER_PII_HOOK_STATE = {"ready": False, "enabled": None}
+
+
+def _ensure_render_pii_hook() -> bool:
+    """Lazily wire the per-fragment redaction hook once.  Returns True iff a
+    hook is active.  Safe to call on every request (cheap after first)."""
+    st = _RENDER_PII_HOOK_STATE
+    if st["enabled"] is None:
+        st["enabled"] = _os_env_flag("VEILGUARD_RENDER_PII_HOOK", "0")
+    if not st["enabled"]:
+        return False
+    if st["ready"]:
+        return True
+    try:
+        import sys as _sys, os as _os2, hashlib as _hl
+        from collections import OrderedDict as _OD
+        _root = _os2.path.dirname(_os2.path.dirname(_os2.path.dirname(
+            _os2.path.abspath(__file__))))   # …/veilguard
+        if _root not in _sys.path:
+            _sys.path.insert(0, _root)
+        from pii import get_redactor as _get_red          # noqa
+        from core.renderers.base_renderer import set_pii_hook as _set_hook
+        _red = _get_red()
+        _cache: "OrderedDict" = _OD()
+        _MAX = int(_os2.environ.get("VEILGUARD_RENDER_PII_CACHE_MAX", "16384"))
+
+        def _hook(text, sid):
+            # Per-fragment output cache keyed on (session root, text hash).
+            try:
+                root = sid.root() if hasattr(sid, "root") else str(sid)
+                key = (root, _hl.blake2b(
+                    text.encode("utf-8", "replace"), digest_size=16).hexdigest())
+            except Exception:
+                return _red.redact_text(text, sid)
+            hit = _cache.get(key)
+            if hit is not None:
+                _cache.move_to_end(key)
+                return hit
+            out = _red.redact_text(text, sid)
+            _cache[key] = out
+            if len(_cache) > _MAX:
+                _cache.popitem(last=False)
+            return out
+
+        _set_hook(_hook)
+        st["ready"] = True
+        logger.info("[render-pii] in-render redaction hook WIRED (per-fragment, cached)")
+        return True
+    except Exception as e:
+        logger.warning(f"[render-pii] hook wiring failed (render stays raw): {e}")
+        st["enabled"] = False
+        return False
+
+
+def _os_env_flag(name: str, default: str) -> bool:
+    import os as _o
+    return _o.environ.get(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
 @app.post("/render_structured")
 async def render_structured(body: RenderBody):
     """Structured render — returns the full layout + cache-ready blocks
@@ -1926,11 +2001,34 @@ async def render_structured(body: RenderBody):
         from core.recall.scope import scope_context as _scope_context
     except Exception:
         _scope_context = None
-    if _scope_context is not None and _scope in ("user", "session", "namespace"):
-        with _scope_context(_scope):
+    # [RENDER_PII_HOOK_2026_05_30] Set the per-request session id so the
+    # renderer's per-fragment policy.redact mints tokens under the SAME sid
+    # the agent-runtime uses (SessionId(tenant_id, conv_id); tenant==user
+    # here) → rehydration stays consistent.  No-op when the hook is disabled.
+    _redact_tok = None
+    if _ensure_render_pii_hook():
+        try:
+            from core.renderers.base_renderer import set_redact_sid as _set_sid
+            from pii.session_store import SessionId as _SID
+            _redact_tok = _set_sid(
+                _SID(tenant_id=body.user_id or "", conv_id=body.conversation_id or "")
+            )
+        except Exception as _e:
+            logger.warning(f"[render-pii] set_redact_sid failed: {_e}")
+            _redact_tok = None
+    try:
+        if _scope_context is not None and _scope in ("user", "session", "namespace"):
+            with _scope_context(_scope):
+                result = renderer.render_structured(body.task_query)
+        else:
             result = renderer.render_structured(body.task_query)
-    else:
-        result = renderer.render_structured(body.task_query)
+    finally:
+        if _redact_tok is not None:
+            try:
+                from core.renderers.base_renderer import reset_redact_sid as _reset_sid
+                _reset_sid(_redact_tok)
+            except Exception:
+                pass
     return {
         "status": "ok",
         "format": "anthropic-structured" if model in ("anthropic", "claude") else f"{model}-structured",

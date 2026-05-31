@@ -20,10 +20,22 @@ Landed:
   and routes the top-level Anthropic `system` block list through
   `redact_render_blocks`. `base.py` `redact_blocks`/`redact_messages` already
   resolve to the same engine.
-- **FROZEN block-output cache** — `_block_cache` keyed by `(tenant, conv,
-  blake2b(text))` → redacted bytes; warm byte-stable blocks replay with zero
-  Presidio/Lance. `redact_blocks` delegates to `redact_render_blocks` so BOTH
-  paths get it.
+- **AID-keyed redaction cache (2026-05-30, supersedes the content-hash cache)**
+  — `_aid_cache` keyed by `(sid.root, aid)` where `aid` = the live-memory-block
+  `origin_archive_id`, surfaced on each rendered block as `_vg_aid`.
+  **Rationale (user correction):** the redaction must run on the *live memory
+  blocks*, NOT the rendered/cache-marked output. Cache markers (`cache_control`
+  ttl, breakpoint placement, re-bundling) churn turn-to-turn, so any key derived
+  from rendered bytes false-misses constantly. A live memory block keeps its
+  `aid` across tier migration → redact ONCE, ever. `redact_memory_blocks` is the
+  entry point (system blocks); `redact_blocks` is the no-cache path for message
+  content (latest prompt, redacted every turn). Immutable blocks (preamble, tool
+  schema, boundary markers) carry `_vg_clean` → never scanned. A block with no
+  `aid` and not clean → redacted every turn (fail-safe, never keyed on bytes).
+  Proven (`_bench_aid_redaction.py`): +1 miss/turn (only the new block), carried
+  aids all hit, and **flipping cache_control every turn causes ZERO extra
+  misses**. **REQUIRES** TCMM's renderer to emit `_vg_aid` + `_vg_clean` per
+  block (pending — until then the boundary sees no aids and redacts every turn).
 - **Line cache REMOVED (2026-05-29)** — the per-line delta analyzer
   (`_analyze_cached`/`_line_spans`) was deleted. Rationale: TCMM memory blocks
   are immutable, so a block is either a block-cache HIT (never re-analyzed) or

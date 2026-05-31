@@ -59,7 +59,7 @@ SCHEMA = pa.schema([
 
 def _open_or_create():
     db = lancedb.connect(DB_DIR)
-    if TABLE not in db.table_names():
+    if TABLE not in db.table_names(limit=100_000):  # default limit=10 hides late tables
         # Empty table with the schema. Lance happily creates a 0-row
         # table from an Arrow Table that has no rows.
         empty = pa.Table.from_pylist([], schema=SCHEMA)
