@@ -264,6 +264,7 @@ async def run_agent_query(
     team_id: Optional[str] = None,
     backend_name: Optional[str] = None,
     max_turns: Optional[int] = None,
+    client_tools: Optional[list[dict[str, Any]]] = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield SSE-shaped event dicts as the agent runs.
 
@@ -354,6 +355,21 @@ async def run_agent_query(
             persona_tool_schemas = _build_tool_schemas(list(persona.tools))
 
         allowed_tools = list(persona.tools)
+        # [CLIENT_TOOLS_MERGE_2026_05_31] Merge LibreChat's client/MCP tools
+        # (web/shell/fs/client) so the persona (e.g. Director) advertises +
+        # can call them.  Dispatch routes via tool_dispatcher Path 2 (the
+        # sub-agents + client-daemon WS bridge).  Persona tools win on a
+        # name collision; the schemas are attached to the agent below so its
+        # tools() includes them.
+        _client_tool_schemas: list[dict] = []
+        for _ct in (client_tools or []):
+            if not isinstance(_ct, dict):
+                continue
+            _nm = _ct.get("name")
+            if not _nm or _nm in allowed_tools:
+                continue
+            allowed_tools.append(_nm)
+            _client_tool_schemas.append(_ct)
 
         # ── Emit run_start ──────────────────────────────────────────────
         run_id = uuid.uuid4().hex[:12]
@@ -381,6 +397,9 @@ async def run_agent_query(
             from agent import events as _agent_events
             AgentCls = agent_for(persona)
             live_agent = AgentCls(persona)
+            # [CLIENT_TOOLS_MERGE_2026_05_31] hand the merged client tool
+            # schemas to the agent so its tools() advertises them to the LLM.
+            live_agent._client_tool_schemas = list(_client_tool_schemas)
             agent_ctx = TurnContext(
                 conversation_id=conversation_id,
                 user_id=user_id,

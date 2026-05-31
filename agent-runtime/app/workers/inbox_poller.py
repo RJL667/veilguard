@@ -46,6 +46,29 @@ logger = logging.getLogger("agent-runtime.workers.inbox_poller")
 # ── Configuration ───────────────────────────────────────────────────────
 
 POLL_INTERVAL_S = 5.0
+
+# [LEDGER_AUTO_COMPACT_2026_05_31] The poller scans agent_task_heartbeats /
+# agent_tasks / task_proposals / task_comments every cycle. Each row write
+# (especially heartbeats — one per worker per beat) appends a Lance fragment;
+# left unchecked these tables reach 1000s of fragments and a single
+# `.to_arrow()` scan blocks the event loop for 2-3s, which QUEUES inbound
+# /agent/query requests behind it (measured 2026-05-31: warm chat turns
+# ballooned from ~2s to 4-5s purely from this contention, even though the
+# Anthropic call + render + redact were all fast). Mirror TCMM's
+# semantic_polling_worker `_maybe_compact`: every interval, ONE pass of
+# compact_files()+cleanup_old_versions() per table, run in a thread so it
+# never blocks the loop. Disable with AGENT_LEDGER_AUTO_COMPACT=0.
+_LEDGER_AUTO_COMPACT = os.environ.get("AGENT_LEDGER_AUTO_COMPACT", "1") != "0"
+_LEDGER_COMPACT_INTERVAL_S = float(
+    os.environ.get("AGENT_LEDGER_COMPACT_INTERVAL_S", "300")
+)
+_LEDGER_COMPACT_TABLES = (
+    "agent_task_heartbeats",
+    "agent_tasks",
+    "task_proposals",
+    "task_comments",
+)
+
 # [DISPATCH_TIMING_ENV_2026_05_29] Both the lease and the dispatch timeout
 # are env-tunable. The prod defaults (lease 300s / timeout 270s) assume fast
 # Lance; the local Windows bind-mount runs Lance ~10x slower, so a single
@@ -141,6 +164,7 @@ class InboxPoller:
         self._in_flight_by_persona: dict[str, int] = {}  # Phase 6.2 — per-persona counter
         self._claimed_history: set[str] = set()  # all task_ids ever claimed (telemetry)
         self._startup_sweep_done = False       # F2 — gate the one-shot orphan sweep
+        self._last_ledger_compact_ts = 0.0     # [LEDGER_AUTO_COMPACT_2026_05_31]
 
     def _can_claim_for_persona(self, persona: str) -> bool:
         """Phase 6.2 — per-persona cap check.  Returns True iff there's
@@ -201,6 +225,15 @@ class InboxPoller:
                     except Exception as e:
                         logger.debug(
                             f"[inbox_poller] heartbeat sweep error: {e}"
+                        )
+                    # [LEDGER_AUTO_COMPACT_2026_05_31] Keep the ledger tables
+                    # de-fragmented so the per-cycle scans above stay sub-second
+                    # and never block the event loop / queue chat requests.
+                    try:
+                        await self._maybe_compact_ledger_tables()
+                    except Exception as e:
+                        logger.debug(
+                            f"[inbox_poller] ledger compaction error: {e}"
                         )
                     await self._poll_once()
                 except Exception as e:
@@ -297,6 +330,65 @@ class InboxPoller:
             except Exception as e:
                 logger.exception(
                     f"[inbox_poller] sweep: failed to cancel {tid}: {e}"
+                )
+
+    async def _maybe_compact_ledger_tables(self) -> None:
+        """Periodically de-fragment the ledger tables this poller scans.
+
+        Every ``_LEDGER_COMPACT_INTERVAL_S`` (default 5min), run one
+        ``compact_files()`` + ``cleanup_old_versions()`` pass per table.
+        Row-per-write growth (heartbeats especially) otherwise drives the
+        fragment count into the thousands, at which point the per-cycle
+        ``.to_arrow()`` scans in ``_sweep_stale_heartbeats`` / ``_poll_once``
+        take seconds and block the event loop — directly inflating chat-turn
+        latency (measured 2026-05-31). The compaction itself runs in a worker
+        thread via ``asyncio.to_thread`` so even a slow pass never stalls the
+        loop. Online + MVCC-safe (Lance handles concurrent readers/writers;
+        a lost commit race just retries next interval). Cheap no-op between
+        intervals: one timestamp compare.
+        """
+        if not _LEDGER_AUTO_COMPACT:
+            return
+        now = time.time()
+        if now - self._last_ledger_compact_ts < _LEDGER_COMPACT_INTERVAL_S:
+            return
+        self._last_ledger_compact_ts = now
+        await asyncio.to_thread(self._compact_ledger_tables_sync)
+
+    def _compact_ledger_tables_sync(self) -> None:
+        """Blocking compaction body — always called inside a thread.
+
+        Uses lancedb's native ``Table.optimize(cleanup_older_than=...)``
+        which compacts fragments AND prunes superseded versions in one call,
+        with NO pylance dependency (the agent-runtime image ships lancedb but
+        not pylance, so the lower-level ``to_lance().optimize.compact_files()``
+        path raises ImportError here — verified 2026-05-31).
+        """
+        try:
+            store = LedgerStore.get(str(LEDGER_DB_PATH))
+        except Exception:
+            return
+        import datetime as _dt
+        for tname in _LEDGER_COMPACT_TABLES:
+            try:
+                tbl = store._db.open_table(tname)
+            except Exception:
+                continue  # table not created yet — nothing to compact
+            try:
+                t0 = time.time()
+                # Aggressive retention (0s) is safe — we don't use Lance
+                # time-travel on the ledger tables.
+                tbl.optimize(cleanup_older_than=_dt.timedelta(seconds=0))
+                logger.info(
+                    "[inbox_poller] auto-compacted %s in %.2fs",
+                    tname, time.time() - t0,
+                )
+            except Exception as e:
+                # Commit race against an active writer ("Retryable commit
+                # conflict") — fine, retry next interval. Never let it kill
+                # the poll loop.
+                logger.debug(
+                    "[inbox_poller] compact %s skipped: %s", tname, e
                 )
 
     async def _sweep_stale_heartbeats(self) -> None:

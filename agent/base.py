@@ -397,15 +397,20 @@ class Agent(ABC):
                         "+ re-redact of memory prefix)", _rk[0]
                     )
                 else:
-                    rendered = await render_structured(
+                    # [PII_SID_CONTRACT_2026_05_30]  Tell the render layer the
+                    # EXACT sid we'll rehydrate with, so render-time redaction
+                    # (when enabled) mints matching REF tokens.  Tolerate a
+                    # stale tcmm_client without the pii_sid param (partial
+                    # reload / skew) — fall back to the un-tagged call.
+                    _render_kwargs = dict(
                         conv_id=ctx.conversation_id,
                         user_id=ctx.user_id,
                         task_query=raw_user_msg,
-                        # [PII_SID_CONTRACT_2026_05_30]  Tell the render layer
-                        # the EXACT sid we'll rehydrate with, so render-time
-                        # redaction (when enabled) mints matching REF tokens.
-                        pii_sid=sid.canonical(),
                     )
+                    try:
+                        rendered = await render_structured(**_render_kwargs, pii_sid=sid.canonical())
+                    except TypeError:
+                        rendered = await render_structured(**_render_kwargs)
                     raw_blocks = list(rendered.blocks)
                     _RENDER_CACHE[_rk] = (
                         list(raw_blocks), _t.time() + _RENDER_CACHE_TTL_S
@@ -856,6 +861,15 @@ class Agent(ABC):
             if t in by_name and t not in seen:
                 out.append(by_name[t])
                 seen.add(t)
+        # [CLIENT_TOOLS_MERGE_2026_05_31] Append client/MCP tool schemas
+        # injected by run_agent_query (forwarded from LibreChat) so this
+        # agent advertises them to the LLM alongside its persona tools.
+        # Persona tools (added above) win on a name collision.
+        for _ct in (getattr(self, "_client_tool_schemas", None) or []):
+            _nm = _ct.get("name") if isinstance(_ct, dict) else None
+            if _nm and _nm not in seen:
+                out.append(_ct)
+                seen.add(_nm)
         return out
 
 

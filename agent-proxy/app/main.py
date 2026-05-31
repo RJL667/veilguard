@@ -3432,6 +3432,10 @@ async def _handle_agent_runtime_request(
         "agent_id": agent_id,
         "messages": data.get("messages", []),
         "stream": stream,
+        # [CLIENT_TOOLS_MERGE_2026_05_31] Forward LibreChat's client/MCP tool
+        # schemas so the agent-runtime persona can MERGE them with its own
+        # tools (web/shell/fs/client dispatch via tool_dispatcher Path 2).
+        "tools": data.get("tools") or [],
     }
 
     timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)

@@ -1974,6 +1974,7 @@ async def agent_query(req: Request) -> StreamingResponse:
                     messages=body["messages"],
                     registry=_persona_registry,
                     constitution=_constitution,
+                    client_tools=body.get("tools") or [],
                 ):
                     if not isinstance(ev, dict):
                         continue
@@ -1993,6 +1994,8 @@ async def agent_query(req: Request) -> StreamingResponse:
         )
 
     # Non-streaming fallback (for tests, debugging) — collect into list.
+    import time as _qt
+    _q0 = _qt.perf_counter(); _q_rs = _q_re = None
     events = []
     async for ev in run_agent_query(
         persona=persona,
@@ -2002,6 +2005,19 @@ async def agent_query(req: Request) -> StreamingResponse:
         messages=body["messages"],
         registry=_persona_registry,
         constitution=_constitution,
+        client_tools=body.get("tools") or [],
     ):
+        if isinstance(ev, dict):
+            if ev.get("type") == "run_start" and _q_rs is None:
+                _q_rs = _qt.perf_counter()
+            elif ev.get("type") == "run_end":
+                _q_re = _qt.perf_counter()
         events.append(ev)
+    _q_end = _qt.perf_counter()
+    _ms = lambda a, b: (b - a) * 1000 if (a is not None and b is not None) else -1
+    logger.info(
+        "[QUERY-PERF] entry->run_start=%.0fms run_start->run_end=%.0fms "
+        "run_end->return=%.0fms total=%.0fms",
+        _ms(_q0, _q_rs), _ms(_q_rs, _q_re), _ms(_q_re, _q_end), _ms(_q0, _q_end),
+    )
     return JSONResponse({"events": events})

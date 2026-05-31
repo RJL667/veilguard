@@ -173,6 +173,9 @@ services:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - TCMM_ENABLED=${TCMM_ENABLED:-true}
       - TCMM_URL=${TCMM_URL:-http://host.docker.internal:8811}
+      # [PII_RENDER_REDACT_2026_05_30] memory redacted at render → boundary
+      # skips re-scanning system blocks (only redacts the latest prompt).
+      - VEILGUARD_REDACT_IN_RENDER=${VEILGUARD_REDACT_IN_RENDER:-1}
       - SUB_AGENTS_URL=${SUB_AGENTS_URL:-http://host.docker.internal:8809}
       - VEILGUARD_INTERNAL_SECRET=${VEILGUARD_INTERNAL_SECRET:-}
       - AGENTS_DIR=/app/agents
@@ -324,6 +327,8 @@ services:
       - MIN_SCORE=${MIN_SCORE:-0.7}
       - TCMM_ENABLED=${TCMM_ENABLED:-false}
       - TCMM_URL=${TCMM_URL:-http://host.docker.internal:8811}
+      # [PII_RENDER_REDACT_2026_05_30] skip re-redacting pre-redacted memory.
+      - VEILGUARD_REDACT_IN_RENDER=${VEILGUARD_REDACT_IN_RENDER:-1}
       # Where audit_db.py writes the pii_audit table.  Must be the
       # same Lance directory TCMM opens on the host so rows live next
       # to archive / sparse / dream data.

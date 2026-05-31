@@ -1573,6 +1573,10 @@ class RenderBody(BaseModel):
     conversation_id: str = ""
     user_id: str = ""
     tool_schemas: Optional[List[Any]] = None
+    # [PII_SID_CONTRACT_2026_05_30] caller SessionId.canonical(); used by the
+    # render-layer redaction hook (set_redact_sid) when enabled. Accepted +
+    # harmless when the hook is off.
+    pii_sid: str = ""
 
 
 @app.post("/pin/system_prompt")
@@ -1965,7 +1969,9 @@ async def render_structured(body: RenderBody):
         "stats":          {prompt_chars, block_count, cached_block_count, ...},
       }
     """
+    import time as _rrpt2; _ph0 = _rrpt2.perf_counter()
     instance = pool.get(body.conversation_id, user_id=body.user_id)
+    _ph_pool = (_rrpt2.perf_counter() - _ph0) * 1000
     tcmm = instance.tcmm
     model = (body.model or "anthropic").lower().strip()
 
@@ -2010,12 +2016,18 @@ async def render_structured(body: RenderBody):
         try:
             from core.renderers.base_renderer import set_redact_sid as _set_sid
             from pii.session_store import SessionId as _SID
-            _redact_tok = _set_sid(
-                _SID(tenant_id=body.user_id or "", conv_id=body.conversation_id or "")
-            )
+            # [PII_SID_CONTRACT_2026_05_30]  Prefer the caller's EXACT sid
+            # (canonical) so render-minted REF tokens match the boundary's
+            # rehydration sid (base.py keys on tenant_id, NOT user_id).
+            if getattr(body, "pii_sid", ""):
+                _sid_obj = _SID.parse(body.pii_sid)
+            else:
+                _sid_obj = _SID(tenant_id=body.user_id or "", conv_id=body.conversation_id or "")
+            _redact_tok = _set_sid(_sid_obj)
         except Exception as _e:
             logger.warning(f"[render-pii] set_redact_sid failed: {_e}")
             _redact_tok = None
+    import time as _rrpt; _rr0 = _rrpt.perf_counter()
     try:
         if _scope_context is not None and _scope in ("user", "session", "namespace"):
             with _scope_context(_scope):
@@ -2029,6 +2041,8 @@ async def render_structured(body: RenderBody):
                 _reset_sid(_redact_tok)
             except Exception:
                 pass
+    logger.info(f"[RENDER-PERF] scope={_scope} pool={_ph_pool:.0f}ms render={(_rrpt.perf_counter()-_rr0)*1000:.0f}ms "
+                f"blocks={len(result.get('blocks', []))} chars={result.get('stats',{}).get('prompt_chars',0)}")
     return {
         "status": "ok",
         "format": "anthropic-structured" if model in ("anthropic", "claude") else f"{model}-structured",
@@ -2051,7 +2065,9 @@ async def render(body: RenderBody):
         "stats": {...},
       }
     """
+    import time as _rrpt2; _ph0 = _rrpt2.perf_counter()
     instance = pool.get(body.conversation_id, user_id=body.user_id)
+    _ph_pool = (_rrpt2.perf_counter() - _ph0) * 1000
     tcmm = instance.tcmm
     model = (body.model or "anthropic").lower().strip()
 
