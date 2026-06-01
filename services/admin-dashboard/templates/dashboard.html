@@ -822,11 +822,27 @@
       </div>
       <!-- Content (REDACTED — REF_X tokens, never raw PII) -->
       <div class="p-5 overflow-auto scrollbar-thin" style="flex: 1;">
-        <div class="text-[10px] uppercase tracking-wider text-text-lo mb-2">
-          content sent to LLM · <span class="text-warn">redacted</span> (REF_X tokens replace PII)
+        <div class="text-[10px] uppercase tracking-wider text-text-lo mb-2 flex justify-between items-center">
+          <span>content sent to LLM · <span class="text-warn">redacted</span> (REF_X tokens replace PII)</span>
+          <span class="text-text-mid font-mono normal-case" x-text="fmt((modalData.content||'').length) + ' chars'"></span>
         </div>
-        <pre class="text-[12px] text-text-hi whitespace-pre-wrap font-mono leading-relaxed bg-bg-800 rounded p-3 border border-line/60"
-             x-text="modalData.content || '(empty)'"></pre>
+        <!-- Split into envelope sections: SYSTEM (incl. TCMM memory) / TOOLS /
+             MESSAGES (latest prompt). Each collapsible; click header to toggle. -->
+        <template x-for="sec in contentSections()" :key="sec.label">
+          <div class="mb-2 border border-line/60 rounded overflow-hidden">
+            <button class="w-full flex items-center justify-between px-3 py-2 bg-bg-800 hover:bg-bg-700 text-left"
+                    @click="sectionOpen[sec.label] = !sectionOpen[sec.label]">
+              <span class="text-[11px] uppercase tracking-wider font-semibold"
+                    :class="sec.label==='MESSAGES' ? 'text-cy' : (sec.label==='SYSTEM' ? 'text-warn' : 'text-text-mid')"
+                    x-text="(sectionOpen[sec.label]?'▾ ':'▸ ') + sec.label + (sec.label==='SYSTEM' ? '  · incl. TCMM memory' : (sec.label==='MESSAGES' ? '  · latest prompt' : ''))"></span>
+              <span class="text-[10px] text-text-lo font-mono" x-text="fmt(sec.bytes) + ' chars'"></span>
+            </button>
+            <pre x-show="sectionOpen[sec.label]"
+                 class="text-[12px] text-text-hi whitespace-pre-wrap font-mono leading-relaxed bg-bg-800 p-3 max-h-[55vh] overflow-auto scrollbar-thin"
+                 x-text="sec.body"></pre>
+          </div>
+        </template>
+        <pre x-show="!modalData.content" class="text-text-lo text-[12px] p-3">(empty)</pre>
       </div>
       <!-- Footer link -->
       <div class="px-5 py-3 border-t border-line/60 flex justify-between text-[11px]">
@@ -877,6 +893,11 @@ function dashboard() {
     // ── Request-detail modal ──────────────────────────────────────────
     modalOpen: false,
     modalData: {},
+    // [REQUEST_DETAIL_SECTIONS_2026-06-01] collapsed/expanded state per
+    // envelope section. SYSTEM (incl. TCMM memory) + MESSAGES (latest
+    // prompt) open by default; TOOLS collapsed (it's the biggest + least
+    // interesting — the 100+ tool schemas).
+    sectionOpen: { SYSTEM: true, TOOLS: false, MESSAGES: true, PREAMBLE: true, CONTENT: true },
 
     // (Chart.js instances live OUTSIDE Alpine state — see _charts below.
     //  Putting them on `this.timeChart`/`this.pieChart` makes Alpine wrap
@@ -1296,6 +1317,33 @@ function dashboard() {
     closeRequest() {
       this.modalOpen = false;
       this.modalData = {};
+    },
+
+    // [REQUEST_DETAIL_SECTIONS_2026-06-01] Split the TO_LLM envelope into its
+    // top-level sections so the TCMM memory (inside SYSTEM) and the latest
+    // prompt (MESSAGES) are findable instead of buried in one giant blob.
+    // Splits on the first occurrence of each marker, in document order.
+    contentSections() {
+      const c = (this.modalData && this.modalData.content) || '';
+      if (!c) return [];
+      const labels = ['SYSTEM', 'TOOLS', 'MESSAGES'];
+      const found = [];
+      for (const L of labels) {
+        const i = c.indexOf('[' + L + ']');
+        if (i >= 0) found.push({ label: L, idx: i });
+      }
+      found.sort((a, b) => a.idx - b.idx);
+      if (found.length === 0) return [{ label: 'CONTENT', body: c, bytes: c.length }];
+      const out = [];
+      if (found[0].idx > 0) {
+        out.push({ label: 'PREAMBLE', body: c.slice(0, found[0].idx), bytes: found[0].idx });
+      }
+      for (let i = 0; i < found.length; i++) {
+        const start = found[i].idx;
+        const end = (i + 1 < found.length) ? found[i + 1].idx : c.length;
+        out.push({ label: found[i].label, body: c.slice(start, end), bytes: end - start });
+      }
+      return out;
     },
 
     _fmtBucketLabel(ts, secs) {

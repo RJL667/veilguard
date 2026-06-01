@@ -29,8 +29,20 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
+
+# [AUDIT_CONTENT_CAP_2026-06-01] The per-row audit content was hard-capped at
+# 65 000 chars, which TRUNCATED the TO_LLM envelope mid-[TOOLS] for Director
+# turns (system preamble ~26KB + TCMM memory + 103 tool schemas ~100KB easily
+# exceeds 65K). The [MESSAGES] section — the user's latest prompt — sits at
+# the END of the envelope, so it fell past the cap and never landed in
+# pii_audit, making it invisible in the admin drill-down (along with the tail
+# of TCMM memory). Bump the default to 1 MB so the full envelope
+# ([SYSTEM]+memory / [TOOLS] / [MESSAGES]) is captured. Tunable via env for
+# deployments that want to bound audit-row size.
+_MAX_AUDIT_CONTENT = int(os.environ.get("AUDIT_MAX_CONTENT_CHARS", "1000000"))
 
 # The shared writer lives at /llm in the container (bind-mounted from
 # Documents/veilguard/llm).  Both record() and AuditDB.get() come from
@@ -123,7 +135,7 @@ def record_turn(
         user_id=user_id,
         model=usage.model,
         stream=True,
-        content=usage.content_text()[:65_000],
+        content=usage.content_text()[:_MAX_AUDIT_CONTENT],
         tokens_input=usage.tokens_input_total,
         tokens_output=usage.tokens_output,
         cache_create=usage.cache_create,
@@ -169,7 +181,7 @@ def record_event(
             user_id=user_id,
             model=audit_ev.get("model") or "",
             stream=False,
-            content=(audit_ev.get("content") or "")[:65_000],
+            content=(audit_ev.get("content") or "")[:_MAX_AUDIT_CONTENT],
             tokens_input=audit_ev.get("tokens_input_total"),
             tokens_output=audit_ev.get("tokens_output"),
             cache_create=audit_ev.get("cache_create"),
