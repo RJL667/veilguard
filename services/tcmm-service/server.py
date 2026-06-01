@@ -2028,11 +2028,46 @@ async def render_structured(body: RenderBody):
             logger.warning(f"[render-pii] set_redact_sid failed: {_e}")
             _redact_tok = None
     import time as _rrpt; _rr0 = _rrpt.perf_counter()
+
+    def _stage_recall_if_needed():
+        # [RENDER_RECALL_STAGE_2026-06-01] The agent-runtime (Director) path
+        # calls /render_structured DIRECTLY and never runs /pre_request (the
+        # proxy's _tcmm_pre_request sits AFTER the agent-runtime dispatch, and
+        # agent-runtime only calls /render + /ingest_turn). Result: the user's
+        # recalled memory was never staged as shadow blocks, so the rendered
+        # prompt carried ZERO memory — verified, a 668-block user got 0 memory
+        # blocks (the recalled memory was "thrown away"). Stage it HERE so the
+        # render is self-contained and race-free. Guard on "nothing staged yet"
+        # so the ChatAgent path (which DOES call /pre_request first) doesn't
+        # double-recall. Runs inside the user scope so cross-conversation
+        # memory surfaces (VEILGUARD_RENDER_RECALL_SCOPE=user).
+        try:
+            if getattr(tcmm, "shadow_blocks", None):
+                return  # already staged by a prior /pre_request — don't re-recall
+            # recall() takes the scope as a PARAM (default "session"); pass the
+            # render scope ("user") explicitly so cross-conversation memory
+            # surfaces — a bare recall() would session-scope and find nothing on
+            # a fresh Director conversation.
+            _rscope = _scope if _scope in ("user", "session", "namespace") else "user"
+            _recalled = tcmm.recall(body.task_query, scope=_rscope) or []
+            if _recalled:
+                tcmm.stage_shadow_blocks(_recalled)
+                logger.info(
+                    f"[RENDER-RECALL] staged {len(_recalled)} shadow blocks "
+                    f"(scope={_rscope}, direct render, no prior /pre_request)"
+                )
+            else:
+                logger.info(f"[RENDER-RECALL] recall(scope={_rscope}) returned 0")
+        except Exception as _e:
+            logger.warning(f"[RENDER-RECALL] recall+stage failed: {_e}")
+
     try:
         if _scope_context is not None and _scope in ("user", "session", "namespace"):
             with _scope_context(_scope):
+                _stage_recall_if_needed()
                 result = renderer.render_structured(body.task_query)
         else:
+            _stage_recall_if_needed()
             result = renderer.render_structured(body.task_query)
     finally:
         if _redact_tok is not None:
