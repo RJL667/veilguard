@@ -371,6 +371,19 @@ async def run_agent_query(
             allowed_tools.append(_nm)
             _client_tool_schemas.append(_ct)
 
+        # [TOOLS_TRACE_2026-06-01] What the persona ends up able to call:
+        # its own tools + the client/MCP tools LibreChat forwarded this turn.
+        try:
+            logger.info(
+                "[TOOLS-TRACE] agent=%s persona_tools=%d client_fwd=%d "
+                "merged=%d client_names=%s",
+                persona.agent_id, len(persona.tools),
+                len(client_tools or []), len(_client_tool_schemas),
+                [c.get("name") for c in _client_tool_schemas][:40],
+            )
+        except Exception:
+            pass
+
         # ── Emit run_start ──────────────────────────────────────────────
         run_id = uuid.uuid4().hex[:12]
         yield {

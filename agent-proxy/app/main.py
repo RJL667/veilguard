@@ -3438,6 +3438,22 @@ async def _handle_agent_runtime_request(
         "tools": data.get("tools") or [],
     }
 
+    # [TOOLS_TRACE_2026-06-01] Visibility into the client/MCP tool set
+    # LibreChat actually forwards for this turn — so we can see WHAT the
+    # Director ends up able to call (the set is dynamic: depends on which
+    # MCP servers the user enabled in the UI).
+    try:
+        _fwd_tools = payload.get("tools") or []
+        _fwd_names = [
+            (t.get("name") if isinstance(t, dict) else None) for t in _fwd_tools
+        ]
+        logger.info(
+            "  [AR-TOOLS] agent=%s fwd_count=%d names=%s",
+            agent_id, len(_fwd_tools), [n for n in _fwd_names if n][:40],
+        )
+    except Exception:
+        pass
+
     timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
     client = httpx.AsyncClient(timeout=timeout)
 
