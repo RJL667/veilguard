@@ -123,7 +123,9 @@ async def test_propose_one_writes_proposal_for_eligible_lesson():
     assert len(_rpwc_stub.calls) == 1  # type: ignore[attr-defined]
     kwargs = _rpwc_stub.calls[0]  # type: ignore[attr-defined]
     assert kwargs["signal_type"] == CA.SIGNAL_CONSTITUTION_AMENDMENT
-    assert kwargs["proposed_assignee"] == "critic-prose"
+    # [F15] amendment drafting goes to a producer (researcher), not a critic —
+    # critics can't write the diff; they review it at submit time.
+    assert kwargs["proposed_assignee"] == "researcher"
     assert "lsn-x" in kwargs["rationale"]
 
 

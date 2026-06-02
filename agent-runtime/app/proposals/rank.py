@@ -55,14 +55,17 @@ logger = logging.getLogger(__name__)
 # Default rank-pass model (per agents/director.md `rank_pass=`).
 DEFAULT_RANK_MODEL = "claude-haiku-4-5"
 
-# Valid assignee values the LLM can choose.  We post-validate against
-# this set so an LLM hallucination doesn't land "researcher-bot" or
-# similar in the queue.  Add agent_ids here as they get personas.
+# Valid PROPOSAL-OWNER assignees the rank-pass LLM can choose.  Post-validated
+# against this set so a hallucination doesn't land "researcher-bot" in the queue.
+#
+# [PROPOSAL_ASSIGNEE_NO_CRITIC_2026_06_02] Critics are intentionally ABSENT: a
+# proposal's owner PRODUCES the deliverable, and critics are read-everywhere /
+# write-nowhere (§4.4) — owning a producing task dead-ends it (no write_file /
+# attach_output / submit_for_review). The critic split applies at REVIEW time
+# (submit_for_review), not ownership. Add producer agent_ids here as needed.
 VALID_ASSIGNEES = frozenset({
     "researcher",
     "builder",
-    "critic-claim",
-    "critic-prose",
     "phishing-analyst",
     "threat-analyst",
     "report-writer",
@@ -340,6 +343,12 @@ async def rank_candidates(
                 ass, node_ids, c.get("default_assignee"),
             )
             ass = c.get("default_assignee", "researcher")
+        # [PROPOSAL_ASSIGNEE_NO_CRITIC_2026_06_02] Never let a critic become the
+        # owner — even via a stale candidate default (the fallback above pulls
+        # default_assignee without re-validating). Critics review at submit
+        # time; they have no write tools and would dead-end the task.
+        if ass in ("critic-claim", "critic-prose"):
+            ass = "researcher"
         try:
             align = float(e.get("refined_objective_alignment") or c.get("default_align", 0.0))
         except (TypeError, ValueError):

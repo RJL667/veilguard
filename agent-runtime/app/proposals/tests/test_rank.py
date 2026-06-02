@@ -92,7 +92,7 @@ async def test_rank_one_candidate_refined():
 
 @pytest.mark.asyncio
 async def test_invalid_assignee_falls_back_to_default():
-    c = _candidate(assignee="critic-prose")
+    c = _candidate(assignee="builder")
     async def adapter(**kwargs):
         return {"ranked": [{
             "signal_node_ids":             c["signal_node_ids"],
@@ -107,7 +107,7 @@ async def test_invalid_assignee_falls_back_to_default():
         constitution_objectives=CONSTITUTION,
         adapter_call=adapter,
     )
-    assert out[0]["refined_assignee"] == "critic-prose"  # fell back to default
+    assert out[0]["refined_assignee"] == "builder"  # fell back to default (a producer)
 
 
 @pytest.mark.asyncio
@@ -255,9 +255,9 @@ async def test_system_prompt_contains_constitution_objectives():
     assert "preserve_user_agency" in sys
     # Weight values inlined
     assert "0.40" in sys or "0.4" in sys
-    # Valid assignees enumerated
+    # Valid assignees enumerated (producers only — critics aren't owners)
     assert "researcher" in sys
-    assert "critic-prose" in sys
+    assert "report-writer" in sys
 
 
 # ── model default sanity ───────────────────────────────────────────────
@@ -267,6 +267,10 @@ def test_default_model_is_haiku():
     assert "haiku" in DEFAULT_RANK_MODEL.lower()
 
 
-def test_valid_assignees_includes_all_personas():
-    for a in ("researcher", "builder", "critic-claim", "critic-prose"):
+def test_valid_assignees_are_producers_not_critics():
+    # [F15] Proposal owners must PRODUCE the deliverable; critics review at
+    # submit time and have no write tools (§4.4), so they are NOT valid owners.
+    for a in ("researcher", "builder", "report-writer"):
         assert a in VALID_ASSIGNEES
+    for critic in ("critic-claim", "critic-prose"):
+        assert critic not in VALID_ASSIGNEES

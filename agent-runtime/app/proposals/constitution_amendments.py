@@ -141,7 +141,10 @@ async def propose_one(*, lesson: dict[str, Any]) -> Optional[str]:
         signal_node_ids=[],
         impact_score=10.0,   # always high — these are rare + load-bearing
         proposed_brief=drafted["brief"],
-        proposed_assignee="critic-prose",
+        # [F15_2026_06_02] A producer writes the amendment draft/diff; critics
+        # have no write tools (§4.4) so a critic-owned amendment task dead-ends.
+        # The Critic reviews the draft at submit_for_review time.
+        proposed_assignee="researcher",
         proposed_deliverable_spec=drafted["spec"],
         rationale=(
             f"constitution_amendment from lesson {lesson_id} "
