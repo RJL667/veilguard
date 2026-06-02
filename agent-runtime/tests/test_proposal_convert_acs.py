@@ -89,3 +89,19 @@ def test_every_proactive_spec_yields_concrete_ac_path():
         assert path.startswith("team/drafts/"), (
             f"{sig}: synthesized AC path {path!r} should be under team/drafts/"
         )
+
+
+def test_create_task_rejects_critic_owner():
+    """Authoritative chokepoint: a critic can never OWN a producing task
+    (§4.4 — no write tools). Rejecting in create_task closes every route
+    (Director LLM, rank-pass, proposal convert, A2A) — a critic owner only
+    arises transiently during review via submit_for_review (an update, not
+    create_task). Fires before any store access, so no fixture needed."""
+    import pytest
+    for critic in ("critic-claim", "critic-prose"):
+        with pytest.raises(ValueError, match="critic"):
+            T.create_task(
+                tenant_id="t", user_id="u", owner_id=critic,
+                brief="b", deliverable_spec="x.md",
+                _phase_6_legacy_exempt=True,
+            )

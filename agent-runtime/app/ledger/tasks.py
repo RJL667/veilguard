@@ -75,6 +75,12 @@ VALID_OWNER_IDS = frozenset({
 # structurally via the children-done autoclose hook.
 _COORDINATOR_OWNERS = frozenset({"director", "team-lead"})
 
+# Critics review artifacts (read-everywhere / write-nowhere, §4.4) — they have
+# no write_file / attach_output / submit_for_review and can NEVER own a
+# producing task. (They own a task only transiently during review, set via
+# submit_for_review's reassignment — never via create_task.)
+_CRITIC_OWNER_ROLES = frozenset({"critic-claim", "critic-prose"})
+
 
 def synthesize_default_acceptance_criteria(
     owner_id: str, deliverable_spec: str,
@@ -166,6 +172,22 @@ def create_task(
         raise ValueError(
             f"unknown owner_id {owner_id!r}; valid persona names are "
             f"{sorted(VALID_OWNER_IDS)}"
+        )
+    # [PROPOSAL_ASSIGNEE_NO_CRITIC_2026_06_02] A critic can NEVER own a producing
+    # task. Critics are read-everywhere / write-nowhere (§4.4) — no write_file /
+    # attach_output / submit_for_review — so a critic-owned task dead-ends
+    # (composes inline, raises a blocker, never converges; caught live on a
+    # recurring_ritual task routed to critic-prose). Critics get ownership ONLY
+    # transiently during review, via submit_for_review's reassignment (an UPDATE,
+    # never create_task). Rejecting here is the authoritative chokepoint so NO
+    # path — Director LLM, rank-pass, proposal convert, A2A — can route producing
+    # work to a critic.
+    if owner_id in _CRITIC_OWNER_ROLES:
+        raise ValueError(
+            f"owner_id {owner_id!r} is a critic; critics review artifacts but "
+            f"cannot OWN a producing task (no write_file / attach_output / "
+            f"submit_for_review). Assign producing work to a producer "
+            f"(researcher / builder); the critic reviews it via submit_for_review."
         )
 
     # Phase 6.0.2 Director-side acceptance contract.
