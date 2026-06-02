@@ -3438,6 +3438,25 @@ async def _handle_agent_runtime_request(
         "tools": data.get("tools") or [],
     }
 
+    # [WORKSPACE_BLOCK_2026_06_01] Fetch the connected client-daemon's
+    # workspace state (folders + OS) and forward the rendered block on a
+    # dedicated field. The unified harness (agent-runtime base.py) rebuilds
+    # the prompt and DISCARDS body["system"], so the legacy
+    # _inject_workspace_state(body, ...) was silently dropped. agent-runtime
+    # reads `workspace_block` and appends it as an uncached system tail
+    # block so the model sees the user's folders again.
+    try:
+        _ws_state_fwd = await _fetch_workspace_state(user_id) if user_id else None
+        _ws_block_fwd = _render_workspace_block(_ws_state_fwd) if _ws_state_fwd else ""
+        if _ws_block_fwd:
+            payload["workspace_block"] = _ws_block_fwd
+            logger.info(
+                "  [AR-WORKSPACE] forwarding workspace block "
+                "(%d folders)", len((_ws_state_fwd or {}).get("folders") or []),
+            )
+    except Exception as _wse:
+        logger.debug(f"[forward] workspace fetch failed: {_wse}")
+
     # [TOOLS_TRACE_2026-06-01] Visibility into the client/MCP tool set
     # LibreChat actually forwards for this turn — so we can see WHAT the
     # Director ends up able to call (the set is dynamic: depends on which

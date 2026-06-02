@@ -46,6 +46,11 @@ class RenderResult:
     tier_summary: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
     layout: dict = field(default_factory=dict)
+    # [TOOLS_NATIVE_FROM_IMMUTABLE_2026_06_01] Anthropic-native tool
+    # schemas extracted from the immutable tool_def pins by the render
+    # endpoint.  Delivered to client.messages.create(tools=[...]) so the
+    # model can invoke tools; sits at the FRONT of the cached prefix.
+    tools: list[dict] = field(default_factory=list)
 
 
 # ── HTTP client (reused across calls) ──────────────────────────────────
@@ -128,6 +133,7 @@ async def render_structured(
         tier_summary=data.get("tier_summary") or {},
         stats=data.get("stats") or {},
         layout=data.get("layout") or {},
+        tools=data.get("tools") or [],
     )
 
 

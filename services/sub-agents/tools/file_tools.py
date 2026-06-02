@@ -79,6 +79,32 @@ def register(mcp):
         return await handle_tool("search_files", {"pattern": pattern, "path": path})
 
     @mcp.tool()
+    async def list_directory(path: str = "") -> str:
+        """List the files and folders directly inside a directory on the
+        user's local machine (their workspace).
+
+        USE THIS whenever the user asks "what files are in my workspace?",
+        "what's in this folder?", "list my files", or "show me the
+        directory" — it is the direct answer to those questions. Do NOT
+        reply that you lack a directory tool; this IS that tool. Returns the
+        immediate (non-recursive) entries — both files and sub-folders —
+        sorted most-recently-modified first. It is fast and safe to call
+        with no arguments (lists the workspace root); you do not need the
+        user to specify a pattern or file type first.
+
+        For a recursive search or to filter by type, use search_files with a
+        glob like ``**/*.py`` instead.
+
+        Args:
+            path: Directory to list (absolute, or relative to the workspace
+                  root). Empty = the workspace/project root.
+        """
+        # Implemented over the daemon's existing search_files capability:
+        # glob "*" returns the immediate children (files + dirs, non-
+        # recursive) of `path`. No new daemon handler / release required.
+        return await handle_tool("search_files", {"pattern": "*", "path": path})
+
+    @mcp.tool()
     async def grep(pattern: str, path: str = "", include: str = "") -> str:
         """Search file contents for a regex pattern. Returns matching lines with file paths.
 

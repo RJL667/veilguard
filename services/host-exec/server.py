@@ -25,6 +25,14 @@ mcp = FastMCP(
 WORK_DIR = os.environ.get("HOST_WORK_DIR", str(Path(__file__).parent.parent.parent))
 TIMEOUT = int(os.environ.get("HOST_EXEC_TIMEOUT", "60"))
 
+# [HOST_DOC_READ_2026_06_01] Read-only document tools (read_pdf/word/excel)
+# may read the user's own files anywhere under their home directory — host-
+# exec runs ON the user's Windows machine, so reading
+# 'C:\\Users\\<user>\\Downloads\\report.pdf' is exactly the intended use.
+# WRITES stay scoped to WORK_DIR via _safe_resolve; only READ-parse tools
+# get this wider root. Override with HOST_DOC_READ_ROOT to narrow/widen.
+_DOC_READ_ROOT = os.environ.get("HOST_DOC_READ_ROOT", os.path.expanduser("~"))
+
 # ── Command Safety Validation ────────────────────────────────────────────────
 import re as _re
 
@@ -210,6 +218,75 @@ def host_file_write(path: str, content: str) -> str:
         return f"Written {len(content)} bytes to {p}"
     except Exception as e:
         return f"Error writing file: {e}"
+
+
+def _safe_read_doc_path(path: str) -> tuple[Path, str]:
+    """Resolve a path for READ-ONLY document parsers (read_pdf/word/excel).
+
+    Allows the project root OR the user's home dir (_DOC_READ_ROOT) so a
+    Windows path like C:\\Users\\rudol\\Downloads\\x.pdf — which the daemon
+    can already see — is readable here too, on the same host. Writes still
+    use the tighter _safe_resolve (WORK_DIR only).
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path(WORK_DIR) / p
+    resolved = p.resolve()
+    roots = [Path(WORK_DIR).resolve(), Path(_DOC_READ_ROOT).resolve()]
+    if not any(str(resolved).startswith(str(r)) for r in roots):
+        return resolved, (
+            f"Error: read denied — {path!r} is outside the allowed roots "
+            f"({WORK_DIR} and {_DOC_READ_ROOT}). Set HOST_DOC_READ_ROOT to widen."
+        )
+    return resolved, ""
+
+
+def _extract_pdf_text(p: Path, pages: str) -> str:
+    import fitz  # PyMuPDF — available in the host Python (1.26.x)
+    doc = fitz.open(str(p))
+    try:
+        total = len(doc)
+        if pages.strip():
+            parts = pages.strip().split("-")
+            start = max(0, int(parts[0]) - 1)
+            end = int(parts[-1]) if len(parts) > 1 else start + 1
+            rng = range(start, min(end, total))
+        else:
+            rng = range(total)
+        out = [f"# {p.name} ({total} pages, reading {len(rng)})\n"]
+        for i in rng:
+            out.append(f"--- Page {i + 1} ---\n{doc[i].get_text().strip()}\n")
+        return "\n".join(out)
+    finally:
+        doc.close()
+
+
+@mcp.tool()
+def host_read_pdf(path: str, pages: str = "") -> str:
+    """Read and extract text from a PDF on the user's WINDOWS host.
+
+    Use THIS — not the documents server's read_pdf — for PDFs on the user's
+    machine (e.g. 'C:\\Users\\rudol\\Downloads\\report.pdf'). The documents
+    server runs in a Linux container and cannot see Windows paths; host-exec
+    runs ON the host and has a real PDF parser (PyMuPDF). Reads under the
+    project root or the user's home directory.
+
+    Args:
+        path: PDF path on the host (absolute Windows path, or relative to the
+              project root). Forward or back slashes both work.
+        pages: Page range like "1-5" or "3". Empty = all pages.
+    """
+    p, err = _safe_read_doc_path(path)
+    if err:
+        return err
+    if not p.exists():
+        return f"Error: File not found: {p}"
+    if not p.is_file():
+        return f"Error: Not a file: {p}"
+    try:
+        return _extract_pdf_text(p, pages)
+    except Exception as e:
+        return f"Error reading PDF: {e}"
 
 
 if __name__ == "__main__":

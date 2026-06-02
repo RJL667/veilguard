@@ -44,7 +44,7 @@ Usage:
 # they finished installing. From 0.2.4 onwards, right-click ->
 # Properties -> Details on VeilguardSetup.exe shows the version
 # directly, and the AppId pin makes the upgrade flow predictable.
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 
 class CredentialsRevokedError(Exception):
@@ -1009,6 +1009,36 @@ async def _run_env_session(
                         _tray_obj.set_connection_state(True)
                     except Exception:
                         pass
+
+                # [PERMISSION_SYNC_ON_CONNECT_2026_06_01] Re-assert the
+                # tray's permission level to the server on every (re)connect.
+                # Without this the tray UI and the server's client_settings
+                # silently DRIFT: observed live — the tray showed "confirm"
+                # while the server had "auto" stored, so the approval gate
+                # ran EVERY tool (run_command / write_file included) with no
+                # toast. The tray is the user's source of truth; push it so
+                # whatever the menu shows is what the gate actually enforces.
+                # scope="user" sets the global default (vs per-conv override).
+                try:
+                    _sync_level = (
+                        getattr(_tray_obj, "_current_level", "") if _tray_obj else ""
+                    )
+                    if _sync_level:
+                        await ws.send(json.dumps({
+                            "jsonrpc": "2.0",
+                            "method": "set_permission_level",
+                            "params": {
+                                "level":  _sync_level,
+                                "scope":  "user",
+                                "source": "connect_sync",
+                            },
+                        }))
+                        logger.info(
+                            f"[PERMISSION_SYNC] re-asserted tray level "
+                            f"'{_sync_level}' to server on connect"
+                        )
+                except Exception as _e:
+                    logger.warning(f"[PERMISSION_SYNC] connect push failed: {_e}")
 
                 # Start heartbeat
                 async def heartbeat():

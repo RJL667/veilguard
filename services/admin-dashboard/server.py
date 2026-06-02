@@ -287,15 +287,20 @@ async def api_messages_per_user(
     ``name=None`` and the dashboard renders that as ``—``.
     """
     s, e = _resolve_window(window, start_ts, end_ts)
-    audit_rows, all_users = await asyncio.gather(
+    audit_rows, all_users, agent_rows = await asyncio.gather(
         asyncio.to_thread(
             pii_audit_stats.messages_per_user,
             None, top_n, start_ts=s, end_ts=e, direction=direction,
         ),
         librechat_users.all_users(),
+        asyncio.to_thread(
+            pii_audit_stats.per_agent,
+            None, 50, start_ts=s, end_ts=e,
+        ),
     )
 
     by_uid = {r["user_id"]: r for r in audit_rows}
+    uid_map = {u["_id"]: u for u in all_users}
 
     rows: list[dict] = []
     seen_uids: set[str] = set()
@@ -307,6 +312,7 @@ async def api_messages_per_user(
         a = by_uid.get(uid, {})
         rows.append({
             "user_id":         uid,
+            "type":            "user",
             "name":            u.get("name"),
             "email":           u.get("email"),
             "role":            u.get("role"),
@@ -329,6 +335,7 @@ async def api_messages_per_user(
             continue
         rows.append({
             "user_id":         uid,
+            "type":            "user",
             "name":            None,
             "email":           None,
             "role":            None,
@@ -339,7 +346,57 @@ async def api_messages_per_user(
                                      "redactions_total", "last_seen")},
         })
 
+    # 3. Append the agent-runtime ICs (director/researcher/builder/critic)
+    #    as their own rows in the SAME list + columns, attributed to the
+    #    user they acted for.  Their activity is ALSO inside that user's
+    #    totals above — they're the breakdown, not separate billing.
+    for a in agent_rows:
+        owner = uid_map.get(a.get("owner_user_id") or "", {})
+        rows.append({
+            "user_id":          "agent:" + a["agent_id"],
+            "type":             "agent",
+            "name":             a["agent_id"],
+            "email":            owner.get("email"),
+            "role":             "agent",
+            "calls":            a.get("calls", 0),
+            "to_llm":           a.get("to_llm", 0),
+            "from_llm":         a.get("from_llm", 0),
+            "to_llm_bytes":     a.get("to_llm_bytes", 0),
+            "from_llm_bytes":   0,
+            "tokens_in":        a.get("tokens_in", 0),
+            "tokens_out":       a.get("tokens_out", 0),
+            "conversations":    a.get("conversations", 0),
+            "redactions":       a.get("redactions", {}),
+            "redactions_total": a.get("redactions_total", 0),
+            "last_seen":        a.get("last_seen", 0),
+            "owner_user_id":    a.get("owner_user_id") or "",
+        })
+
     rows.sort(key=lambda r: (r.get("to_llm", 0), r.get("calls", 0)), reverse=True)
+    return {"rows": rows, "start_ts": s, "end_ts": e}
+
+
+@app.get("/api/agents/per-agent")
+async def api_agents_per_agent(
+    window: Optional[str] = "24h",
+    start_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    user_id: Optional[str] = None,
+    top_n: int = 30,
+    user=Depends(require_admin),
+):
+    """Per-agent (IC) call + token rollup — *which agent spent the quota*.
+
+    Distinct from /api/messages/per-user, which collapses every agent
+    dispatch under the libreuser id the agents inherit.  This groups by
+    ``extra.agent_id`` (director / researcher / builder / critic) so the
+    operator can see the agents as distinct actors.
+    """
+    s, e = _resolve_window(window, start_ts, end_ts)
+    rows = await asyncio.to_thread(
+        pii_audit_stats.per_agent,
+        None, top_n, start_ts=s, end_ts=e, user_id=user_id,
+    )
     return {"rows": rows, "start_ts": s, "end_ts": e}
 
 

@@ -23,7 +23,7 @@
 ; installer-shows-0.2.1 confusion: Inno's upgrade prompt referred to
 ; the existing install's version, not the version about to be installed).
 
-#define MyAppVersion "0.9.3"
+#define MyAppVersion "0.9.4"
 
 [Setup]
 AppId={{6A3BC56C-68CD-4F71-8466-0883395AF3EB}}

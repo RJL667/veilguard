@@ -109,13 +109,51 @@ class TurnContext:
     tenant_id: str
     parent_cid: Optional[str] = None
     is_background: bool = False
+    # [WORKSPACE_BLOCK_2026_06_01] Live client-daemon workspace state
+    # (folders + os hint), rendered by the proxy's _render_workspace_block.
+    # The unified harness owns prompt assembly and discards body["system"],
+    # so the proxy's body-level injection was silently dropped. Carry it on
+    # the context instead; run_turn appends it as a FRESH (uncached) system
+    # tail block — it changes per turn (project switch), so it must stay out
+    # of the cached prefix.
+    workspace_block: str = ""
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
 
 
+def _stringify_tool_result(rc) -> str:
+    """A tool_result block's ``content`` is either a plain string or a list
+    of content blocks (``{"type":"text","text":...}``). Flatten to text."""
+    if isinstance(rc, str):
+        return rc
+    if isinstance(rc, list):
+        out: list[str] = []
+        for b in rc:
+            if isinstance(b, str):
+                out.append(b)
+            elif isinstance(b, dict):
+                if isinstance(b.get("text"), str):
+                    out.append(b["text"])
+                elif isinstance(b.get("content"), str):
+                    out.append(b["content"])
+        return "\n".join(out)
+    return "" if rc is None else str(rc)
+
+
 def _last_user_text(messages: list[dict]) -> str:
-    """Pull the most recent role=user message body as a plain string."""
+    """Pull the most recent role=user message body as a plain string.
+
+    [TOOL_RESULT_VISIBLE_2026_06_01]  The agent tool loop appends
+    tool_result blocks as a role=user message (Anthropic convention:
+    {"role":"user","content":[{"type":"tool_result", ...}]}). This used to
+    extract ONLY type=="text" blocks, so a tool_result message flattened to
+    "" — the model never saw its tool's output and re-emitted the SAME tool
+    call every loop iteration (the observed write_file 5x retry: each write
+    succeeded with is_error=False, but the model couldn't see the success).
+    Now we ALSO surface tool_result content (flagging real errors) so the
+    model sees the outcome and stops looping.
+    """
     for m in reversed(messages):
         if not isinstance(m, dict) or m.get("role") != "user":
             continue
@@ -125,10 +163,17 @@ def _last_user_text(messages: list[dict]) -> str:
         if isinstance(content, list):
             parts: list[str] = []
             for blk in content:
-                if isinstance(blk, dict) and blk.get("type") == "text":
+                if not isinstance(blk, dict):
+                    continue
+                bt = blk.get("type")
+                if bt == "text":
                     t = blk.get("text")
                     if isinstance(t, str):
                         parts.append(t)
+                elif bt == "tool_result":
+                    _txt = _stringify_tool_result(blk.get("content"))
+                    _err = " [ERROR]" if blk.get("is_error") else ""
+                    parts.append(f"[Tool result{_err}]\n{_txt}")
             return "\n".join(parts)
     return ""
 
@@ -228,15 +273,11 @@ class Agent(ABC):
                 self.persona.system_prompt, kind="persona_prompt",
             )
 
-        # Pin tool definitions as IMMUTABLE blocks — one per schema,
-        # priority_class="SYSTEM", dedup by fingerprint.  Includes the
-        # shadow tool (tcmm_record_turn) because prepare_tools runs the
-        # injection.  Pinning them here means TCMM's /render returns
-        # them in the cached prefix instead of us shoving the JSON into
-        # the preamble (which would re-fingerprint the whole preamble
-        # on every tool change).  Anthropic ALSO gets these natively in
-        # the request `tools` field via prepare_tools later — the pin
-        # is for cache stability + memory hygiene, not LLM visibility.
+        # [TOOLS_IN_IMMUTABLE_2026_06_01]  Tools live in the IMMUTABLE
+        # tier (pinned, one block per schema, cached 24h) — this is the
+        # SINGLE home for tool schemas.  The separate native `tools` array
+        # is DROPPED from the request (see STEP 3) so the 44 schemas ship
+        # exactly ONCE, in the cached prefix, not twice.
         try:
             tools_for_pin = self.prepare_tools(self.tools()) or []
             if tools_for_pin:
@@ -348,21 +389,29 @@ class Agent(ABC):
         # fire it on a background task so it never blocks the turn.  The
         # essentials (magic prefix + persona) are also injected inline
         # below, so a render that races ahead of the pin still works.
+        # [PIN_BLOCKING_2026_06_01]  Pin BEFORE the render below — blocking,
+        # not fire-and-forget.  The old background create_task() raced the
+        # render: the render ran before the pins landed, so TCMM's
+        # immutable tier came back EMPTY every turn, which forced the
+        # inline magic-prefix / preamble / persona fallback (the thing that
+        # parked all the static content AFTER the volatile recalled memory
+        # and caused per-turn cache rewrites).  Verified live 2026-06-01:
+        # pin/system_prompt + pin/tool_definitions → render_structured puts
+        # them in the immutable (1h-cached) tier.  Block ONCE per
+        # (conv,agent); pins are idempotent + the dedup skips later turns.
+        # If TCMM is down the pin calls fast-path to no-ops
+        # (tcmm_client._tcmm_unreachable), so the dead path adds ~0ms.
         if self.include_memory():
             _pin_key = (ctx.conversation_id, self.agent_id)
             if _pin_key not in _PREPARED_SESSIONS:
-                _PREPARED_SESSIONS.add(_pin_key)
-                async def _do_prepare():
-                    try:
-                        await self.prepare_session(ctx)
-                    except Exception as e:
-                        _PREPARED_SESSIONS.discard(_pin_key)
-                        logger.warning(
-                            f"[agent] prepare_session hook failed: {e}"
-                        )
-                _pt = _asyncio.create_task(_do_prepare())
-                _BACKGROUND_TASKS.add(_pt)
-                _pt.add_done_callback(_BACKGROUND_TASKS.discard)
+                try:
+                    await self.prepare_session(ctx)
+                    _PREPARED_SESSIONS.add(_pin_key)
+                except Exception as e:
+                    logger.warning(
+                        f"[agent] prepare_session pin failed (continuing "
+                        f"on degraded inline path): {e}"
+                    )
         _t_marks["S0_5_prepare_session"] = _t.time()
 
         # STEP 1 — TCMM render.  Skips when include_memory() is False
@@ -383,6 +432,12 @@ class Agent(ABC):
             "built on Anthropic's Claude Agent SDK."
         )
         _memory_degraded = False
+        # [TOOLS_NATIVE_FROM_IMMUTABLE_2026_06_01] Anthropic-native tool
+        # schemas, extracted by TCMM's render from the immutable tool_def
+        # pins. Populated below (fresh render or render-cache hit); consumed
+        # at the adapter call as the native `tools` field. Stays [] when TCMM
+        # is degraded → adapter falls back to the agent's own prepared tools.
+        _render_tools: list = []
         if self.include_memory():
             try:
                 # [RENDER_DISPATCH_CACHE_2026_05_29] Reuse one rendered
@@ -392,6 +447,7 @@ class Agent(ABC):
                 _rhit = _RENDER_CACHE.get(_rk)
                 if _rhit is not None and _t.time() < _rhit[1]:
                     raw_blocks = list(_rhit[0])
+                    _render_tools = list(_rhit[2]) if len(_rhit) > 2 else []
                     logger.info(
                         "[agent] render cache HIT for %s (skipped TCMM render "
                         "+ re-redact of memory prefix)", _rk[0]
@@ -412,8 +468,10 @@ class Agent(ABC):
                     except TypeError:
                         rendered = await render_structured(**_render_kwargs)
                     raw_blocks = list(rendered.blocks)
+                    _render_tools = list(getattr(rendered, "tools", []) or [])
                     _RENDER_CACHE[_rk] = (
-                        list(raw_blocks), _t.time() + _RENDER_CACHE_TTL_S
+                        list(raw_blocks), _t.time() + _RENDER_CACHE_TTL_S,
+                        list(_render_tools),
                     )
             except RuntimeError as e:
                 logger.warning(
@@ -534,18 +592,53 @@ class Agent(ABC):
         # 6000 and DO cache.  Future fix: pin a richer preamble (the
         # Constitution + recent_decisions) so even cold conversations
         # clear the floor; for now we accept the cold-start hit.
+        # [PERSONA_DOUBLE_WRITE_FIX_2026_06_01]  The persona system prompt
+        # is ALSO pinned into the immutable tier by prepare_session
+        # (pin_system_prompt kind="persona_prompt"), so on the warm path it
+        # already arrives INSIDE the rendered blocks (cached, 24h).  This
+        # tail-append is the ORIGINAL injection path and predates pinning;
+        # once pins render correctly it became a straight DUPLICATE — the
+        # persona showed up twice, the second copy landing in the uncached
+        # tail and being rewritten EVERY turn (the 81k "volatile" blob the
+        # cache inspector flagged).  Append here ONLY as a fallback: when
+        # the rendered blocks do NOT already contain the persona text
+        # (TCMM degraded / pin not yet landed on a cold first turn).  When
+        # the pinned copy is present, skip the append entirely.
         if self.persona.system_prompt:
-            _persona_blk = {
-                "type": "text",
-                "text": self.persona.system_prompt,
-            }
-            # Only add my own cache_control when TCMM ISN'T managing the
-            # cache layout (degraded path).  When TCMM owns it, appending
-            # a 5m marker after TCMM's 1h markers triggers the mixed-ttl
-            # 400 error — see [CACHE_CONTROL_OWNERSHIP_2026_05_29].
-            if not _tcmm_owns_cache:
-                _persona_blk["cache_control"] = {"type": "ephemeral"}
-            raw_blocks.append(_persona_blk)
+            _persona_head = self.persona.system_prompt.strip()[:120]
+            _persona_already_rendered = any(
+                isinstance(b, dict) and _persona_head and _persona_head in b.get("text", "")
+                for b in raw_blocks
+            )
+            if not _persona_already_rendered:
+                _persona_blk = {
+                    "type": "text",
+                    "text": self.persona.system_prompt,
+                }
+                # Only add my own cache_control when TCMM ISN'T managing the
+                # cache layout (degraded path).  When TCMM owns it, appending
+                # a 5m marker after TCMM's 1h markers triggers the mixed-ttl
+                # 400 error — see [CACHE_CONTROL_OWNERSHIP_2026_05_29].
+                if not _tcmm_owns_cache:
+                    _persona_blk["cache_control"] = {"type": "ephemeral"}
+                raw_blocks.append(_persona_blk)
+            else:
+                logger.info(
+                    "[agent] persona already in rendered (pinned) blocks — "
+                    "skipping tail-append to avoid the uncached duplicate"
+                )
+
+        # [WORKSPACE_BLOCK_2026_06_01] Append the live client-daemon
+        # workspace state (connected folders + OS hint) as the FINAL system
+        # block, with NO cache_control so it sits in the uncached tail. It
+        # changes when the user switches projects, so it must stay OUT of
+        # the cached prefix (otherwise a project switch would force a cache
+        # rewrite). The proxy injects this into body["system"], which this
+        # harness discards when it rebuilds the prompt — ctx carries it
+        # through instead so the model actually sees the folders.
+        _ws_blk = getattr(ctx, "workspace_block", "") or ""
+        if _ws_blk.strip():
+            raw_blocks.append({"type": "text", "text": _ws_blk})
 
         # STEP 2 — PII redaction.  Block-level so cache_control markers
         # are preserved.  Same SessionId means same tokens whether this
@@ -607,17 +700,58 @@ class Agent(ABC):
         # the adapter wrapper so our event loop stays free.
         # prepare_tools() hook lets subclasses inject the shadow tool.
         try:
-            final_tools = self.prepare_tools(self.tools()) or None
-            # [PROMPT_CACHE_TOOLS_2026_05_28] Add cache_control to the
-            # LAST tool so Anthropic caches the whole tools array (and
-            # the system prefix that comes before it).  Director has
-            # ~17 tools = ~3000 tokens — adding this to the ~1000-token
-            # system prefix puts us safely over Haiku's 2048-token
-            # cache minimum.  Without this marker the cache silently
-            # no-ops (verified live: cache_create=0 cache_read=0).
-            # Only when TCMM isn't managing cache layout — a 5m tools
-            # marker combined with TCMM's 1h system markers also trips
-            # the mixed-ttl 400 (tools are processed before system).
+            # [TOOLS_NATIVE_FROM_IMMUTABLE_2026_06_01]  The native `tools`
+            # field is sourced from TCMM's IMMUTABLE tool_def pins, which the
+            # render endpoint extracts into `rendered.tools` (carried here as
+            # _render_tools).  This is the SINGLE delivery channel:
+            #   * tools are pinned (immutable source of truth, cached 24h)
+            #   * NOT rendered as text in the system blocks (no duplicate,
+            #     and the model couldn't invoke text anyway — it faked a
+            #     <function_calls> text block the dispatcher dropped)
+            #   * emitted here as the native field, which sits BEFORE
+            #     `system` in Anthropic's wire order → front of the cached
+            #     prefix, never after the volatile recalled memory, never a
+            #     per-turn rewrite, and natively invocable.
+            # Fall back to the agent's own prepared tools ONLY when TCMM is
+            # degraded (no render → _render_tools empty) so tool_use survives
+            # offline.  Either source already includes the shadow
+            # tcmm_record_turn tool (prepare_tools injects it before pinning).
+            final_tools = list(_render_tools) if _render_tools else (
+                self.prepare_tools(self.tools()) or None
+            )
+            # [TOOL_DEDUP_2026_06_01] Anthropic 400s the whole turn with
+            # "tools: Tool names must be unique" if any name repeats. This
+            # happens when the immutable pin lane holds MORE THAN ONE
+            # tool_def blob — e.g. the tool set grew (new sub-agents tools)
+            # so prepare_session pinned a fresh blob next to the old one,
+            # and /render_structured extracts BOTH, so overlapping tools
+            # appear twice. Dedup by name keeping the FIRST occurrence: every
+            # unique tool (including the newly-added ones, which exist only
+            # in the newer blob) survives, and the request stops 400ing.
+            if final_tools and isinstance(final_tools, list):
+                _seen_names: set = set()
+                _uniq_tools: list = []
+                _dropped = 0
+                for _tool in final_tools:
+                    _nm = _tool.get("name") if isinstance(_tool, dict) else None
+                    if _nm and _nm in _seen_names:
+                        _dropped += 1
+                        continue
+                    if _nm:
+                        _seen_names.add(_nm)
+                    _uniq_tools.append(_tool)
+                if _dropped:
+                    logger.warning(
+                        f"[agent] dropped {_dropped} duplicate tool name(s) "
+                        f"before send (Anthropic requires unique tool names)"
+                    )
+                final_tools = _uniq_tools
+            # [PROMPT_CACHE_TOOLS_2026_05_28] Add cache_control to the LAST
+            # tool ONLY when TCMM isn't managing the cache layout (degraded).
+            # When TCMM owns it, the immutable system marker already covers
+            # the (earlier-in-wire-order) tools field; adding a 5m tools
+            # marker on top of TCMM's 1h system markers trips Anthropic's
+            # mixed-ttl 400 (tools are processed before system).
             # [CACHE_CONTROL_OWNERSHIP_2026_05_29]
             if (not _tcmm_owns_cache) and final_tools and isinstance(final_tools, list) and len(final_tools) > 0:
                 last_tool = dict(final_tools[-1])  # copy so we don't mutate caller's list
@@ -629,6 +763,7 @@ class Agent(ABC):
                 system_prompt=(
                     None if redacted_blocks else self.persona.system_prompt
                 ),
+                # Native tools field, sourced from the immutable pins above.
                 tools=final_tools,
                 agent_id=self.agent_id,
             )
@@ -728,8 +863,24 @@ class Agent(ABC):
             _sections: list[str] = []
             if _sys_text:
                 _sections.append(f"[SYSTEM]\n{_sys_text}")
-            _sections.append(f"[TOOLS]\n{_tools_json}")
-            _sections.append(f"[MESSAGES]\n{_msgs_json}")
+            # [TOOLS_NATIVE_FROM_IMMUTABLE_2026_06_01] Tool schemas are sent
+            # as Anthropic's native `tools` field, sourced from the immutable
+            # tool_def pins (single source of truth) — NOT duplicated as text
+            # in [SYSTEM]. The native field sits BEFORE system in wire order,
+            # so it's at the front of the cached prefix. Log it here so the
+            # audit reflects the real request (this is the front-of-prefix
+            # tools array, not a second copy of the [SYSTEM] text).
+            _sections.append(
+                f"[TOOLS] (native field, {len(final_tools or [])} schemas, "
+                f"cached at front of prefix)\n{_tools_json}"
+            )
+            # [MESSAGES_LAST_ONLY_2026_06_01] The adapter is sent ONLY the
+            # latest user message (redacted_user_msg) — prior turns are
+            # consumed into TCMM memory and recalled, NOT re-sent to the LLM.
+            # Log what is ACTUALLY sent, not the full conversation history
+            # (the old redacted_messages dump was a misleading display
+            # artifact, exactly like the old [TOOLS] dump).
+            _sections.append(f"[MESSAGES]\n{redacted_user_msg}")
             _to_llm_full = "\n\n".join(_sections)
 
             yield events.audit(
@@ -791,11 +942,21 @@ class Agent(ABC):
             _cid, _uid, _mdl = ctx.conversation_id, ctx.user_id, result.model
             _fobj = flag_obj or None
             _um, _at = raw_user_msg, raw_text
+            _rk_inval = (_cid, _uid, self.persona.agent_id)
             async def _deferred_ingest():
                 if _um:
                     await ingest_user(_cid, _uid, _um)
                 if _at:
                     await ingest_assistant(_cid, _uid, _at, model=_mdl, flag_obj=_fobj)
+                # [RENDER_CACHE_FRESH_2026_06_01] This turn's prompt + reply
+                # just landed in TCMM live memory. Drop the cached render for
+                # this (conv,user,agent) so the NEXT turn RE-RENDERS and the
+                # turn surfaces in working memory immediately. Without this,
+                # _RENDER_CACHE (TTL=90s) served a STALE prefix for ~4-5 user
+                # turns, so a prompt didn't appear until the TTL lapsed — the
+                # reported "shows up at turn 4-5, not turn 2" lag. Pop AFTER
+                # ingest so the re-render is guaranteed to see this turn.
+                _RENDER_CACHE.pop(_rk_inval, None)
             _bg = _asyncio.create_task(_deferred_ingest())
             _BACKGROUND_TASKS.add(_bg)
             _bg.add_done_callback(_BACKGROUND_TASKS.discard)

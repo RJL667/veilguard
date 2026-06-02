@@ -7,6 +7,7 @@ def register_all(mcp):
     from tools import managed_tasks, daemons, teams, messaging
     from tools import utility, verify, transcripts, playbooks, file_tools
     from tools import ask_user, tool_search, plans, client_admin
+    from tools import host_docs
 
     # NOTE: scratchpad NOT registered as MCP tool — Claude misuses it to "save" user info.
     # Scratchpad is available inside spawn_agentic via the agentic tool handler.
@@ -19,5 +20,8 @@ def register_all(mcp):
                 # Phase C/D: daemon task introspection + permission_level
                 # MCP tools (list_my_tasks / task_status / cancel_task /
                 # get_permission_level / set_permission_level).
-                client_admin]:
+                client_admin,
+                # [HOST_DOC_READ_2026_06_01] read_pdf on the host (parses
+                # Windows-path PDFs the container documents server can't see).
+                host_docs]:
         mod.register(mcp)

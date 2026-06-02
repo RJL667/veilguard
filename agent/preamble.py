@@ -379,27 +379,87 @@ _VEILGUARD_PREAMBLE_TEMPLATE = (
 # ── Renderer ────────────────────────────────────────────────────────────
 
 
-def render_preamble(tools: Optional[list[dict]] = None) -> str:
+# [PREAMBLE_CORE_DELTA_2026-06-01]  Paragraphs that are ONLY relevant to
+# agents that orchestrate sub-agents / background tasks (the Director and
+# ICs).  A plain user-facing assistant that just chats + calls basic tools
+# never spawns sub-agents or submits long-running tasks, so these
+# paragraphs are dead weight (and mild misdirection) for it.  We identify
+# them by an exact start-of-paragraph prefix — precise enough not to catch
+# the §2 style rule, which legitimately *mentions* spawn_agent as one
+# example of "don't call tools when the user is just chatting" and stays in
+# core (any tool-using agent wants that rule).
+#
+# Splitting is by paragraph (``\n\n``) so the universal core stays a single
+# byte-stable block.  IMPORTANT: with_orchestration=True returns the
+# template VERBATIM (not a re-join), so the Director / IC cache slot is
+# 100% unchanged — no cache invalidation for the current live path.
+_ORCHESTRATION_PARA_PREFIXES = (
+    "Lineage: sub-agent conversations you spawn",
+    "When you spawn sub-agents (via spawn_agent",
+    "Long-running tasks (5-10 minutes) submitted via start_task",
+)
+
+
+def _strip_orchestration(template: str) -> str:
+    """Return the preamble with the orchestration-only paragraphs removed.
+
+    Splits on the paragraph separator, drops paragraphs whose stripped
+    text starts with one of the orchestration prefixes, and re-joins.
+    Used only for the lean (no-orchestration) variant — the full variant
+    returns the template verbatim for cache stability.
+    """
+    paras = template.split("\n\n")
+    kept = [
+        p for p in paras
+        if not any(
+            p.lstrip().startswith(prefix)
+            for prefix in _ORCHESTRATION_PARA_PREFIXES
+        )
+    ]
+    return "\n\n".join(kept)
+
+
+def render_preamble(
+    tools: Optional[list[dict]] = None,
+    *,
+    with_orchestration: bool = True,
+) -> str:
     """Build the Veilguard preamble — tool-agnostic.
 
     The ``tools`` parameter is retained for ABI compatibility (callers
     still pass it) but is IGNORED.  Tool schemas are no longer inlined
     into the preamble bytes — they get pinned separately via TCMM's
     /pin/tool_definitions endpoint and arrive natively in Anthropic's
-    ``tools`` request field.  Keeping the preamble tool-agnostic gives
-    one stable cache slot for the entire Veilguard frame, regardless
-    of which persona / tool variant is on the wire.
+    ``tools`` request field.
 
-    Cache-stability: byte-for-byte identical across all callers and
-    turns.  Pin once, hit forever.
+    ``with_orchestration`` (default True) controls whether the sub-agent /
+    background-task coordination paragraphs are included:
+
+      * True  → the FULL Veilguard frame, byte-for-byte identical to the
+                historical template.  This is what orchestrating agents
+                (Director, ICs) get, and it preserves their cache slot.
+      * False → the UNIVERSAL CORE only — identity/trust, style, answer
+                contract, memory semantics, recall failure modes, POPIA,
+                cyber context, citations, checklist — with the spawn /
+                long-running-task prose stripped.  This is the lean frame
+                for a plain user-facing assistant that never orchestrates.
+
+    Default stays True so existing callers are completely unaffected; the
+    lean variant is opt-in for the assistant/chat path (wired separately).
+
+    Cache-stability: each variant is byte-stable across callers and turns
+    — pin once, hit forever (two stable slots instead of one).
     """
     # Note: signature still accepts `tools` so we don't have to chase
     # every caller in lockstep; the arg is documented as IGNORED.
     _ = tools  # explicitly silence linters
-    return _VEILGUARD_PREAMBLE_TEMPLATE
+    if with_orchestration:
+        return _VEILGUARD_PREAMBLE_TEMPLATE
+    return _strip_orchestration(_VEILGUARD_PREAMBLE_TEMPLATE)
 
 
 __all__ = [
     "render_preamble",
     "_VEILGUARD_PREAMBLE_TEMPLATE",
+    "_ORCHESTRATION_PARA_PREFIXES",
 ]

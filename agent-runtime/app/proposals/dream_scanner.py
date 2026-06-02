@@ -270,6 +270,18 @@ class DreamScanner:
         self.importance_threshold: float = float(os.environ.get(
             "VEILGUARD_DREAM_IMPORTANCE_THRESHOLD", "5.0"
         ))
+        # [DREAM_BACKPRESSURE_2026_06_01] Hard cap on the pending-proposal
+        # queue. The dream cycle re-derives clusters with churning
+        # signal_node_ids, so create_proposal's node-id dedup misses and the
+        # queue ballooned to 345 rows (18 real clusters x dozens of dupes)
+        # in a 37h window — re-running the rank-pass LLM every cycle for
+        # work nobody drains. When pending >= this cap, _scan_once SKIPS the
+        # whole cycle (no scan, no scoring, no LLM rank pass, no emit) until
+        # a human approves/shelves some. Bounds the queue AND stops the idle
+        # LLM burn. Tunable via env.
+        self.max_pending_backpressure = int(os.environ.get(
+            "VEILGUARD_DREAM_MAX_PENDING", "25"
+        ))
 
     def notify_importance(self, score: float) -> None:
         """Accumulate importance contribution toward the early-fire
@@ -329,6 +341,28 @@ class DreamScanner:
             logger.debug(f"[dream_scanner] dream_archive unavailable: {e}")
             return {"rows_scanned": 0, "candidates": 0, "emitted": 0,
                     "skipped_dedup": 0, "by_signal": {}}
+
+        # [DREAM_BACKPRESSURE_2026_06_01] Skip the ENTIRE cycle if the
+        # pending queue is already at/over the cap. No point scanning,
+        # scoring, paying the Haiku rank pass, or emitting more proposals
+        # onto a backlog nobody is draining — that's exactly how 345 stale
+        # rows accumulated. The cap releases automatically once the user
+        # approves/shelves enough to drop pending back under the limit.
+        try:
+            _pending = db.open_table("task_proposals").count_rows(
+                "status = 'pending'"
+            )
+            if _pending >= self.max_pending_backpressure:
+                logger.info(
+                    f"[dream_scanner] backpressure: {_pending} pending >= cap "
+                    f"{self.max_pending_backpressure}; skipping cycle (no "
+                    f"scan/scoring/LLM/emit until the queue drains)"
+                )
+                return {"rows_scanned": 0, "candidates": 0, "emitted": 0,
+                        "skipped_dedup": 0, "skipped_backpressure": _pending,
+                        "by_signal": {}}
+        except Exception as _bpe:
+            logger.debug(f"[dream_scanner] backpressure check skipped: {_bpe}")
 
         # Scan recent rows — limit large to catch anything we missed
         # if the cursor reset (container restart).  Filtering happens

@@ -1,0 +1,35 @@
+PK	3	4	
+	*	0	0	0	xl/workbook.xml­	­	<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>
+PK	3	4	
+	*	0	0	0	xl/worksheets/sheet1.xml­	­	<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<sheetData>
+<row r="1"><c r="A1" t="str"><v>Name</v></c><c r="B1" t="str"><v>Score</v></c><c r="C1" t="str"><v>Status</v></c></row>
+<row r="2"><c r="A2" t="str"><v>Alice</v></c><c r="B2" t="n"><v>85</v></c><c r="C2" t="str"><v>Pass</v></c></row>
+<row r="3"><c r="A3" t="str"><v>Bob</v></c><c r="B3" t="n"><v>72</v></c><c r="C3" t="str"><v>Pass</v></c></row>
+<row r="4"><c r="A4" t="str"><v>Charlie</v></c><c r="B4" t="n"><v>58</v></c><c r="C4" t="str"><v>Fail</v></c></row>
+<row r="5"><c r="A5" t="str"><v>Diana</v></c><c r="B5" t="n"><v>92</v></c><c r="C5" t="str"><v>Pass</v></c></row>
+</sheetData>
+</worksheet>
+PK	3	4	
+	*	0	0	0	_rels/.rels­	­	<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>
+PK	3	4	
+	*	0	0	0	xl/_rels/workbook.xml.rels­	­	<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+</Relationships>
+PK	3	4	
+	*	0	0	0	[Content_Types].xml­	­	<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>
+PK

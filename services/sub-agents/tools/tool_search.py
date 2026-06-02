@@ -46,6 +46,7 @@ TOOL_CATALOG = {
     "stop_daemon": "Stop a running daemon",
     "list_daemons": "List all daemons and their status",
     "daemon_log": "View recent observations from a daemon",
+    "daemon_wait": "Wait for a daemon to record its next observation(s)",
     # Schedules
     "schedule_task": "Schedule a recurring task on an interval",
     "run_schedule": "Manually trigger a scheduled task",

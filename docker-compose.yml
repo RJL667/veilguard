@@ -171,6 +171,7 @@ services:
       - ANTHROPIC_API_URL=${ANTHROPIC_API_URL:-https://api.anthropic.com}
       - AGENT_RUNTIME_PORT=5000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ANTHROPIC_DUMP_REQUESTS=1
       - TCMM_ENABLED=${TCMM_ENABLED:-true}
       - TCMM_URL=${TCMM_URL:-http://host.docker.internal:8811}
       # [PII_RENDER_REDACT_2026_05_30] memory redacted at render → boundary

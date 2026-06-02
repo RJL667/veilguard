@@ -36,7 +36,13 @@ rem lookups are O(1) instead of a 320x Lance checkout-storm (3.6s->0.13s).
 set VEILGUARD_RECALL_SCOPE=user
 set VEILGUARD_RENDER_RECALL_SCOPE=user
 set TCMM_EAGER_BULK_WARM=1
-start "Veilguard-TCMM" /min cmd /c "set VEILGUARD_RECALL_SCOPE=user&& set VEILGUARD_RENDER_RECALL_SCOPE=user&& set TCMM_EAGER_BULK_WARM=1&& python services\tcmm-service\server.py --port 8811"
+rem [TCMM_ROOT_FIX_2026-06-01] .env line 53 has a stale container path
+rem TCMM_ROOT=/opt/tcmm; on the Windows host that breaks `from adapters...`
+rem (ModuleNotFoundError) because sys.path.insert gets a nonexistent dir.
+rem Set the real canonical tree here so it wins over .env (load_dotenv
+rem uses override=False, so a process-env value takes precedence).
+rem Also pin NLP_BACKEND=ai_studio (host has no GPU; local NLP needs one).
+start "Veilguard-TCMM" /min cmd /c "set TCMM_ROOT=C:\Users\rudol\.gemini\antigravity\tcmm\TCMM&& set NLP_BACKEND=ai_studio&& set VEILGUARD_RECALL_SCOPE=user&& set VEILGUARD_RENDER_RECALL_SCOPE=user&& set TCMM_EAGER_BULK_WARM=1&& python services\tcmm-service\server.py --port 8811"
 timeout /t 2 /nobreak >nul
 
 echo [6/6] Starting Docker services (LibreChat + PII proxy)...

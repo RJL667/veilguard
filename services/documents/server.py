@@ -56,10 +56,12 @@ def _safe_path(path: str) -> Path:
             f"Path {path!r} looks like a Windows absolute path, but this "
             f"server runs in a Linux container with workspace at "
             f"{WORKSPACE}. The container does not mirror the user's "
-            f"Windows filesystem. Pass a workspace-relative path instead, "
-            f"e.g. {suggestion!r} (lands at {WORKSPACE}/{suggestion}). "
-            f"For files that must end up on the user's Windows host, use "
-            f"the host-exec server's host_file_write tool instead."
+            f"Windows filesystem. To read or create a document on the user's "
+            f"Windows host, use the sub-agents server's host tools — "
+            f"`read_pdf`, `read_xlsx`, `create_xlsx` — with this same Windows "
+            f"path; they run on the host. Only pass a workspace-relative path "
+            f"(e.g. {suggestion!r} → {WORKSPACE}/{suggestion}) if you "
+            f"deliberately want the file inside the container sandbox."
         )
     if "\\" in path:
         raise ValueError(

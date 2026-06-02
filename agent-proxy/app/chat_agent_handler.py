@@ -169,17 +169,26 @@ async def handle_chat_request(
     # agents down, daemon offline, network hiccup), we proceed without
     # the block.  The user's chat keeps working; the LLM just won't
     # know which folders are pinned.
+    # [WORKSPACE_BLOCK_2026_06_01] The unified harness (base.py run_turn)
+    # rebuilds the prompt from the TCMM render + last message and DISCARDS
+    # body["system"], so the old _inject_workspace_state(body, ...) was
+    # silently dropped (verified: workspace block absent from every TO_LLM).
+    # Carry the rendered block on the TurnContext instead; base.py appends
+    # it as a FRESH (uncached) system tail block so a project switch takes
+    # effect next turn with no cache churn.
+    _ws_block = ""
     if user_id:
         try:
-            from app.main import _fetch_workspace_state, _inject_workspace_state
+            from app.main import _fetch_workspace_state, _render_workspace_block
             ws_state = await _fetch_workspace_state(user_id)
             if ws_state:
-                _inject_workspace_state(body, "anthropic", ws_state)
-                logger.info(
-                    f"[chat_agent] injected workspace state: "
-                    f"folders={len(ws_state.get('folders') or [])} "
-                    f"client={ws_state.get('client_id', '?')}"
-                )
+                _ws_block = _render_workspace_block(ws_state) or ""
+                if _ws_block:
+                    logger.info(
+                        f"[chat_agent] workspace block ready: "
+                        f"folders={len(ws_state.get('folders') or [])} "
+                        f"client={ws_state.get('client_id', '?')}"
+                    )
         except Exception as _e:
             logger.debug(f"[chat_agent] workspace fetch failed: {_e}")
 
@@ -209,6 +218,7 @@ async def handle_chat_request(
         conversation_id=conversation_id or f"conv-{uuid.uuid4().hex[:8]}",
         user_id=user_id,
         tenant_id=tenant_id or user_id,
+        workspace_block=_ws_block,
     )
 
     logger.info(

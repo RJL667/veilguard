@@ -51,5 +51,28 @@
     "updated_at": 1778714303.29934,
     "run_count": 13,
     "last_error": null
+  },
+  "extract_pdf": {
+    "name": "extract_pdf",
+    "description": "Extract text content from a PDF file using pdfplumber",
+    "args": {
+      "path": "string"
+    },
+    "created_at": 1780327869.668721,
+    "updated_at": 1780327869.668721,
+    "run_count": 2,
+    "last_error": null
+  },
+  "excel_test": {
+    "name": "excel_test",
+    "description": "Create and read an Excel file with sample data",
+    "args": {
+      "path": "string",
+      "action": "string"
+    },
+    "created_at": 1780328315.0709321,
+    "updated_at": 1780328315.0709321,
+    "run_count": 0,
+    "last_error": null
   }
 }

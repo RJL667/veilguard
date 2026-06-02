@@ -248,10 +248,15 @@ async def observe_tool(args: dict[str, Any]) -> dict[str, Any]:
 @tool(
     name="read_constitution",
     description=(
-        "Return the current org Constitution: objectives (with weights), "
-        "constraints (with rules), metrics. Director uses this to decide "
-        "if a proposed Task would violate any constraint, and to compute "
-        "objective_alignment when ranking proposals."
+        "Return the ORGANIZATION'S GOVERNANCE CONSTITUTION — the org's "
+        "objectives (with weights), constraints (with rules), and metrics. "
+        "This is internal policy/governance data, takes NO arguments, and "
+        "does NOT read files of any kind. Do NOT use it to read a "
+        "spreadsheet, PDF, document, or any file the user mentions — for "
+        "those use read_xlsx (Excel), read_pdf (PDF), or read_file (text). "
+        "Use read_constitution ONLY to check whether a proposed Task "
+        "violates a constraint, or to compute objective_alignment when "
+        "ranking proposals."
     ),
     input_schema={
         "type": "object",

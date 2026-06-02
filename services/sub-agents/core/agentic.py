@@ -120,6 +120,19 @@ async def handle_tool(name: str, args: dict) -> str:
     # web_search queries / file paths / shell commands and tools fail.
     args = await _rehydrate_args(args)
 
+    # [LIST_DIRECTORY_ALIAS_2026_06_01] `list_directory` is a thin alias
+    # over `search_files`: the daemon has no `_tool_list_directory` (its WS
+    # `list_directory` is the folder-picker control channel, not a tool),
+    # and this dispatcher's local execution is a hardcoded name chain that
+    # doesn't know it.  Rewrite to a glob-`*` search so the immediate
+    # children (files + folders) of `path` (default: the workspace root)
+    # are listed via the existing search_files client-routing → daemon →
+    # the user's actual machine.  This is what answers "what files are in
+    # my workspace?".
+    if name == "list_directory":
+        name = "search_files"
+        args = {"pattern": "*", "path": (args.get("path") or "")}
+
     # Check if this tool should be routed to the client daemon
     from utils.tool_location import is_client_tool, SANDBOX_FALLBACK_TOOLS
     from core.client_bridge import SANDBOX_USER_ID

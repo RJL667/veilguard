@@ -29,6 +29,7 @@ frontend never sees ``undefined`` keys.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -128,20 +129,31 @@ def _windowed_rows(
 
     # Cache miss — resolve the window now and do the actual scan.
     s, e = _resolve_window(start_ts, end_ts, window_hours)
+    # [LEAK_FIX_2026_06_01] Push the time-window + user filter AND column
+    # projection INTO Lance (DataFusion) so it materialises only the windowed
+    # rows + the columns the dashboard reads — instead of to_arrow()-ing the
+    # ENTIRE audit history (every prompt's full `content`) into RAM on every
+    # ~10s refresh, copying it through a pyarrow mask, and caching it. That
+    # full-history load — repeated and retained — is what pinned admin at ~3GB.
+    _COLS = [
+        "aid", "created_at", "direction", "user_id", "conversation_id",
+        "model", "tokens_input", "tokens_output", "cache_create",
+        "cache_read", "extra", "content",
+    ]
     try:
         t = _open_table()
-        arr = t.to_arrow()
+        _where = f"created_at >= {float(s)} AND created_at < {float(e)}"
+        if user_id:
+            _u = str(user_id).replace("'", "''")
+            _where += f" AND user_id = '{_u}'"
+        # search() with no vector = plain filtered scan; .where() + .select()
+        # push predicate + projection to the engine (no Python-side mask copy).
+        arr = t.search().where(_where).select(_COLS).to_arrow()
     except Exception as ex:
-        logger.info("pii_audit table unavailable: %s", ex)
+        logger.info("pii_audit windowed scan failed: %s", ex)
         return s, e, None
 
-    mask = pc.and_(
-        pc.greater_equal(arr.column("created_at"), s),
-        pc.less(arr.column("created_at"), e),
-    )
-    if user_id:
-        mask = pc.and_(mask, pc.equal(arr.column("user_id"), user_id))
-    result = (s, e, arr.filter(mask))
+    result = (s, e, arr)
 
     _WINDOWED_CACHE[key] = (now, result)
     # Evict oldest if we've accumulated too many distinct keys
@@ -269,12 +281,24 @@ def per_user(
     timestamps = sub.column("created_at").to_pylist()
     tokens_in = sub.column("tokens_input").to_pylist()
     tokens_out = sub.column("tokens_output").to_pylist()
+    extras = sub.column("extra").to_pylist()
 
     by_user: dict[str, dict[str, Any]] = {}
-    for uid, d, c, conv, ts, ti, to in zip(
-        users, dirs, contents, convs, timestamps, tokens_in, tokens_out
+    for uid, d, c, conv, ts, ti, to, ex_raw in zip(
+        users, dirs, contents, convs, timestamps, tokens_in, tokens_out, extras
     ):
         if not uid:
+            continue
+        # [DEDUP_2026_06_01] Skip the per-turn ``turn_summary`` roll-up
+        # rows (record_turn) — their tokens are already accounted for by
+        # the per-call ``agent_event`` rows (record_event). Counting both
+        # inflated user totals ~2.5x and made them irreconcilable with the
+        # per-agent rows. Same filter per_agent() uses.
+        try:
+            ex = json.loads(ex_raw) if ex_raw else {}
+        except Exception:
+            ex = {}
+        if ex.get("kind") == "turn_summary":
             continue
         u = by_user.setdefault(
             uid,
@@ -292,7 +316,6 @@ def per_user(
                 "last_seen": 0,
             },
         )
-        u["calls"] += 1
         if conv:
             u["conversations"].add(conv)
         cl = len(c) if c else 0
@@ -302,11 +325,14 @@ def per_user(
             if c:
                 for m in KIND_RE.finditer(c):
                     u["redactions"][m.group(1)] += 1
-        else:
+        elif d == "FROM_LLM":
+            # Tokens live on the response side. Summing tokens_in on
+            # TO_LLM too would double-count input (both rows carry it).
             u["from_llm"] += 1
+            u["calls"] += 1
             u["from_llm_bytes"] += cl
-        u["tokens_in"] += ti or 0
-        u["tokens_out"] += to or 0
+            u["tokens_in"] += ti or 0
+            u["tokens_out"] += to or 0
         if ts and ts > u["last_seen"]:
             u["last_seen"] = ts
 
@@ -317,6 +343,104 @@ def per_user(
         u["conversations"] = len(u["conversations"])
         rows.append(u)
     rows.sort(key=lambda r: r["calls"], reverse=True)
+    return rows[:top_n]
+
+
+def per_agent(
+    window_hours: Optional[int] = 24,
+    top_n: int = 30,
+    *,
+    start_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    user_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Per-agent (agent-runtime IC) call + token rollup over the window.
+
+    ``per_user`` collapses every background dispatch under the libreuser
+    id the agents inherit, so the operator can't see which agent spent
+    the quota.  This groups FROM_LLM rows by ``extra.agent_id`` instead
+    — director / researcher / builder / critic-claim / critic-prose —
+    answering "which agent burned my usage".
+
+    Emits the SAME column shape as ``per_user`` (to_llm / from_llm /
+    conversations / tokens_in / tokens_out / to_llm_bytes /
+    redactions_total / last_seen) so the dashboard can list agents and
+    users in ONE table.  ``owner_user_id`` is the user the agent most
+    often acted for (so the endpoint can show its email).
+
+    Token totals come from the per-call ``agent_event`` rows; the
+    per-turn ``turn_summary`` rows are skipped so tokens aren't
+    double-counted (the summary equals the sum of its events).
+    """
+    s, e, sub = _windowed_rows(start_ts, end_ts, window_hours, user_id)
+    if sub is None or sub.num_rows == 0:
+        return []
+
+    dirs = sub.column("direction").to_pylist()
+    extras = sub.column("extra").to_pylist()
+    ti = sub.column("tokens_input").to_pylist()
+    to_ = sub.column("tokens_output").to_pylist()
+    cr = sub.column("cache_read").to_pylist()
+    times = sub.column("created_at").to_pylist()
+    contents = sub.column("content").to_pylist()
+    convs = sub.column("conversation_id").to_pylist()
+    users = sub.column("user_id").to_pylist()
+
+    by_agent: dict[str, dict[str, Any]] = {}
+    for i in range(sub.num_rows):
+        try:
+            ex = json.loads(extras[i]) if extras[i] else {}
+        except Exception:
+            ex = {}
+        if ex.get("kind") == "turn_summary":
+            continue  # avoid double-count — agent_event rows carry the tokens
+        agent = ex.get("agent_id")
+        if not agent:
+            continue
+        a = by_agent.setdefault(agent, {
+            "agent_id": agent,
+            "calls": 0,
+            "to_llm": 0,
+            "from_llm": 0,
+            "tokens_in": 0,
+            "tokens_out": 0,
+            "to_llm_bytes": 0,
+            "cache_read": 0,
+            "conversations": set(),
+            "redactions": Counter(),
+            "owner_ids": Counter(),
+            "last_seen": 0,
+        })
+        c = contents[i] or ""
+        if dirs[i] == "TO_LLM":
+            a["to_llm"] += 1
+            a["to_llm_bytes"] += len(c)
+            for m in KIND_RE.finditer(c):
+                a["redactions"][m.group(1)] += 1
+        elif dirs[i] == "FROM_LLM":
+            a["from_llm"] += 1
+            a["calls"] += 1
+            a["tokens_in"] += ti[i] or 0
+            a["tokens_out"] += to_[i] or 0
+            a["cache_read"] += cr[i] or 0
+        if convs[i]:
+            a["conversations"].add(convs[i])
+        if users[i]:
+            a["owner_ids"][users[i]] += 1
+        if times[i] and times[i] > a["last_seen"]:
+            a["last_seen"] = times[i]
+
+    rows: list[dict[str, Any]] = []
+    for a in by_agent.values():
+        a["conversations"] = len(a["conversations"])
+        a["redactions"] = dict(a["redactions"])
+        a["redactions_total"] = sum(a["redactions"].values())
+        a["owner_user_id"] = (
+            a["owner_ids"].most_common(1)[0][0] if a["owner_ids"] else ""
+        )
+        del a["owner_ids"]
+        rows.append(a)
+    rows.sort(key=lambda r: r["tokens_in"], reverse=True)
     return rows[:top_n]
 
 
@@ -367,6 +491,7 @@ def recent_redactions(
     cr = sub.column("cache_read").to_pylist()
     ti = sub.column("tokens_input").to_pylist()
     to_ = sub.column("tokens_output").to_pylist()
+    extras = sub.column("extra").to_pylist()
 
     # Pass 1 (asc): build TO_LLM aid → FROM_LLM idx mapping.
     pair: dict[int, int] = {}
@@ -390,6 +515,16 @@ def recent_redactions(
         c = contents[i] or ""
         kinds = Counter(KIND_RE.findall(c))
         pi = pair.get(aids[i])
+        # Pull the agent-runtime identity out of the extra JSON so the
+        # dashboard can ATTRIBUTE each row to the IC that made it
+        # (researcher / builder / critic / director).  Without this, every
+        # background dispatch is invisible-as-an-agent: it inherits the
+        # libreuser's user_id, so the operator sees "the libreuser" doing
+        # everything instead of seeing the agents.  Best-effort parse.
+        try:
+            _ex = json.loads(extras[i]) if extras[i] else {}
+        except Exception:
+            _ex = {}
         out.append(
             {
                 "aid": aids[i],
@@ -404,6 +539,9 @@ def recent_redactions(
                 "tokens_input": (ti[pi] if pi is not None else None),
                 "tokens_output": (to_[pi] if pi is not None else None),
                 "turn_type":     _classify_turn(convs[i], c),
+                "agent_id":      _ex.get("agent_id"),
+                "task_id":       _ex.get("task_id"),
+                "source":        _ex.get("source"),
             }
         )
         if len(out) >= limit:
@@ -456,12 +594,13 @@ def request_detail(aid: int) -> dict[str, Any]:
     """
     try:
         t = _open_table()
-        arr = t.to_arrow()
+        # [LEAK_FIX_2026_06_01] Predicate-pushdown the single aid instead of
+        # to_arrow()-ing the ENTIRE audit history just to find one row — that
+        # full load made every popup click pull ~600MB and lag the dashboard.
+        sub = t.search().where(f"aid = {int(aid)}").to_arrow()
     except Exception as e:
         return {"error": f"open pii_audit failed: {e}"}
 
-    mask = pc.equal(arr.column("aid"), int(aid))
-    sub = arr.filter(mask)
     if sub.num_rows == 0:
         return {"error": f"aid {aid} not found"}
     row = sub.slice(0, 1)
@@ -570,7 +709,21 @@ def cache_overview(
         }
 
     dirs = sub.column("direction").to_pylist()
-    from_idx = [i for i, d in enumerate(dirs) if d == "FROM_LLM"]
+    extras = sub.column("extra").to_pylist()
+
+    def _is_turn_summary(i: int) -> bool:
+        try:
+            return (json.loads(extras[i]) if extras[i] else {}).get("kind") == "turn_summary"
+        except Exception:
+            return False
+
+    # [DEDUP_2026_06_01] FROM_LLM rows EXCLUDING the per-turn roll-up
+    # (record_turn) so cache/token totals aren't double-counted against
+    # the per-call agent_event rows that carry the same numbers.
+    from_idx = [
+        i for i, d in enumerate(dirs)
+        if d == "FROM_LLM" and not _is_turn_summary(i)
+    ]
     if not from_idx:
         return {**empty, "start_ts": s, "end_ts": e}
 

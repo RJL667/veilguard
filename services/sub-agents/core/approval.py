@@ -39,20 +39,15 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-# Reach agent-runtime's policy module via sys.path probe — same shape as
-# the chat_agent_handler's `/agent` mount discovery.  Inside the
-# sub-agents container `/agent-runtime` is mounted as a sibling of
-# `/app`; on host it's `Documents/veilguard/agent-runtime/`.
-_HERE = Path(__file__).resolve()
-for _candidate in [*_HERE.parents, Path("/")]:
-    _ar = _candidate / "agent-runtime"
-    if (_ar / "app" / "policy" / "client_tool_policy.py").is_file():
-        if str(_ar) not in sys.path:
-            sys.path.insert(0, str(_ar))
-        break
-
+# [POLICY_REHOME_2026_05_31]  The canonical client-tool policy now lives IN
+# this service (`core/policy.py`), per the 2026-05-25 decision to centralise
+# approval in sub-agents.  (The old `app.policy.client_tool_policy` in
+# agent-runtime was removed then but never re-homed, which left this gate in
+# a degraded blanket-approve/fail-closed mode.)  Import the local module; if
+# it can't load for any reason, `_POLICY_OK` stays False and gate() fails
+# CLOSED (forces an approval toast — see the `_policy_unavailable` path).
 try:
-    from app.policy.client_tool_policy import (
+    from .policy import (
         classify as _classify_policy,
         Decision as _PolicyDecision,
         CLIENT_TOOLS as _POLICY_CLIENT_TOOLS,
@@ -139,6 +134,16 @@ async def gate(
         )
 
     # ── Static policy classification ─────────────────────────────────────
+    # [APPROVAL_FAILCLOSED_2026_05_31]  The static policy module
+    # (`app.policy.client_tool_policy`) was removed 2026-05-25 and never
+    # re-homed into sub-agents, so `_POLICY_OK` is False in production.  When
+    # the policy brain is unavailable we MUST NOT silently run client tools:
+    # `_policy_unavailable` forces an explicit user-approval toast below even
+    # at permission_level=auto.  Previously this branch blanket-APPROVED,
+    # which meant any conversation pinned to `auto` (via the toast's "always
+    # for this conv" button) would run EVERY client tool — including
+    # run_command / write_file — with no check and no toast.
+    _policy_unavailable = False
     if _POLICY_OK and _classify_policy is not None:
         try:
             result = _classify_policy(
@@ -153,16 +158,18 @@ async def gate(
         except Exception as e:
             logger.warning(f"[approval] policy classify failed: {e}")
             policy_decision = "approve"
-            policy_reason = f"policy fault, defaulting to APPROVE: {e}"
+            policy_reason = f"policy fault, requiring approval: {e}"
+            _policy_unavailable = True   # unknown decision → fail closed
     else:
-        # If we can't load the policy module at all, fail closed for
-        # CLIENT_TOOLS we don't recognise as server-only.
+        # Can't load the policy module → fail CLOSED: require explicit
+        # approval for every client tool rather than blanket-approving.
         logger.warning(
-            "[approval] policy module not importable — degrading to "
-            "blanket APPROVE for daemon-routed tools"
+            "[approval] policy module not importable — FAIL-CLOSED: every "
+            "client tool now requires explicit user approval (no silent run)"
         )
         policy_decision = "approve"
-        policy_reason = "policy module unavailable (fallback APPROVE)"
+        policy_reason = "policy module unavailable — approval required (fail-closed)"
+        _policy_unavailable = True
 
     # Hard DENY is final.
     if policy_decision == "deny":
@@ -181,6 +188,16 @@ async def gate(
         level, timeout_s = DEFAULT_LEVEL, DEFAULT_TIMEOUT_S
 
     needs_approval = _needs_user_approval(policy_decision, level)
+    # [APPROVAL_FAILCLOSED_2026_05_31]  Policy brain unavailable → never allow
+    # a silent run.  Force the approval round-trip even when the level would
+    # otherwise auto-allow (level=auto, or level!=strict on an ALLOW).  This
+    # only flips the case that would have run with NO check; callers already
+    # at needs_approval=True (the default `confirm` path, server/IC callers)
+    # are unchanged, and the `system:sandbox` identity already returned above.
+    if _policy_unavailable and not needs_approval:
+        needs_approval = True
+        policy_reason += " [fail-closed: forcing approval, policy unavailable]"
+
     if not needs_approval:
         return GateResult(
             proceed=True,

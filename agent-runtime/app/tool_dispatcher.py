@@ -118,11 +118,35 @@ async def dispatch(tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]
     returns an isError result with a clear message — the LLM sees it on
     its next turn and can react.
     """
-    bare = _strip_mcp_prefix(tool_name)
-    logger.info(f"[tool_dispatcher] dispatch {tool_name!r} (bare={bare!r})")
+    # [MCP_SUFFIX_STRIP_2026_06_01] LibreChat suffix-mangles MCP tools as
+    # `<tool>_mcp_<server>` (e.g. `list_directory_mcp_sub-agents`,
+    # `run_command_mcp_sub-agents`).  `_strip_mcp_prefix` only handled the
+    # `mcp__server__tool` PREFIX form, so the suffix form fell through
+    # UNSTRIPPED → Path-1 miss → Path-2 forwarded the mangled name →
+    # sub-agents `is_client_tool()`/handle_tool didn't recognize it →
+    # "tool not available", which is exactly the failure the user hit
+    # ("the MCP naming screwed it up").  Strip the suffix to the bare name.
+    #
+    # CRITICAL — a suffix-mangled name EXPLICITLY belongs to an MCP server
+    # (the user's interactive sub-agents/daemon tools), so it MUST reach
+    # the daemon via Path 2 and must NOT be intercepted by a same-named
+    # in-process Path-1 handler.  `workspace_fs.list_directory` lists the
+    # CONTAINER's /workspace (the agents' shared drafts) — answering "what
+    # files are in MY workspace?" from there would silently show the wrong
+    # filesystem.  So we skip Path 1 entirely for suffix-mangled tools.
+    _is_mcp_suffix = ("_mcp_" in tool_name) and not tool_name.startswith("mcp__")
+    if _is_mcp_suffix:
+        bare = tool_name.rsplit("_mcp_", 1)[0]
+    else:
+        bare = _strip_mcp_prefix(tool_name)
+    logger.info(
+        f"[tool_dispatcher] dispatch {tool_name!r} "
+        f"(bare={bare!r}, mcp_suffix={_is_mcp_suffix})"
+    )
 
     # Path 1 — in-process (server-side ledger / memory tools).
-    handler = _HANDLER_REGISTRY.get(bare)
+    # Skipped for suffix-mangled MCP tools — see note above.
+    handler = None if _is_mcp_suffix else _HANDLER_REGISTRY.get(bare)
     if handler is not None:
         try:
             res = await handler(tool_input)
@@ -177,7 +201,10 @@ async def dispatch(tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]
             "x-user-id":         ctx.user_id,
             "x-conversation-id": ctx.conversation_id,
         }
-        payload = {"tool_name": tool_name, "tool_input": tool_input,
+        # Forward the BARE name — sub-agents' is_client_tool()/handle_tool
+        # match bare names (`list_directory`, `run_command`), never the
+        # `_mcp_<server>`-mangled or `mcp__server__`-prefixed forms.
+        payload = {"tool_name": bare, "tool_input": tool_input,
                    "agent_id":  ctx.agent_id}
         async with _httpx.AsyncClient(timeout=90.0) as client:
             r = await client.post(

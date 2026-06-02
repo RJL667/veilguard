@@ -560,7 +560,7 @@
   <section class="rounded-xl bg-bg-900 border border-line shadow-card p-5 mb-5">
     <div class="flex items-baseline justify-between mb-3">
       <h2 class="text-sm font-semibold text-text-hi tracking-wide">MESSAGES TO LLM · <span x-text="windowLabel()"></span></h2>
-      <span class="text-[11px] text-text-lo">click a user name to drill in</span>
+      <span class="text-[11px] text-text-lo">users + agent-runtime ICs · agents are the breakdown of each user's total</span>
     </div>
     <div class="overflow-x-auto scrollbar-thin">
       <table class="w-full text-xs">
@@ -579,11 +579,18 @@
         </thead>
         <tbody>
           <template x-for="r in (messagesPerUser || [])" :key="r.user_id">
-            <tr class="border-t border-line/40">
+            <tr class="border-t border-line/40" :class="r.type === 'agent' ? 'bg-purple-500/5' : ''">
               <td class="py-1.5">
-                <span class="user-link"
-                      @click="selectUser(r.user_id, r.name)"
-                      x-text="r.name || '—'"></span>
+                <template x-if="r.type === 'agent'">
+                  <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-purple-500/20 text-purple-300"
+                        title="agent-runtime IC — breakdown of the owning user's total"
+                        x-text="r.name"></span>
+                </template>
+                <template x-if="r.type !== 'agent'">
+                  <span class="user-link"
+                        @click="selectUser(r.user_id, r.name)"
+                        x-text="r.name || '—'"></span>
+                </template>
               </td>
               <td class="py-1.5 text-text-mid font-mono text-[11px]" x-text="r.email || ''"></td>
               <td class="py-1.5 text-right text-text-hi stat-num" x-text="fmt(r.to_llm)"></td>
@@ -663,14 +670,16 @@
                 <span x-text="fmtConvId(r.conversation_id)"></span>
                 <span class="ml-1 px-1 py-0 rounded text-[9px] font-mono align-middle"
                       :class="{
-                        'bg-em/20 text-em':                r.turn_type === 'turn',
-                        'bg-text-lo/15 text-text-mid':    r.turn_type === 'tool',
-                        'bg-blue-500/20 text-blue-300':   r.turn_type === 'sub',
+                        'bg-purple-500/20 text-purple-300': r.turn_type === 'sub' &amp;&amp; r.agent_id,
+                        'bg-blue-500/20 text-blue-300':     r.turn_type === 'sub' &amp;&amp; !r.agent_id,
+                        'bg-em/20 text-em':                 r.turn_type === 'turn',
+                        'bg-text-lo/15 text-text-mid':      r.turn_type === 'tool',
                       }"
-                      x-text="r.turn_type || 'turn'"
-                      :title="r.turn_type === 'tool' ? 'Tool-result follow-up — model continuing after a tool execution. Shares conv_id with the parent user turn.'
-                            : r.turn_type === 'sub'  ? 'Sub-agent LLM call (spawn_agent/spawn_agentic) — fresh conv_id, separate TCMM namespace.'
-                            : 'Main user turn — full TCMM preamble.'"></span>
+                      x-text="(r.turn_type === 'sub' &amp;&amp; r.agent_id) ? r.agent_id : (r.turn_type || 'turn')"
+                      :title="(r.turn_type === 'sub' &amp;&amp; r.agent_id) ? ('background agent-runtime IC: ' + r.agent_id + (r.task_id ? ' · task ' + r.task_id : ''))
+                            : r.turn_type === 'tool' ? 'Tool-result follow-up — model continuing after a tool execution. Shares conv_id with the parent user turn.'
+                            : r.turn_type === 'sub'  ? 'Sub-agent LLM call — fresh conv_id, separate TCMM namespace.'
+                            : 'Main user turn (Director-handled) — full TCMM preamble.'"></span>
               </td>
               <!-- tokens_input is null until the FROM_LLM row is paired
                    in by recent_redactions. Same pending-vs-orphan
@@ -833,8 +842,8 @@
             <button class="w-full flex items-center justify-between px-3 py-2 bg-bg-800 hover:bg-bg-700 text-left"
                     @click="sectionOpen[sec.label] = !sectionOpen[sec.label]">
               <span class="text-[11px] uppercase tracking-wider font-semibold"
-                    :class="sec.label==='MESSAGES' ? 'text-cy' : (sec.label==='SYSTEM' ? 'text-warn' : 'text-text-mid')"
-                    x-text="(sectionOpen[sec.label]?'▾ ':'▸ ') + sec.label + (sec.label==='SYSTEM' ? '  · incl. TCMM memory' : (sec.label==='MESSAGES' ? '  · latest prompt' : ''))"></span>
+                    :class="secMeta(sec.label).color"
+                    x-text="(sectionOpen[sec.label]?'▾ ':'▸ ') + sec.label + '  ' + secMeta(sec.label).hint"></span>
               <span class="text-[10px] text-text-lo font-mono" x-text="fmt(sec.bytes) + ' chars'"></span>
             </button>
             <pre x-show="sectionOpen[sec.label]"
@@ -897,7 +906,7 @@ function dashboard() {
     // envelope section. SYSTEM (incl. TCMM memory) + MESSAGES (latest
     // prompt) open by default; TOOLS collapsed (it's the biggest + least
     // interesting — the 100+ tool schemas).
-    sectionOpen: { SYSTEM: true, TOOLS: false, MESSAGES: true, PREAMBLE: true, CONTENT: true },
+    sectionOpen: { IMMUTABLE: false, STABLE: false, WORKING: false, VOLATILE: true, TOOLS: false, MESSAGES: true, SYSTEM: true, PREAMBLE: true, CONTENT: true },
 
     // (Chart.js instances live OUTSIDE Alpine state — see _charts below.
     //  Putting them on `this.timeChart`/`this.pieChart` makes Alpine wrap
@@ -1323,27 +1332,73 @@ function dashboard() {
     // top-level sections so the TCMM memory (inside SYSTEM) and the latest
     // prompt (MESSAGES) are findable instead of buried in one giant blob.
     // Splits on the first occurrence of each marker, in document order.
+    // [TIER_SPLIT_2026-06-01] Split the SYSTEM blob into TCMM's CACHE
+    // TIERS (immutable / stable / working / volatile) so you can see, per
+    // turn, how many chars live in each cache segment — i.e. what's a
+    // cache READ (immutable/stable/working, before the cache_control
+    // markers) vs a cache WRITE every turn (volatile, the recalled tail).
+    // Then TOOLS, then MESSAGES (the prompt). Falls back to the old
+    // SYSTEM/TOOLS/MESSAGES split when the TCMM tier markers aren't present
+    // (degraded render / non-agent path).
     contentSections() {
       const c = (this.modalData && this.modalData.content) || '';
       if (!c) return [];
-      const labels = ['SYSTEM', 'TOOLS', 'MESSAGES'];
-      const found = [];
-      for (const L of labels) {
-        const i = c.indexOf('[' + L + ']');
-        if (i >= 0) found.push({ label: L, idx: i });
-      }
-      found.sort((a, b) => a.idx - b.idx);
-      if (found.length === 0) return [{ label: 'CONTENT', body: c, bytes: c.length }];
+      const sysI   = c.indexOf('[SYSTEM]');
+      const toolsI = c.indexOf('[TOOLS]');
+      const msgI   = c.indexOf('[MESSAGES]');
+      const sysStart = sysI >= 0 ? sysI : 0;
+      const sysEnd   = toolsI >= 0 ? toolsI : (msgI >= 0 ? msgI : c.length);
+      const sys = c.slice(sysStart, sysEnd);
       const out = [];
-      if (found[0].idx > 0) {
-        out.push({ label: 'PREAMBLE', body: c.slice(0, found[0].idx), bytes: found[0].idx });
+
+      // Carve the system blob at each tier's END marker, in order.
+      const tiers = [
+        { label: 'IMMUTABLE', end: '--- END IMMUTABLE MEMORY ---' },
+        { label: 'STABLE',    end: '--- END STABLE MEMORY ---' },
+        { label: 'WORKING',   end: '--- END LIVE MEMORY ---' },
+      ];
+      let cur = 0, anyTier = false;
+      for (const t of tiers) {
+        const p = sys.indexOf(t.end, cur);
+        if (p < 0) continue;
+        const e = p + t.end.length;
+        out.push({ label: t.label, body: sys.slice(cur, e), bytes: e - cur });
+        cur = e; anyTier = true;
       }
-      for (let i = 0; i < found.length; i++) {
-        const start = found[i].idx;
-        const end = (i + 1 < found.length) ? found[i + 1].idx : c.length;
-        out.push({ label: found[i].label, body: c.slice(start, end), bytes: end - start });
+      if (anyTier) {
+        // Everything left in SYSTEM after the working marker = the
+        // UNCACHED volatile/recalled/transient tail (rewrites every turn).
+        if (cur < sys.length) {
+          out.push({ label: 'VOLATILE', body: sys.slice(cur), bytes: sys.length - cur });
+        }
+      } else {
+        out.push({ label: 'SYSTEM', body: sys, bytes: sys.length });
+      }
+
+      if (toolsI >= 0) {
+        const tEnd = msgI >= 0 ? msgI : c.length;
+        out.push({ label: 'TOOLS', body: c.slice(toolsI, tEnd), bytes: tEnd - toolsI });
+      }
+      if (msgI >= 0) {
+        out.push({ label: 'MESSAGES', body: c.slice(msgI), bytes: c.length - msgI });
       }
       return out;
+    },
+
+    // Per-section colour + cache hint for the request-detail modal.
+    secMeta(label) {
+      const m = {
+        IMMUTABLE: { hint: '· cache READ · 24h (system+tools+persona)', color: 'text-em' },
+        STABLE:    { hint: '· cache READ · 1h',  color: 'text-em' },
+        WORKING:   { hint: '· cache READ · 5m',  color: 'text-blue-300' },
+        VOLATILE:  { hint: '· CACHE WRITE every turn (recalled tail)', color: 'text-warn' },
+        TOOLS:     { hint: '· tools array',      color: 'text-text-mid' },
+        MESSAGES:  { hint: '· latest prompt',    color: 'text-cy' },
+        SYSTEM:    { hint: '· incl. TCMM memory',color: 'text-warn' },
+        PREAMBLE:  { hint: '', color: 'text-text-mid' },
+        CONTENT:   { hint: '', color: 'text-text-mid' },
+      };
+      return m[label] || { hint: '', color: 'text-text-mid' };
     },
 
     _fmtBucketLabel(ts, secs) {

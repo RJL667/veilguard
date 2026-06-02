@@ -1609,18 +1609,29 @@ async def pin_system_prompt(body: PinSystemPromptBody):
 
 @app.post("/pin/tool_definitions")
 async def pin_tool_definitions(body: PinToolDefinitionsBody):
-    """Pin a list of tool schemas — one IMMUTABLE block per tool.
+    """Pin ALL tool schemas as ONE cohesive IMMUTABLE block.
 
-    Per-tool granularity is the point: a single tool's description /
-    input_schema tweak invalidates exactly one cached block, leaving
-    the rest of the prefix (preamble + persona + other tools + user
-    profile) byte-stable and cache-warm.  Dedup by fingerprint via
-    ``pin_immutable_block``.
+    [TOOLS_ONE_BLOCK_2026_06_01] This used to pin one block PER tool
+    (N blocks).  That shredded the tool array into N separate memory
+    blocks: the renderer stamps each pinned block with a label and the
+    legacy label was ``[Memory index=K | role=SYSTEM]`` — dropping all
+    115 tools into the citable/recall *memory* namespace, where their
+    indexes collided with recalled-memory AIDs (index=42 was BOTH the
+    list_tasks tool AND a RECALL block) and corrupted tcmm_record_turn
+    citation + heat reinforcement.  The system prompt is pinned as ONE
+    block (see /pin/system_prompt above); tools must be too — they are
+    NOT memory and must not be chunked into it.
+
+    The whole tool blob is byte-stable across turns (client tools only
+    change on redeploy), so it still caches as a single warm prefix
+    chunk.  A tool change re-pins the one blob — acceptable, that only
+    happens on deploy.  Per-tool cache granularity is not worth
+    fracturing the memory namespace.
 
     Schemas serialize as ``json.dumps(schema, sort_keys=True,
     separators=(',', ':'))`` so identical dicts in any key order give
-    identical fingerprints.  Strings pass through unchanged (caller
-    has already canonicalized).
+    an identical blob fingerprint.  Strings pass through unchanged
+    (caller already canonicalized).
     """
     import json as _json
     if not body.tools:
@@ -1629,8 +1640,7 @@ async def pin_tool_definitions(body: PinToolDefinitionsBody):
     instance = pool.get(body.conversation_id, user_id=body.user_id)
     tcmm = instance.tcmm
     before_ids = {b.id for b in tcmm.live_blocks}
-    ids: List[int] = []
-    deduped = 0
+    parts: List[str] = []
     for schema in body.tools:
         if isinstance(schema, str):
             txt = schema
@@ -1642,24 +1652,31 @@ async def pin_tool_definitions(body: PinToolDefinitionsBody):
                 )
             except Exception:
                 continue
-        if not txt:
-            continue
-        bid = tcmm.pin_immutable_block(
-            txt,
-            priority_class="SYSTEM",
-            source="tool_def",
-            kind="tool_def",
+        if txt:
+            parts.append(txt)
+    if not parts:
+        return {"status": "ok", "block_ids": [], "deduped_count": 0,
+                "note": "no serializable tools"}
+    # One JSON array of every tool schema → a single immutable block.
+    blob = "[" + ",".join(parts) + "]"
+    bid = tcmm.pin_immutable_block(
+        blob,
+        priority_class="SYSTEM",
+        source="tool_def",
+        kind="tool_def",
+    )
+    if bid is None:
+        raise HTTPException(
+            status_code=500,
+            detail="pin_immutable_block returned None for tool blob",
         )
-        if bid is None:
-            continue
-        if bid in before_ids:
-            deduped += 1
-        ids.append(bid)
+    deduped = 1 if bid in before_ids else 0
     logger.info(
         f"[PIN] session={pool._normalize_id(body.conversation_id)} "
-        f"kind=tool_def n={len(body.tools)} bids={ids} deduped={deduped}"
+        f"kind=tool_def n_tools={len(parts)} single_block bid={bid} "
+        f"deduped={deduped}"
     )
-    return {"status": "ok", "block_ids": ids, "deduped_count": deduped}
+    return {"status": "ok", "block_ids": [bid], "deduped_count": deduped}
 
 
 @app.post("/pin/user_profile")
@@ -2076,12 +2093,42 @@ async def render_structured(body: RenderBody):
                 _reset_sid(_redact_tok)
             except Exception:
                 pass
+    # [TOOLS_NATIVE_FROM_IMMUTABLE_2026_06_01] Tool schemas are pinned in
+    # the immutable lane (source="tool_def") as the single source of truth,
+    # but they are deliberately NOT rendered as text (the renderer skips
+    # them — see base_renderer _collect).  Extract them here and return a
+    # structured `tools` array so the agent adapter can populate Anthropic's
+    # NATIVE tools field.  Wire order is tools → system → messages, so the
+    # native field sits at the FRONT of the cached prefix (covered by the
+    # immutable system marker) — never after the volatile recalled memory,
+    # never a per-turn cache rewrite, and the model can actually INVOKE the
+    # tools instead of faking <function_calls> text.
+    native_tools: List[dict] = []
+    try:
+        import json as _json_tools
+        _pinned_fn = getattr(tcmm, "pinned_prefix_blocks", None)
+        for _pb in (_pinned_fn() if callable(_pinned_fn) else []):
+            if getattr(_pb, "source", "") != "tool_def":
+                continue
+            try:
+                _parsed = _json_tools.loads(getattr(_pb, "text", "") or "")
+            except Exception:
+                continue
+            if isinstance(_parsed, list):
+                native_tools.extend(t for t in _parsed if isinstance(t, dict))
+            elif isinstance(_parsed, dict):
+                native_tools.append(_parsed)
+    except Exception as _e:
+        logger.warning(f"[render] native tool extraction failed: {_e}")
+
     logger.info(f"[RENDER-PERF] scope={_scope} pool={_ph_pool:.0f}ms render={(_rrpt.perf_counter()-_rr0)*1000:.0f}ms "
-                f"blocks={len(result.get('blocks', []))} chars={result.get('stats',{}).get('prompt_chars',0)}")
+                f"blocks={len(result.get('blocks', []))} chars={result.get('stats',{}).get('prompt_chars',0)} "
+                f"native_tools={len(native_tools)}")
     return {
         "status": "ok",
         "format": "anthropic-structured" if model in ("anthropic", "claude") else f"{model}-structured",
         **result,
+        "tools": native_tools,
     }
 
 
@@ -2880,6 +2927,9 @@ async def debug_session_state(conversation_id: str, user_id: str = ""):
             "tokens": _tok_count(b),
             "created_step": int(getattr(b, "created_step", 0) or 0),
             "role": getattr(b, "priority_class", "") or "?",
+            "source": getattr(b, "source", None),
+            "kind": getattr(b, "last_heat_source", None),
+            "origin_archive_id": getattr(b, "origin_archive_id", None),
             "text_preview": (getattr(b, "text", "") or "")[:80],
         }
 
