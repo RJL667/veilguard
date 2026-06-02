@@ -202,8 +202,13 @@ async def _startup() -> None:
     try:
         if os.environ.get("VEILGUARD_DREAM_SCANNER_DISABLED", "") not in ("1", "true", "yes"):
             from .proposals.dream_scanner import DreamScanner
+            # [DREAM_INTERVAL_2026_06_01] Default was 600s (10 min) =
+            # ~144 scans/day, each potentially paying the Haiku rank pass —
+            # far too hot for a background dream-scanner and a big part of
+            # the idle LLM burn. 1h is plenty; importance-accumulation +
+            # fire_now() still wake it early when a real signal burst lands.
             _scanner_interval = float(os.environ.get(
-                "VEILGUARD_DREAM_SCANNER_INTERVAL_S", "600",
+                "VEILGUARD_DREAM_SCANNER_INTERVAL_S", "3600",
             ))
             scanner = DreamScanner(
                 interval_seconds=_scanner_interval,
@@ -1119,6 +1124,12 @@ async def proposal_convert(proposal_id: str, request: Request) -> JSONResponse:
     brief = p.get("proposed_brief") or "(no brief)"
     assignee = p.get("proposed_assignee") or "researcher"
     spec = p.get("proposed_deliverable_spec") or ""
+    # [F13_FIX_2026_06_02] This path used to call create_task with NO
+    # acceptance_criteria, so the Phase 6.0.2 contract rejected EVERY proposal
+    # approval (400 — surfaced live during the Tier-1.3 proactive-stream UAT).
+    # Synthesize the same default AC the Director's MCP create_task tool does
+    # (shared helper) so approve->Task works and the Critic can still gate done.
+    acs = _tasks.synthesize_default_acceptance_criteria(assignee, spec)
     try:
         new_tid = _tasks.create_task(
             tenant_id=tenant_id,
@@ -1127,10 +1138,12 @@ async def proposal_convert(proposal_id: str, request: Request) -> JSONResponse:
             assigner_id="director",
             brief=brief,
             deliverable_spec=spec,
+            acceptance_criteria=acs or None,
             inputs=[],
             origin="proactive",
             pattern="A",
             constitution_version=p.get("constitution_version"),
+            _phase_6_legacy_exempt=(not acs),
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"task create: {e}")
@@ -1900,6 +1913,37 @@ async def get_constitution() -> JSONResponse:
     return JSONResponse(_constitution)
 
 
+@app.get("/apr/status")
+async def apr_status() -> JSONResponse:
+    """Phase 6.7 — Artifact Production Ratio circuit-breaker snapshot.
+
+    Global (not tenant-scoped) — APR is a system-level health metric.
+    Powers the sidebar 'Veilguard halted' banner.
+    """
+    from .runtime_health import apr_snapshot
+    return JSONResponse(apr_snapshot())
+
+
+@app.post("/apr/resume")
+async def apr_resume_endpoint() -> JSONResponse:
+    """Phase 6.7 — operator unblock for the APR circuit breaker.
+
+    Clears the rolling window + tripped state so the inbox poller resumes
+    dispatch.  Returns the post-resume snapshot.
+
+    [F10_FIX_2026_06_02] apr.py docstrings referenced `/apr/resume` +
+    `/apr/status` but neither route was ever wired — a tripped breaker is
+    sticky (`is_tripped()` short-circuits `apr_should_pause_dispatch`) with
+    no auto-recovery, so before this it was recoverable ONLY by restarting
+    the process. This wires the operator action the spec §6.7 banner promises.
+    """
+    from .runtime_health import apr_resume, apr_snapshot
+    apr_resume()
+    snap = apr_snapshot()
+    logger.info(f"[apr] operator resume via /apr/resume — breaker cleared; snapshot={snap}")
+    return JSONResponse({"resumed": True, "snapshot": snap})
+
+
 @app.post("/agent/query")
 async def agent_query(req: Request) -> StreamingResponse:
     """Main entry.  Runs SDK query() with all middleware wired in.
@@ -1975,6 +2019,7 @@ async def agent_query(req: Request) -> StreamingResponse:
                     registry=_persona_registry,
                     constitution=_constitution,
                     client_tools=body.get("tools") or [],
+                    workspace_block=body.get("workspace_block") or "",
                 ):
                     if not isinstance(ev, dict):
                         continue
@@ -2006,6 +2051,7 @@ async def agent_query(req: Request) -> StreamingResponse:
         registry=_persona_registry,
         constitution=_constitution,
         client_tools=body.get("tools") or [],
+        workspace_block=body.get("workspace_block") or "",
     ):
         if isinstance(ev, dict):
             if ev.get("type") == "run_start" and _q_rs is None:

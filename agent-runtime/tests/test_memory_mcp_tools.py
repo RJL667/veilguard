@@ -23,11 +23,15 @@ async def _call(tool, args):
 
 
 class TestMetadata:
-    def test_two_tools_present(self):
-        # recall is handled by TCMM directly (not via agent-runtime
-        # MCP); memory_mcp exposes only the writers + constitution.
+    def test_three_tools_present(self):
+        # memory_mcp exposes recall + observe + read_constitution. The
+        # earlier "recall is handled by TCMM directly, not via the MCP
+        # server" design was reversed (decision log 2026-05-22: "Memory
+        # tools (recall / observe / read_constitution) exposed via second
+        # in-process MCP server"); recall_tool is imported + asserted on
+        # below, so the in-process server must expose all three.
         names = {t.name for t in _ALL_TOOLS}
-        assert names == {"observe", "read_constitution"}
+        assert names == {"observe", "read_constitution", "recall"}
 
     def test_observe_has_text_required(self):
         schema = observe_tool.input_schema

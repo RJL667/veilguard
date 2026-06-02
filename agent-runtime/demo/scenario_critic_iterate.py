@@ -78,6 +78,19 @@ def main() -> None:
             Turn(
                 text="First submit. Pausing for Critic review.",
                 tool_calls=[
+                    # Write a REAL artifact so the server-side mechanical AC
+                    # (output_path_exists, default path = outputs[0]) has a
+                    # file to find. The first review is rejected on CITATION
+                    # grounds (a semantic call the critic makes), not on the
+                    # mechanical gate — AC checks only run on review_decision
+                    # (approved), so the uncited-but-present file is fine here.
+                    ToolCall(name="write_file", input={
+                        "path": "agents/team/core/drafts/passkey-research.md",
+                        "content": (
+                            "# Passkey adoption among US consumer banks\n\n"
+                            "All US banks support passkeys.\n"
+                        ),
+                    }),
                     ToolCall(name="mcp__veilguard_ledger__attach_output", input={
                         "task_id": "__LATEST_TASK_FOR_RESEARCHER__",
                         "path": "agents/team/core/drafts/passkey-research.md",
@@ -100,6 +113,18 @@ def main() -> None:
                 }),
             ]),
             Turn(text="Resubmitting with citation.", tool_calls=[
+                # Overwrite the artifact with the cited version. The file now
+                # exists at the attached path, so when the critic approves on
+                # the second review the server-side output_path_exists AC
+                # passes → the approve sticks → task transitions to done.
+                ToolCall(name="write_file", input={
+                    "path": "agents/team/core/drafts/passkey-research.md",
+                    "content": (
+                        "# Passkey adoption among US consumer banks\n\n"
+                        "Chase and Bank of America support passkeys "
+                        "(source: https://example.com/passkey-tracker, 2026-04 snapshot).\n"
+                    ),
+                }),
                 ToolCall(name="mcp__veilguard_ledger__submit_for_review", input={
                     "task_id": "__LATEST_TASK_FOR_RESEARCHER__",
                     "target": "team_knowledge",

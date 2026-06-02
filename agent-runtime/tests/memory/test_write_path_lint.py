@@ -72,6 +72,10 @@ _SANCTIONED_DIRECT_IMPORTERS: frozenset[str] = frozenset({
     # for the `migrated_to_tcmm` marker update, and routes through the
     # sanctioned Phase 7 split-writer for the TCMM side.
     "app/proposals/m4_backfill.py",
+    # One-shot operational maintenance script (run via `docker exec`), not an
+    # agent/runtime write path — uses LedgerStore directly to cancel stale
+    # coordinator junk. Same treatment as m4_backfill.py above.
+    "app/scripts_cleanup_stale_coordinators.py",
     # Phase 4 docs + replay touch ledger directly.
     "app/documents.py",
     "app/replay.py",
@@ -111,12 +115,27 @@ _FORBIDDEN_FROM_IMPORTS: dict[str, frozenset[str]] = {
 }
 
 
+def _is_test_path(p: Path) -> bool:
+    """Test files + fixtures legitimately access store / TCMM handles
+    directly (arrange-phase setup, assertions on persisted rows). The
+    write-path discipline (§3.11) governs RUNTIME / agent code, not the
+    test harness — so the scan skips them. AC-38 still proves the detector
+    fires, via synthetic tmp_path fixtures, so excluding tests here does
+    not weaken the guarantee."""
+    if any(part.lower() == "tests" for part in p.parts):
+        return True
+    return p.name.startswith("test_") or p.name == "conftest.py"
+
+
 def _all_py_files() -> list[Path]:
     files: list[Path] = []
-    if APP_ROOT.is_dir():
-        files.extend(p for p in APP_ROOT.rglob("*.py") if "__pycache__" not in str(p))
-    if AGENT_ROOT.is_dir():
-        files.extend(p for p in AGENT_ROOT.rglob("*.py") if "__pycache__" not in str(p))
+    for root in (APP_ROOT, AGENT_ROOT):
+        if not root.is_dir():
+            continue
+        for p in root.rglob("*.py"):
+            if "__pycache__" in str(p) or _is_test_path(p):
+                continue
+            files.append(p)
     return files
 
 

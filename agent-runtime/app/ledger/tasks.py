@@ -70,6 +70,49 @@ VALID_OWNER_IDS = frozenset({
     "team-lead",
 })
 
+# Owners that coordinate a fan-out (group children) rather than personally
+# produce a file deliverable. They carry ZERO acceptance criteria and close
+# structurally via the children-done autoclose hook.
+_COORDINATOR_OWNERS = frozenset({"director", "team-lead"})
+
+
+def synthesize_default_acceptance_criteria(
+    owner_id: str, deliverable_spec: str,
+) -> list[dict]:
+    """Synthesize a minimal AC when a caller supplied none.
+
+    Phase 6.0.2 requires >=1 required mechanical AC at create_task time.
+    Callers that don't pass one (the Director's MCP create_task tool, the
+    proactive `/proposals/convert` flow) use this so the Critic can still
+    gate `done`.
+
+    - Coordinator owners (director / team-lead) → `[]` (no file deliverable;
+      closed by the children-done autoclose hook — caller must pass
+      `_phase_6_legacy_exempt=True`).
+    - Worker owners → a single `output_path_exists` AC derived from the path
+      mentioned in `deliverable_spec` (or `deliverable.md` if none).
+
+    Shared by both create paths SO THEY CAN'T DRIFT — drift was UAT finding
+    F13 (2026-06-02): `/proposals/convert` called create_task with no ACs and
+    every proposal approval failed with a Phase 6.0.2 400.
+    """
+    if owner_id in _COORDINATOR_OWNERS:
+        return []
+    import re as _re
+    m = _re.search(
+        r"([a-zA-Z0-9_./\-]+\.(?:md|txt|json|yaml|yml|html|csv|pdf|py|js|ts|tsx))",
+        deliverable_spec or "",
+    )
+    target_path = m.group(1) if m else "deliverable.md"
+    return [{
+        "id":         "AC-default",
+        "statement":  f"Output file {target_path!r} exists and is non-empty",
+        "check_kind": "output_path_exists",
+        "check_args": {"path": target_path, "min_bytes": 1},
+        "required":   True,
+        "rationale":  "synthesized default: no acceptance_criteria supplied for a worker task",
+    }]
+
 
 def _now() -> float:
     return time.time()
@@ -741,6 +784,18 @@ def submit_for_review(
     from . import comments
     if critic_id is None:
         critic_id = _DEFAULT_CRITIC_BY_TARGET.get(target, "critic-prose")
+
+    # [SUBMIT_IDEMPOTENT_2026_06_01] If the task is ALREADY in `review`,
+    # this is a no-op — NOT an error.  The IC submits on one turn, but its
+    # agent loop can keep running and call submit_for_review AGAIN on a
+    # later turn (observed live: researcher re-submitted turns 14-16 after a
+    # successful turn-13 submit).  Without this guard update_status raises
+    # IllegalTransition(review→review), the IC sees a tool FAILURE, and
+    # burns its remaining turns "retrying" a submit it already completed.
+    # Return cleanly so the dispatch can end this turn cycle.
+    _cur = get_task(task_id, tenant_id, user_id)
+    if _cur and _cur.get("status") == "review":
+        return
 
     # Status: in_progress → review (state machine enforced).
     update_status(

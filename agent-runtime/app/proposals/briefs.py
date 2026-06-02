@@ -62,37 +62,47 @@ BRIEF_TEMPLATES: dict[str, str] = {
 }
 
 
-# Default deliverable spec per signal_type — short hint about acceptance
-# criteria so the receiving IC has something concrete to aim for without
-# the user having to write one for every approved proposal.
+# Default deliverable spec per signal_type.
+#
+# [PROACTIVE_AC_PATH_2026_06_02] Each spec MUST name a concrete,
+# regex-extractable output path (team/drafts/<name>.md).  `/proposals/convert`
+# + the MCP create_task tool synthesize a default `output_path_exists` AC by
+# extracting a path from this spec; the receiving IC also reads this spec and
+# writes there.  Earlier specs named no real path ("Land in team_knowledge",
+# "agents/skills/<slug>.md") so the synthesized AC fell back to `deliverable.md`
+# — a file the IC never wrote — and EVERY approved proactive task died at the
+# Critic gate (UAT follow-up to F13).  Imperative "Write … to <path>" keeps the
+# IC's output and the AC target aligned by construction.
 DELIVERABLE_SPECS: dict[str, str] = {
     SIGNAL_INFORMATION_GAP: (
-        "Markdown reference card, ≤500 words, ≥2 sources cited inline. "
-        "Land in team_knowledge namespace on Critic approval."
+        "Write a markdown research note to team/drafts/research-note.md — "
+        "≤500 words, ≥2 sources cited inline. Promote to team_knowledge on "
+        "Critic approval."
     ),
     SIGNAL_CONTRADICTION_ARC: (
-        "Investigation note: which claim supersedes, with evidence "
-        "citations. Update the superseded claim's status in dream."
+        "Write the investigation note to team/drafts/contradiction-note.md — "
+        "which claim supersedes, with evidence citations."
     ),
     SIGNAL_RECURRING_RITUAL: (
-        "Skill definition in agents/skills/<slug>.md: trigger pattern, "
-        "step-by-step procedure, 2 worked examples."
+        "Write the skill definition to team/drafts/skill-def.md — trigger "
+        "pattern, step-by-step procedure, 2 worked examples."
     ),
     SIGNAL_REFLECTIVE_HEURISTIC: (
-        "Either an org_memory lesson (rule + trigger + evidence) or a "
-        "skill file. State which and why."
+        "Write the lesson/skill proposal to team/drafts/heuristic-review.md — "
+        "an org_memory lesson (rule + trigger + evidence) OR a skill; state "
+        "which and why."
     ),
     SIGNAL_STANCE_ARC: (
-        "Committee verdict: which stance is canonical going forward, "
-        "with explicit dissent log entries from the disagreeing agents."
+        "Write the committee verdict to team/drafts/stance-verdict.md — which "
+        "stance is canonical going forward, with explicit dissent log entries."
     ),
     SIGNAL_LOW_STABILITY: (
-        "Either: stabilise the cluster with new evidence, OR retire "
-        "the cluster's claims with supersession notes."
+        "Write the cluster decision to team/drafts/cluster-review.md — "
+        "stabilise with new evidence OR retire the claims with supersession notes."
     ),
     SIGNAL_STALE_SUPERSESSION: (
-        "Refresh-or-retire decision per claim in the chain, with "
-        "rationale and any new evidence found."
+        "Write the refresh-or-retire decision to team/drafts/chain-refresh.md — "
+        "per-claim rationale and any new evidence found."
     ),
 }
 

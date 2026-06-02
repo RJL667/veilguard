@@ -1,7 +1,9 @@
 """One-shot cleanup of stale pre-guard task junk + coordinator backfill.
 
-Run inside the agent-runtime container:
-    docker exec veilguard-agent-runtime-1 python /app/app/scripts_cleanup_stale_coordinators.py <tenant_id>
+Run inside the agent-runtime container (MODULE form — the script does
+`from app.ledger...`, so it must run with /app on sys.path; the old
+`python /app/app/scripts_…py` form fails with ModuleNotFoundError: app.ledger):
+    docker exec -w /app veilguard-agent-runtime-1 python -m app.scripts_cleanup_stale_coordinators <tenant_id>
 
 What it does for the given (tenant_id == user_id) namespace:
   1. Cancels stale director-OWNED subtasks (parent_id set, owner_id=director,

@@ -146,6 +146,28 @@ def test_evaluate_promote_but_not_amendment_eligible():
     assert d["amendment_eligible"] is False
 
 
+def test_evaluate_amendment_eligible_exact_boundaries():
+    """Pin the exact thresholds (≥0.75 confidence AND ≥5 reinforcements).
+
+    The existing tests only probe clearly-above (0.8/6) and clearly-below
+    (reinf 3); this nails the off-by-one on BOTH axes so a `>` vs `>=`
+    regression is caught. Constitution-amendment is the highest-blast-
+    radius promotion (it changes governance), so the gate must be exact.
+    """
+    # Exactly on both thresholds → eligible (inclusive >=).
+    assert L.evaluate_promotion(
+        confidence=0.75, reinforcement_count=5, distinct_agents=2,
+    )["amendment_eligible"] is True
+    # One epsilon below the confidence floor → NOT eligible.
+    assert L.evaluate_promotion(
+        confidence=0.74, reinforcement_count=5, distinct_agents=2,
+    )["amendment_eligible"] is False
+    # One below the reinforcement floor → NOT eligible.
+    assert L.evaluate_promotion(
+        confidence=0.75, reinforcement_count=4, distinct_agents=2,
+    )["amendment_eligible"] is False
+
+
 # ── promote_one ────────────────────────────────────────────────────────
 
 

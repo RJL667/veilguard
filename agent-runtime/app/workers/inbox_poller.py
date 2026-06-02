@@ -850,6 +850,39 @@ class InboxPoller:
             logger.error(
                 f"[inbox_poller] turn-cap update failed for {task_id}: {e}"
             )
+        # [F11_AUTOCLOSE_ON_FORCE_CANCEL_2026_06_02] The raw status write above
+        # bypasses ledger.tasks.update_status and therefore the
+        # [PARENT_AUTOCLOSE_2026_05_29] hook — so force-cancelling the LAST open
+        # child left the coordinator parent stuck `open` forever (orphan; only
+        # scripts_cleanup_stale_coordinators.py mopped it up). Propagate autoclose
+        # explicitly. Caught live 2026-06-02 (Pattern-C fanout, UAT F11).
+        self._autoclose_parent_after_force_cancel(task_id, tenant_id, user_id)
+
+    def _autoclose_parent_after_force_cancel(
+        self, task_id: str, tenant_id: str, user_id: str,
+    ) -> None:
+        """Propagate parent-autoclose after a privileged raw-write cancel.
+
+        Both force-cancel paths (turn-cap + timeout) write `cancelled`
+        directly to Lance, skipping `update_status`'s autoclose hook. Without
+        this, a coordinator whose last child was force-cancelled never closes.
+        """
+        try:
+            from ..ledger import tasks as _tm
+            closed = _tm._maybe_autoclose_parents(
+                child_task_id=task_id, tenant_id=tenant_id,
+                user_id=user_id, actor_agent_id="inbox-poller",
+            )
+            if closed:
+                logger.info(
+                    f"[inbox_poller] force-cancel of {task_id} autoclosed "
+                    f"parent coordinator(s): {closed}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"[inbox_poller] parent-autoclose after force-cancel of "
+                f"{task_id} failed: {e}"
+            )
 
     def _force_cancel_on_timeout(self, task_row: dict) -> None:
         """Cancel a hung task and emit an audit comment.
@@ -917,6 +950,9 @@ class InboxPoller:
             logger.error(
                 f"[inbox_poller] force-cancel update failed for {task_id}: {e}"
             )
+        # [F11_AUTOCLOSE_ON_FORCE_CANCEL_2026_06_02] Same orphan-coordinator fix
+        # as the turn-cap path — propagate parent autoclose after the raw write.
+        self._autoclose_parent_after_force_cancel(task_id, tenant_id, user_id)
 
     def _cascade_cancel_dead_dep(
         self, *, task_id: str, tenant_id: str, user_id: str, dead_deps: list,

@@ -58,6 +58,16 @@ def setup_demo_env(*, tmp_root: str | None = None) -> str:
         format="  [log] %(name)s %(message)s",
     )
 
+    # Windows consoles default to cp1252; demo banners/prints use unicode
+    # (→, etc.). Without this, a decorative print can crash the run with
+    # UnicodeEncodeError AFTER the test already passed (UAT finding F9,
+    # 2026-06-02). Containers are utf-8 so this is a Windows-local guard.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
     if tmp_root is None:
         tmp_root = tempfile.mkdtemp(prefix="veilguard-demo-")
 
@@ -66,6 +76,15 @@ def setup_demo_env(*, tmp_root: str | None = None) -> str:
 
     os.environ["LEDGER_DB_PATH"] = lance_dir
     os.environ["VEILGUARD_AUDIT_DB_PATH"] = lance_dir
+    # Server-side workspace root for the workspace_fs tools AND the
+    # mechanical AC executors (output_path_exists resolves a path UNDER
+    # this root). Point it at a writable temp dir so demos can produce real
+    # artifacts the server-side AC gate checks on review_decision(approved).
+    # Default is "/workspace" (absent on dev hosts) → every output_path_exists
+    # AC fails → approves auto-downgrade → tasks can never reach done.
+    workspace_dir = os.path.join(tmp_root, "workspace")
+    os.makedirs(workspace_dir, exist_ok=True)
+    os.environ["VEILGUARD_WORKSPACE_ROOT"] = workspace_dir
     os.environ["TCMM_ENABLED"] = "false"
     os.environ["BACKEND"] = "scripted"
     os.environ["ANTHROPIC_API_KEY"] = "demo-key-not-real"

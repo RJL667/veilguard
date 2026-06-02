@@ -66,7 +66,12 @@ def test_team_lead_persona_file_exists():
     assert persona.is_file(), f"team-lead.md missing at {persona}"
     body = persona.read_text(encoding="utf-8")
     assert "Agent ID:** team-lead" in body
-    assert "Role:** manager" in body or "Role: manager" in body
+    # team-lead is a mini-Director scoped to one team. The spec role enum is
+    # {director, ic, consultant} (§0.3) — there is no `manager` value — so the
+    # persona declares the spec-legal leadership role `director`. (Whether a
+    # distinct `team-lead`/`manager` role should be added is a tracked design
+    # question; see UAT_REPORT.md.)
+    assert "Role:** director" in body or "Role: director" in body
 
 
 # ── create_team validators ──────────────────────────────────────────────

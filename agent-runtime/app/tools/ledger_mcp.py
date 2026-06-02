@@ -223,24 +223,11 @@ async def create_task_tool(args: dict[str, Any]) -> dict[str, Any]:
             acs = []  # closed by the children-done autoclose hook
         elif not acs:
             # Worker leaf, no explicit ACs → synthesize from deliverable_spec.
-            import re as _re
-            spec = args["deliverable_spec"] or ""
-            m = _re.search(
-                r"([a-zA-Z0-9_./\-]+\.(?:md|txt|json|yaml|yml|html|csv|pdf|py|js|ts|tsx))",
-                spec,
+            # Shared helper (also used by the /proposals/convert path) so the
+            # two create paths can't drift — see F13 (2026-06-02).
+            acs = tasks.synthesize_default_acceptance_criteria(
+                args.get("owner_id"), args["deliverable_spec"] or "",
             )
-            target_path = m.group(1) if m else "deliverable.md"
-            acs = [{
-                "id":         "AC-default",
-                "statement":  f"Output file {target_path!r} exists and is non-empty",
-                "check_kind": "output_path_exists",
-                "check_args": {"path": target_path, "min_bytes": 1},
-                "required":   True,
-                "rationale": (
-                    "synthesized by ledger_mcp.create_task_tool because "
-                    "no acceptance_criteria was supplied for a worker task"
-                ),
-            }]
         # [PARENT_ID_GUARD_2026_05_29]  Reject a parent_id that doesn't
         # resolve to a real task in this tenant.  The Director, when
         # fanning out (Pattern C), tends to create the parent + all
@@ -927,8 +914,59 @@ async def review_decision_tool(args: dict[str, Any]) -> dict[str, Any]:
                         f"{args.get('notes', '')}"
                     ),
                 }
+        # [REVISION_ROUND_CAP_2026_06_01] Bound the critic↔IC revision loop.
+        # changes_requested bounces the task review→in_progress and
+        # re-dispatches the IC; with NO cap, an UNSATISFIABLE brief (e.g.
+        # "Review firewall logs" with no actual logs) loops FOREVER — each
+        # round burns ~25 IC turns + ~10 critic turns. Measured 2026-06-01:
+        # one such task ran 40 LLM turns / 982k input tokens in 30 min and
+        # would never stop (the artifact can't satisfy the critic, and the
+        # poller re-claims review/in_progress endlessly). After the cap-th
+        # rejection, STOP bouncing: CANCEL the task (legal from `review`,
+        # and the inbox poller only claims open/review/in_progress so a
+        # cancelled task is NEVER re-dispatched). Tunable via env; default 2
+        # = the IC gets exactly one revision attempt before escalate-by-
+        # cancel. A human re-scopes + re-creates if the work still matters.
+        import os as _os
+        _MAX_REVISION_ROUNDS = max(
+            1, int(_os.environ.get("VEILGUARD_MAX_REVISION_ROUNDS", "2"))
+        )
+        _cap_hit = False
+        _prior_rejections = 0
+        if decision == "changes_requested":
+            try:
+                for _c in comments.list_comments(
+                    task_id=args["task_id"],
+                    tenant_id=ctx.tenant_id,
+                    user_id=ctx.user_id,
+                ):
+                    if (_c.get("kind") == "review_decision"
+                            and (_c.get("body") or "").startswith(
+                                "changes_requested")):
+                        _prior_rejections += 1
+            except Exception:
+                _prior_rejections = 0
+            # This decision would be the (_prior_rejections + 1)-th rejection.
+            if _prior_rejections + 1 >= _MAX_REVISION_ROUNDS:
+                _cap_hit = True
+                logger.warning(
+                    f"[review_decision] task {args['task_id']} hit revision-"
+                    f"round cap ({_MAX_REVISION_ROUNDS}) on rejection "
+                    f"#{_prior_rejections + 1}; CANCELLING instead of bouncing "
+                    f"to in_progress (IC↔critic could not converge)."
+                )
+
         # Add review_decision comment with the full body.
-        body = f"{decision}: {args['notes']}"
+        if _cap_hit:
+            body = (
+                f"changes_requested: {args['notes']}  "
+                f"[REVISION-CAP HIT] rejection #{_prior_rejections + 1} ≥ cap "
+                f"{_MAX_REVISION_ROUNDS} → task auto-CANCELLED to stop the "
+                f"IC↔critic loop. Re-scope the brief and re-create the task "
+                f"if the work is still needed."
+            )
+        else:
+            body = f"{decision}: {args['notes']}"
         comments.add_comment(
             task_id=args["task_id"],
             tenant_id=ctx.tenant_id,
@@ -943,6 +981,8 @@ async def review_decision_tool(args: dict[str, Any]) -> dict[str, Any]:
             "changes_requested": "in_progress",
             "declined": "cancelled",
         }[decision]
+        if _cap_hit:
+            target_status = "cancelled"   # terminal: kill the revision loop
         tasks.update_status(
             task_id=args["task_id"],
             tenant_id=ctx.tenant_id,
@@ -957,7 +997,10 @@ async def review_decision_tool(args: dict[str, Any]) -> dict[str, Any]:
         # `original_owner=<id>`.  Without this, the task would stay
         # assigned to the critic and the inbox poller would re-dispatch
         # to the critic in an infinite loop.
-        if decision == "changes_requested":
+        # [REVISION_ROUND_CAP_2026_06_01] Skip the bounce when the cap was
+        # hit — the task is now `cancelled`; restoring the IC owner + reset
+        # lease would re-arm the very loop we just stopped.
+        if decision == "changes_requested" and not _cap_hit:
             try:
                 cmts = comments.list_comments(
                     task_id=args["task_id"],
@@ -1044,6 +1087,7 @@ async def review_decision_tool(args: dict[str, Any]) -> dict[str, Any]:
             "task_id": args["task_id"],
             "decision": decision,
             "new_status": target_status,
+            "revision_cap_hit": _cap_hit,
         })
     except Exception as e:
         return _err(f"review_decision failed: {e}")

@@ -106,7 +106,7 @@ def test_promote_lesson_broadcasts_lesson_created(subscribe):
             assert ok is True
         return await get(timeout=0.5)
 
-    events = asyncio.get_event_loop().run_until_complete(_go())
+    events = asyncio.run(_go())
     types = [e.get("type") for e in events]
     assert "lesson_created" in types, f"got types={types}"
     created = next(e for e in events if e["type"] == "lesson_created")
@@ -145,7 +145,7 @@ def test_promote_lesson_does_NOT_broadcast_on_tcmm_failure(subscribe):
             assert ok is False
         return await get(timeout=0.3)
 
-    events = asyncio.get_event_loop().run_until_complete(_go())
+    events = asyncio.run(_go())
     assert events == [], (
         f"got phantom events from a failed TCMM write: {events}"
     )
@@ -172,4 +172,4 @@ def test_promote_lesson_survives_broadcast_failure():
             )
             return ok
 
-    assert asyncio.get_event_loop().run_until_complete(_go()) is True
+    assert asyncio.run(_go()) is True

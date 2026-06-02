@@ -64,6 +64,20 @@ from .personas.loader import PersonaSpec, PersonaRegistry
 
 logger = logging.getLogger("agent-runtime.runtime")
 
+# [F14_FIX_2026_06_02] Per-tool-result cap for the rebuilt next-turn context
+# (the LOOP_CONTEXT_FIX action log). The old hard 1200-char slice truncated
+# EVERY tool result, so an agent — especially a critic — re-reading a >1.2KB
+# artifact across turns saw it as "truncated/corrupted" and rejected valid
+# work. That was the systemic reason multi-agent tasks died at the Critic gate
+# (UAT F14, surfaced live 2026-06-02: a 3790-byte research note read as
+# "truncated at line 18" ≈ the 1200-char cut point). 12KB fits real markdown
+# deliverables; env-tunable. Genuine over-cap truncation now carries the
+# Phase-6.5 marker so it's explicit, not a silent cut.
+from .runtime_health.truncation import truncate_with_marker
+_TOOL_RESULT_LOG_CAP = max(
+    1200, int(os.environ.get("VEILGUARD_TOOL_RESULT_LOG_CAP", "12000"))
+)
+
 
 # Backend selection: env var BACKEND ∈ {live, scripted}.  Default
 # `live` for production (calls TCMM /generate); scripted demos + tests
@@ -265,6 +279,7 @@ async def run_agent_query(
     backend_name: Optional[str] = None,
     max_turns: Optional[int] = None,
     client_tools: Optional[list[dict[str, Any]]] = None,
+    workspace_block: str = "",
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield SSE-shaped event dicts as the agent runs.
 
@@ -419,6 +434,9 @@ async def run_agent_query(
                 tenant_id=tenant_id,
                 parent_cid=parent_cid,
                 is_background=is_background,
+                # [WORKSPACE_BLOCK_2026_06_01] client-daemon folders, forwarded
+                # by the proxy; base.py appends as an uncached system tail.
+                workspace_block=workspace_block or "",
             )
         else:
             live_agent = None
@@ -454,10 +472,28 @@ async def run_agent_query(
         # shared TCMM adapter.
         def _first_user_text(msgs: list[dict]) -> str:
             for m in msgs:
-                if m.get("role") == "user":
-                    c = m.get("content")
-                    if isinstance(c, str) and c.strip():
-                        return c
+                if m.get("role") != "user":
+                    continue
+                c = m.get("content")
+                if isinstance(c, str) and c.strip():
+                    return c
+                # [FIRST_USER_TEXT_LIST_2026_06_01]  LibreChat / the
+                # Anthropic Messages API send user content as a LIST of
+                # blocks: [{"type":"text","text":"..."}, ...].  The old
+                # string-only check returned "" for those, so the loop
+                # rebuild's "YOUR TASK" section came back BLANK on
+                # iteration 2 — and the model, seeing no task, abandoned
+                # the actual request and started demanding a task_id /
+                # deliverable_spec ("the YOUR TASK section is blank…").
+                # Flatten the text blocks so the original ask survives.
+                if isinstance(c, list):
+                    parts = [
+                        b.get("text", "") for b in c
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    joined = "\n".join(p for p in parts if p).strip()
+                    if joined:
+                        return joined
             return ""
         _original_task_text = _first_user_text(loop_messages)
         _action_log: list[str] = []
@@ -652,7 +688,9 @@ async def run_agent_query(
                         if isinstance(b, dict) and b.get("type") == "text":
                             parts.append(b.get("text", ""))
                     payload = "\n".join(parts) or json.dumps(payload)
-                payload = str(payload)[:1200]
+                payload = truncate_with_marker(
+                    str(payload), max_bytes=_TOOL_RESULT_LOG_CAP
+                )
                 tag = "ERROR" if is_err else "ok"
                 # Compact the tool input for the log so the model can see
                 # WHAT it called (e.g. which path it wrote).
