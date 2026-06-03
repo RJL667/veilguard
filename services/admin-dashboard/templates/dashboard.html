@@ -434,7 +434,8 @@
 
     <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
       <div class="flex items-baseline justify-between mb-3">
-        <h2 class="text-sm font-semibold text-text-hi tracking-wide">LANCE · tables + fragmentation</h2>
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide"
+            x-text="(lance.overview?.backend === 'postgres' ? 'POSTGRES' : 'LANCE') + ' · tables' + (lance.overview?.backend === 'postgres' ? '' : ' + fragmentation')"></h2>
         <span class="text-[11px] text-text-lo font-mono"
               x-text="lance.fts_index?.built ? 'FTS built' : 'FTS pending'"></span>
       </div>
@@ -1314,12 +1315,23 @@ function dashboard() {
 
     // ── Request-detail modal ──────────────────────────────────────────
     async openRequest(aid) {
+      // Open the modal IMMEDIATELY (placeholder) so it ALWAYS appears on
+      // click, then fill in the detail when the fetch returns. Previously
+      // modalOpen was set only AFTER the await, so any throw in the fetch
+      // or JSON parse left modalOpen=false → no popup, error hidden in the
+      // console. Now errors surface INSIDE the modal.
+      this.modalData = { aid: aid };
+      this.modalOpen = true;
       try {
         const detail = await this._j('api/requests/' + aid);
         this.modalData = detail;
-        this.modalOpen = true;
       } catch (e) {
         console.error('openRequest failed', e);
+        this.modalData = {
+          aid: aid,
+          content: 'Failed to load request detail: ' +
+                   (e && e.message ? e.message : String(e)),
+        };
       }
     },
 
