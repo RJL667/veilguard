@@ -19,13 +19,24 @@ import time as _time
 from pathlib import Path
 from typing import Any, Callable
 
-import lancedb
-
 
 LANCE_DIR = os.environ.get(
     "ADMIN_LANCE_DIR",
     "/home/rudol/veilguard/tcmm-data/veilguard/tcmm.db",
 )
+
+# Backend select — when TCMM moved to Postgres these stats read the CTI tables
+# (base_node / archive / dream) instead of the Lance dir.
+_TCMM_BACKEND = os.environ.get("TCMM_STORAGE", "lance").lower()
+_PG = _TCMM_BACKEND in ("postgres", "postgresql")
+_TCMM_DSN = os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm")
+
+
+def _pg_conn():
+    import psycopg2
+    conn = psycopg2.connect(_TCMM_DSN)
+    conn.autocommit = True   # each stat query independent; a bad predicate can't poison the rest
+    return conn
 
 # Tables we care about for the dashboard. archive is the hot one;
 # pii_audit feeds the redaction view; the others are tracked for
@@ -66,12 +77,171 @@ def _cached(fn: Callable) -> Callable:
 
 
 def _connect():
+    import lancedb  # lazy: only the Lance backend needs it
     return lancedb.connect(LANCE_DIR)
 
 
 def _quote(s: str) -> str:
     """Escape a single-quoted SQL literal."""
     return s.replace("'", "''")
+
+
+# ── Postgres backends for the three dashboard stat functions ──────────
+# Stage coverage predicates per column type: topics/entities/claims are
+# bigint[]/text[] arrays (cardinality); the dicts + link maps are jsonb.
+_PG_STAGE_PRED = {
+    "topics":           "cardinality(topics) > 0",
+    "topic_dicts":      "jsonb_typeof(topic_dicts) = 'array' AND jsonb_array_length(topic_dicts) > 0",
+    "entities":         "cardinality(entities) > 0",
+    "entity_dicts":     "jsonb_typeof(entity_dicts) = 'array' AND jsonb_array_length(entity_dicts) > 0",
+    "claims":           "cardinality(claims) > 0",
+    "semantic_links":   "semantic_links   IS NOT NULL AND semantic_links   <> '{}'::jsonb",
+    "entity_links":     "entity_links     IS NOT NULL AND entity_links     <> '{}'::jsonb",
+    "topic_links":      "topic_links      IS NOT NULL AND topic_links      <> '{}'::jsonb",
+    "contextual_links": "contextual_links IS NOT NULL AND contextual_links <> '{}'::jsonb",
+}
+
+
+def _pg_overview() -> dict[str, Any]:
+    out: dict[str, Any] = {"path": "postgres", "backend": "postgres", "tables": []}
+    try:
+        conn = _pg_conn()
+    except Exception as e:
+        out["error"] = f"open failed: {e}"
+        return out
+    try:
+        cur = conn.cursor()
+        for name in ("base_node", "archive", "dream", "dream_edges", "block_vectors", "pii_audit"):
+            rec: dict[str, Any] = {"name": name}
+            try:
+                cur.execute(f"SELECT count(*) FROM {name}")
+                rec["rows"] = cur.fetchone()[0]
+                cur.execute("SELECT pg_total_relation_size(%s)", [name])
+                rec["disk_bytes"] = cur.fetchone()[0]
+                rec["fragments"] = 0  # Postgres: no Lance fragmentation (autovacuum)
+            except Exception as e:
+                rec["error"] = str(e)[:160]
+            out["tables"].append(rec)
+        return out
+    finally:
+        conn.close()
+
+
+def _pg_fts_status() -> dict[str, Any]:
+    try:
+        conn = _pg_conn()
+    except Exception as e:
+        return {"built": False, "error": str(e)[:160]}
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT indexname FROM pg_indexes WHERE indexname IN "
+                    "('ix_base_fts','ix_base_vec','ix_base_srcblocks')")
+        idx = {r[0] for r in cur.fetchall()}
+        return {"built": "ix_base_fts" in idx, "backend": "postgres",
+                "fts_index": "ix_base_fts" in idx, "vector_index": "ix_base_vec" in idx,
+                "path": "postgres:base_node"}
+    finally:
+        conn.close()
+
+
+def _pg_nlp_coverage(user_id: str | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {"archive_rows": 0, "user_id": user_id, "stages": {},
+                           "embeddings_by_type": {}}
+    try:
+        conn = _pg_conn()
+    except Exception as e:
+        out["error"] = f"open failed: {e}"
+        return out
+    try:
+        cur = conn.cursor()
+
+        def cnt(extra: str | None = None) -> int:
+            q = "SELECT count(*) FROM v_archive WHERE TRUE"
+            p: list = []
+            if user_id:
+                q += " AND user_id = %s"; p.append(user_id)
+            if extra:
+                q += f" AND ({extra})"
+            try:
+                cur.execute(q, p); return cur.fetchone()[0]
+            except Exception:
+                return 0
+
+        total = cnt()
+        out["archive_rows"] = total
+        if total == 0:
+            return out
+
+        def stage_map(rec_only: bool):
+            m: dict[str, dict] = {}
+            pre = "recallable = TRUE AND " if rec_only else ""
+            denom = rec_total if rec_only else total
+            for stage, pred in _PG_STAGE_PRED.items():
+                n = cnt(pre + f"({pred})")
+                m[stage] = {"covered": n, "missing": denom - n, "percent": _pct(n, denom)}
+            nc = cnt(pre + "block_class IS NOT NULL AND block_class <> ''")
+            m["block_class"] = {"covered": nc, "missing": denom - nc, "percent": _pct(nc, denom)}
+            return m
+
+        out["stages"] = stage_map(False)
+        rec_total = cnt("recallable = TRUE")
+        out["recallable_archive_rows"] = rec_total
+        out["recallable_total"] = rec_total
+        out["not_recallable_total"] = total - rec_total
+        out["stages_recallable"] = stage_map(True)
+
+        vec = cnt("vector IS NOT NULL")
+        out["vector_coverage"] = {"covered": vec, "missing": total - vec, "percent": _pct(vec, total)}
+
+        # class × recallable cross-tab via GROUP BY
+        try:
+            q = ("SELECT COALESCE(NULLIF(block_class,''),'UNCLASSIFIED'), recallable, count(*) "
+                 "FROM v_archive WHERE TRUE")
+            p = []
+            if user_id:
+                q += " AND user_id = %s"; p.append(user_id)
+            q += " GROUP BY 1,2"
+            cur.execute(q, p)
+            breakdown: dict[str, dict[str, int]] = {}
+            for cls, rec, n in cur.fetchall():
+                row = breakdown.setdefault(cls or "UNCLASSIFIED",
+                                           {"recallable": 0, "not_recallable": 0, "total": 0})
+                row["recallable" if rec is True else "not_recallable"] += n
+                row["total"] += n
+            out["class_breakdown"] = dict(sorted(breakdown.items(), key=lambda kv: -kv[1]["total"]))
+        except Exception as e:
+            out["class_breakdown_error"] = str(e)[:160]
+
+        out["link_totals"] = {s: out["stages"].get(s, {}).get("covered", 0)
+                              for s in ("semantic_links", "entity_links",
+                                        "topic_links", "contextual_links")}
+
+        # embeddings: base_node.vector (archive type) + block_vectors by emb_type
+        bytype: dict[str, int] = {}
+        try:
+            q = "SELECT count(*) FROM base_node WHERE vector IS NOT NULL"
+            p = []
+            if user_id:
+                q += " AND user_id = %s"; p.append(user_id)
+            cur.execute(q, p); bytype["archive"] = cur.fetchone()[0]
+        except Exception:
+            pass
+        try:
+            q = "SELECT emb_type, count(*) FROM block_vectors WHERE TRUE"
+            p = []
+            if user_id:
+                q += " AND user_id = %s"; p.append(user_id)
+            q += " GROUP BY 1"
+            cur.execute(q, p)
+            for et, n in cur.fetchall():
+                bytype[et] = n
+        except Exception:
+            pass
+        out["embeddings_total"] = sum(bytype.values())
+        out["embeddings_by_type"] = dict(sorted(bytype.items()))
+        return out
+    finally:
+        conn.close()
 
 
 # ── overview ─────────────────────────────────────────────────────────
@@ -84,6 +254,8 @@ def overview() -> dict[str, Any]:
     All errors are caught per-table — a missing or corrupt table can't
     take the dashboard down.
     """
+    if _PG:
+        return _pg_overview()
     out: dict[str, Any] = {"path": LANCE_DIR, "tables": []}
     try:
         db = _connect()
@@ -167,6 +339,8 @@ def nlp_coverage(user_id: str | None = None) -> dict[str, Any]:
     Both use ``search().select([...]).to_arrow()`` so Lance only reads
     the requested columns (~50–100 KB total instead of a multi-MB scan).
     """
+    if _PG:
+        return _pg_nlp_coverage(user_id)
     out: dict[str, Any] = {
         "archive_rows": 0,
         "user_id": user_id,
@@ -328,6 +502,8 @@ def fts_index_status() -> dict[str, Any]:
     check that path exists and report mtime so we know when it last
     rebuilt.
     """
+    if _PG:
+        return _pg_fts_status()
     sparse_dir = Path(LANCE_DIR) / "sparse_archive.lance" / "_indices"
     if not sparse_dir.exists():
         return {"built": False, "path": str(sparse_dir)}

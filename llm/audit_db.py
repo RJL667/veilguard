@@ -34,10 +34,42 @@ import threading
 import time
 from typing import Optional
 
-import lancedb
 import pyarrow as pa
 
 logger = logging.getLogger("veilguard.audit_db")
+
+# Backend select (mirrors the TCMM/ledger Postgres switch). When
+# VEILGUARD_AUDIT_BACKEND (or TCMM_STORAGE) is postgres, pii_audit is a real
+# Postgres table; otherwise the legacy LanceDB table. Same record() API either way.
+_AUDIT_BACKEND = os.environ.get(
+    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "lance")
+).lower()
+_PG = _AUDIT_BACKEND in ("postgres", "postgresql")
+_AUDIT_DSN = os.environ.get(
+    "VEILGUARD_AUDIT_DATABASE_URL",
+    os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm"),
+)
+_PG_DDL = """
+CREATE TABLE IF NOT EXISTS pii_audit (
+    aid             BIGINT PRIMARY KEY,
+    user_id         TEXT,
+    conversation_id TEXT,
+    direction       TEXT NOT NULL,
+    model           TEXT,
+    stream          BOOLEAN,
+    content         TEXT,
+    created_at      DOUBLE PRECISION NOT NULL,
+    tokens_input    BIGINT,
+    tokens_output   BIGINT,
+    cache_create    BIGINT,
+    cache_read      BIGINT,
+    task_id         TEXT,
+    extra           TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_pii_created      ON pii_audit (created_at);
+CREATE INDEX IF NOT EXISTS ix_pii_user_created ON pii_audit (user_id, created_at);
+CREATE INDEX IF NOT EXISTS ix_pii_conv         ON pii_audit (conversation_id);
+"""
 
 
 # Default points at the TCMM data volume which is bind-mounted into
@@ -105,31 +137,32 @@ class AuditDB:
             return cls._instance
 
     def __init__(self):
-        self._db = lancedb.connect(_DB_PATH)
-        try:
-            self._tbl = self._db.open_table(_TABLE)
-            # [TASK_ID_MIGRATION_2026_05_26] Idempotent schema-add for
-            # the task_id column.  Lance allows adding nullable columns
-            # to an existing table; existing rows get NULL automatically.
-            # add_columns is idempotent — if the column already exists
-            # this no-ops with a NotFound / already-exists exception we
-            # swallow.
+        self._pg = _PG
+        if self._pg:
+            import psycopg2
+            self._conn = psycopg2.connect(_AUDIT_DSN)
+            self._conn.autocommit = True
+            with self._conn.cursor() as c:
+                c.execute(_PG_DDL)
+            logger.info(f"[audit_db] postgres backend — ::{_TABLE}")
+        else:
+            import lancedb  # lazy: only the Lance backend needs it
+            self._db = lancedb.connect(_DB_PATH)
             try:
-                existing_cols = set(self._tbl.schema.names)
-                if "task_id" not in existing_cols:
-                    self._tbl.add_columns({"task_id": "cast(NULL as string)"})
-                    logger.info(
-                        f"[audit_db] migrated {_TABLE}: added task_id column"
-                    )
-            except Exception as e:
-                # Don't fail init on migration issues — log and continue.
-                # Production rows can still be read without the column.
-                logger.warning(
-                    f"[audit_db] task_id column add skipped: {e}"
-                )
-        except Exception:
-            self._tbl = self._db.create_table(_TABLE, schema=SCHEMA)
-            logger.info(f"[audit_db] created table {_TABLE} at {_DB_PATH}")
+                self._tbl = self._db.open_table(_TABLE)
+                # [TASK_ID_MIGRATION_2026_05_26] Idempotent schema-add for the
+                # task_id column.  Lance allows adding nullable columns to an
+                # existing table; existing rows get NULL automatically.
+                try:
+                    existing_cols = set(self._tbl.schema.names)
+                    if "task_id" not in existing_cols:
+                        self._tbl.add_columns({"task_id": "cast(NULL as string)"})
+                        logger.info(f"[audit_db] migrated {_TABLE}: added task_id column")
+                except Exception as e:
+                    logger.warning(f"[audit_db] task_id column add skipped: {e}")
+            except Exception:
+                self._tbl = self._db.create_table(_TABLE, schema=SCHEMA)
+                logger.info(f"[audit_db] created table {_TABLE} at {_DB_PATH}")
 
         self._aid_lock = threading.Lock()
         # Microsecond-resolution seed (NOT nanosecond — nanosecond aids
@@ -189,11 +222,21 @@ class AuditDB:
 
     def _flush(self, batch: list[dict]):
         try:
-            self._tbl.add(batch)
+            if self._pg:
+                from psycopg2.extras import execute_values
+                cols = list(SCHEMA.names)
+                vals = [tuple(row.get(c) for c in cols) for row in batch]
+                with self._conn.cursor() as c:
+                    execute_values(
+                        c,
+                        f"INSERT INTO {_TABLE} ({', '.join(cols)}) VALUES %s "
+                        f"ON CONFLICT (aid) DO NOTHING",
+                        vals,
+                    )
+            else:
+                self._tbl.add(batch)
         except Exception as e:
-            logger.warning(
-                f"[audit_db] flush failed ({len(batch)} rows): {e}"
-            )
+            logger.warning(f"[audit_db] flush failed ({len(batch)} rows): {e}")
 
 
 class _NullAuditDB:

@@ -37,10 +37,6 @@ import time
 from collections import Counter
 from typing import Any, Optional
 
-import lancedb
-import pyarrow.compute as pc
-
-
 logger = logging.getLogger("veilguard.admin.pii_audit")
 
 
@@ -55,9 +51,37 @@ TOK_RE = re.compile(
 KIND_RE = re.compile(r"REF_([A-Z_]+?)_\d+")
 
 
+_AUDIT_BACKEND = os.environ.get(
+    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "lance")
+).lower()
+_PG = _AUDIT_BACKEND in ("postgres", "postgresql")
+_AUDIT_DSN = os.environ.get(
+    "VEILGUARD_AUDIT_DATABASE_URL",
+    os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm"),
+)
+
+
 def _open_table():
+    import lancedb  # lazy: only the Lance backend needs it
     db = lancedb.connect(LANCE_DIR)
     return db.open_table("pii_audit")
+
+
+def _pg_table(where_sql: str, params: list, cols: list):
+    """Run a pii_audit query on Postgres and return a REAL pyarrow.Table with
+    ALL `cols` present (even when empty), so every downstream aggregator's
+    `.column(name).to_pylist()` / `.num_rows` / `.slice()` works unchanged."""
+    import psycopg2
+    import pyarrow as pa
+    sel = ", ".join(cols)
+    conn = psycopg2.connect(_AUDIT_DSN)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT {sel} FROM pii_audit WHERE {where_sql}", params)
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    return pa.table({c: [r[i] for r in rows] for i, c in enumerate(cols)})
 
 
 def _resolve_window(
@@ -141,14 +165,22 @@ def _windowed_rows(
         "cache_read", "extra", "content",
     ]
     try:
-        t = _open_table()
-        _where = f"created_at >= {float(s)} AND created_at < {float(e)}"
-        if user_id:
-            _u = str(user_id).replace("'", "''")
-            _where += f" AND user_id = '{_u}'"
-        # search() with no vector = plain filtered scan; .where() + .select()
-        # push predicate + projection to the engine (no Python-side mask copy).
-        arr = t.search().where(_where).select(_COLS).to_arrow()
+        if _PG:
+            _where = "created_at >= %s AND created_at < %s"
+            _params: list = [float(s), float(e)]
+            if user_id:
+                _where += " AND user_id = %s"
+                _params.append(str(user_id))
+            arr = _pg_table(_where, _params, _COLS)
+        else:
+            t = _open_table()
+            _where = f"created_at >= {float(s)} AND created_at < {float(e)}"
+            if user_id:
+                _u = str(user_id).replace("'", "''")
+                _where += f" AND user_id = '{_u}'"
+            # search() with no vector = plain filtered scan; .where() + .select()
+            # push predicate + projection to the engine (no Python-side mask copy).
+            arr = t.search().where(_where).select(_COLS).to_arrow()
     except Exception as ex:
         logger.info("pii_audit windowed scan failed: %s", ex)
         return s, e, None
@@ -593,11 +625,16 @@ def request_detail(aid: int) -> dict[str, Any]:
     counts are recomputed from the content for display.
     """
     try:
-        t = _open_table()
-        # [LEAK_FIX_2026_06_01] Predicate-pushdown the single aid instead of
-        # to_arrow()-ing the ENTIRE audit history just to find one row — that
-        # full load made every popup click pull ~600MB and lag the dashboard.
-        sub = t.search().where(f"aid = {int(aid)}").to_arrow()
+        if _PG:
+            sub = _pg_table("aid = %s", [int(aid)],
+                            ["aid", "user_id", "conversation_id", "direction", "model",
+                             "created_at", "tokens_input", "tokens_output", "content"])
+        else:
+            # [LEAK_FIX_2026_06_01] Predicate-pushdown the single aid instead of
+            # to_arrow()-ing the ENTIRE audit history just to find one row — that
+            # full load made every popup click pull ~600MB and lag the dashboard.
+            t = _open_table()
+            sub = t.search().where(f"aid = {int(aid)}").to_arrow()
     except Exception as e:
         return {"error": f"open pii_audit failed: {e}"}
 
