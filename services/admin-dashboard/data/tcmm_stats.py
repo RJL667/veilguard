@@ -15,6 +15,35 @@ import httpx
 TCMM_BASE = os.environ.get("TCMM_URL", "http://127.0.0.1:8811").rstrip("/")
 TIMEOUT = 3.0
 
+# When TCMM is on Postgres, the NLP/embedding-progress counts come from the CTI
+# `archive` stage flags instead of a Lance scan.
+_PG = os.environ.get("TCMM_STORAGE", "lance").lower() in ("postgres", "postgresql")
+_TCMM_DSN = os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm")
+
+
+def _pg_nlp_progress() -> dict[str, int]:
+    """archive total + semantic_done/embedding_done counts from Postgres."""
+    out = {"archive_total": 0, "nlp_processed": 0, "nlp_pending": 0,
+           "embed_processed": 0, "embed_pending": 0}
+    try:
+        import psycopg2
+        conn = psycopg2.connect(_TCMM_DSN)
+        try:
+            with conn.cursor() as c:
+                c.execute("SELECT count(*), count(*) FILTER (WHERE semantic_done), "
+                          "count(*) FILTER (WHERE embedding_done) FROM archive")
+                total, sem, emb = c.fetchone()
+        finally:
+            conn.close()
+        out["archive_total"] = total or 0
+        out["nlp_processed"] = sem or 0
+        out["embed_processed"] = emb or 0
+        out["nlp_pending"] = out["archive_total"] - out["nlp_processed"]
+        out["embed_pending"] = out["archive_total"] - out["embed_processed"]
+    except Exception:
+        pass
+    return out
+
 
 async def _get(path: str) -> dict[str, Any] | None:
     try:
@@ -54,6 +83,8 @@ def _lance_nlp_progress() -> dict[str, int]:
     Returns zeros if the archive is unreachable so the frontend's
     placeholders render rather than crashing.
     """
+    if _PG:
+        return _pg_nlp_progress()
     out = {
         "archive_total": 0,
         "nlp_processed": 0,

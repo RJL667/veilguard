@@ -42,10 +42,35 @@ import time
 from pathlib import Path
 from typing import Optional
 
-import lancedb
 import pyarrow as pa
 
 logger = logging.getLogger("veilguard.client_settings")
+
+# Backend select — Postgres when TCMM_STORAGE / VEILGUARD_AUDIT_BACKEND=postgres.
+_PG = os.environ.get(
+    "TCMM_STORAGE", os.environ.get("VEILGUARD_AUDIT_BACKEND", "lance")
+).lower() in ("postgres", "postgresql")
+_PG_DSN = os.environ.get(
+    "VEILGUARD_CLIENT_SETTINGS_DATABASE_URL",
+    os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm"),
+)
+_PG_DDL = """
+CREATE TABLE IF NOT EXISTS client_settings (
+    user_id           TEXT PRIMARY KEY,
+    permission_level  TEXT,
+    default_timeout_s BIGINT,
+    created_ts        DOUBLE PRECISION,
+    updated_ts        DOUBLE PRECISION
+);
+CREATE TABLE IF NOT EXISTS client_settings_conv (
+    user_id          TEXT,
+    conv_id          TEXT,
+    permission_level TEXT,
+    expires_at       DOUBLE PRECISION,
+    created_ts       DOUBLE PRECISION,
+    PRIMARY KEY (user_id, conv_id)
+);
+"""
 
 
 # ── Constants ────────────────────────────────────────────────────────────
@@ -89,6 +114,16 @@ class ClientSettingsStore:
     _instance_lock = threading.Lock()
 
     def __init__(self, db_path: Optional[str] = None):
+        self._pg = _PG
+        if self._pg:
+            import psycopg2
+            self._conn = psycopg2.connect(_PG_DSN)
+            self._conn.autocommit = True
+            with self._conn.cursor() as c:
+                c.execute(_PG_DDL)
+            logger.info("[client_settings] postgres backend")
+            return
+        import lancedb  # lazy: only the Lance backend needs it
         path = (
             db_path
             or os.environ.get("VEILGUARD_CLIENT_SETTINGS_DB_PATH")
@@ -178,6 +213,14 @@ class ClientSettingsStore:
         """
         if not user_id:
             return DEFAULT_LEVEL, DEFAULT_TIMEOUT_S
+        if self._pg:
+            with self._conn.cursor() as c:
+                c.execute("SELECT permission_level, default_timeout_s FROM client_settings "
+                          "WHERE user_id=%s", [user_id])
+                r = c.fetchone()
+            if not r:
+                return DEFAULT_LEVEL, DEFAULT_TIMEOUT_S
+            return (r[0] or DEFAULT_LEVEL), int(r[1] or DEFAULT_TIMEOUT_S)
         try:
             arr = (
                 self._tbl_user.search()
@@ -215,6 +258,15 @@ class ClientSettingsStore:
             "created_ts":       now,   # overwritten by merge_insert if row exists
             "updated_ts":       now,
         }
+        if self._pg:
+            with self._conn.cursor() as c:
+                c.execute("INSERT INTO client_settings (user_id,permission_level,default_timeout_s,"
+                          "created_ts,updated_ts) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (user_id) DO "
+                          "UPDATE SET permission_level=EXCLUDED.permission_level, "
+                          "default_timeout_s=EXCLUDED.default_timeout_s, updated_ts=EXCLUDED.updated_ts",
+                          [user_id, level, int(prev_timeout), now, now])
+            logger.info(f"[client_settings] user={user_id[:8]} level={level} timeout={prev_timeout}s")
+            return
         try:
             (
                 self._tbl_user.merge_insert("user_id")
@@ -236,6 +288,17 @@ class ClientSettingsStore:
         """Return the conv override level, or None if absent / expired."""
         if not (user_id and conv_id):
             return None
+        if self._pg:
+            with self._conn.cursor() as c:
+                c.execute("SELECT permission_level, expires_at FROM client_settings_conv "
+                          "WHERE user_id=%s AND conv_id=%s", [user_id, conv_id])
+                r = c.fetchone()
+            if not r:
+                return None
+            level, expires = r[0], (r[1] or 0.0)
+            if expires and expires < time.time():
+                return None
+            return level if level in PERMISSION_LEVELS else None
         try:
             arr = (
                 self._tbl_conv.search()
@@ -275,6 +338,14 @@ class ClientSettingsStore:
             "expires_at":       expires,
             "created_ts":       now,
         }
+        if self._pg:
+            with self._conn.cursor() as c:
+                c.execute("INSERT INTO client_settings_conv (user_id,conv_id,permission_level,"
+                          "expires_at,created_ts) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (user_id,conv_id) "
+                          "DO UPDATE SET permission_level=EXCLUDED.permission_level, "
+                          "expires_at=EXCLUDED.expires_at",
+                          [user_id, conv_id, level, expires, now])
+            return
         try:
             (
                 self._tbl_conv.merge_insert(["user_id", "conv_id"])
@@ -293,6 +364,11 @@ class ClientSettingsStore:
     def clear_conv_override(self, user_id: str, conv_id: str) -> None:
         """Remove a conv override (e.g. user clicked 'reset' in tray)."""
         if not (user_id and conv_id):
+            return
+        if self._pg:
+            with self._conn.cursor() as c:
+                c.execute("DELETE FROM client_settings_conv WHERE user_id=%s AND conv_id=%s",
+                          [user_id, conv_id])
             return
         try:
             self._tbl_conv.delete(

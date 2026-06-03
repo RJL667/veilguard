@@ -51,3 +51,6 @@ anthropic>=0.40.0
 # Async test fixtures for the unit tests.
 pytest==8.3.4
 pytest-asyncio==0.25.0
+
+# Postgres backend for the agentic ledger (LEDGER_BACKEND=postgres → PgLedgerStore).
+psycopg2-binary>=2.9.9

@@ -27,12 +27,39 @@ import time
 from pathlib import Path
 from typing import Iterable, Optional
 
-import lancedb
 import pyarrow as pa
 
 from .model import Task, TaskStatus
 
 logger = logging.getLogger("veilguard.tasks.store")
+
+# Backend select — Postgres when TCMM_STORAGE / VEILGUARD_AUDIT_BACKEND=postgres,
+# else the legacy LanceDB table. Same TaskStore API either way.
+_PG = os.environ.get(
+    "TCMM_STORAGE", os.environ.get("VEILGUARD_AUDIT_BACKEND", "lance")
+).lower() in ("postgres", "postgresql")
+_PG_DSN = os.environ.get(
+    "VEILGUARD_TASKS_DATABASE_URL",
+    os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm"),
+)
+_PG_DDL = """
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id          TEXT PRIMARY KEY,
+    user_id          TEXT, tenant_id TEXT, conv_id TEXT,
+    parent_task_id   TEXT, root_task_id TEXT,
+    depends_on       TEXT[],
+    kind             TEXT, executor TEXT, title TEXT, description TEXT,
+    payload_json     TEXT, status TEXT,
+    created_at       DOUBLE PRECISION, started_at DOUBLE PRECISION, finished_at DOUBLE PRECISION,
+    result           TEXT, error TEXT,
+    interval_seconds BIGINT, next_run_at DOUBLE PRECISION, extras_json TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_tasks_user   ON tasks(user_id);
+CREATE INDEX IF NOT EXISTS ix_tasks_parent ON tasks(parent_task_id);
+CREATE INDEX IF NOT EXISTS ix_tasks_root   ON tasks(root_task_id);
+CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks(status);
+CREATE INDEX IF NOT EXISTS ix_tasks_kind   ON tasks(kind);
+"""
 
 
 # ── Schema ───────────────────────────────────────────────────────────────
@@ -145,6 +172,16 @@ class TaskStore:
     _instance_lock = threading.Lock()
 
     def __init__(self, db_path: Optional[str] = None):
+        self._pg = _PG
+        if self._pg:
+            import psycopg2
+            self._conn = psycopg2.connect(_PG_DSN)
+            self._conn.autocommit = True
+            with self._conn.cursor() as c:
+                c.execute(_PG_DDL)
+            logger.info("[tasks.store] postgres backend")
+            return
+        import lancedb  # lazy: only the Lance backend needs it
         path = (
             db_path
             or os.environ.get("VEILGUARD_TASKS_DB_PATH")
@@ -185,8 +222,28 @@ class TaskStore:
             pass
         return []
 
+    def _pg_upsert(self, rows: list[dict]) -> None:
+        cols = list(_SCHEMA.names)
+        setc = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c != "task_id")
+        ph = ", ".join(["%s"] * len(cols))
+        with self._conn.cursor() as cur:
+            for row in rows:
+                cur.execute(
+                    f"INSERT INTO tasks ({', '.join(cols)}) VALUES ({ph}) "
+                    f"ON CONFLICT (task_id) DO UPDATE SET {setc}",
+                    [row.get(c) for c in cols])
+
+    def _pg_select(self, where: str, params: list, limit: int) -> list[Task]:
+        import psycopg2.extras
+        with self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"SELECT * FROM tasks WHERE {where} ORDER BY created_at LIMIT %s",
+                        list(params) + [int(limit)])
+            return [_row_to_task(dict(r)) for r in cur.fetchall()]
+
     def _ensure_indexes(self) -> None:
         """Idempotent BTREE creation, same pattern as pii_session_store."""
+        if self._pg:
+            return  # Postgres manages its own indexes (DDL in __init__)
         try:
             existing = {idx.columns[0] for idx in self._tbl.list_indices()
                         if idx.columns}
@@ -209,6 +266,8 @@ class TaskStore:
     def upsert(self, task: Task) -> None:
         """Insert or update a task by primary key (task_id)."""
         row = _task_to_row(task)
+        if self._pg:
+            self._pg_upsert([row]); return
         try:
             (
                 self._tbl.merge_insert("task_id")
@@ -225,6 +284,8 @@ class TaskStore:
         rows = [_task_to_row(t) for t in tasks]
         if not rows:
             return 0
+        if self._pg:
+            self._pg_upsert(rows); return len(rows)
         try:
             (
                 self._tbl.merge_insert("task_id")
@@ -242,6 +303,9 @@ class TaskStore:
     def get_task(self, task_id: str) -> Optional[Task]:
         if not task_id:
             return None
+        if self._pg:
+            r = self._pg_select("task_id = %s", [task_id], 1)
+            return r[0] if r else None
         arr = (
             self._tbl.search()
             .where(f"task_id = '{_esc(task_id)}'")
@@ -262,6 +326,15 @@ class TaskStore:
         """List a user's tasks, optionally filtered by status/kind/since."""
         if not user_id:
             return []
+        if self._pg:
+            where = "user_id = %s"; params: list = [user_id]
+            if statuses:
+                where += " AND status = ANY(%s)"; params.append([str(s) for s in statuses])
+            if kinds:
+                where += " AND kind = ANY(%s)"; params.append([str(k) for k in kinds])
+            if since_ts > 0:
+                where += " AND created_at >= %s"; params.append(float(since_ts))
+            return self._pg_select(where, params, limit)
         clauses = [f"user_id = '{_esc(user_id)}'"]
         if statuses:
             ss = ",".join(f"'{_esc(s)}'" for s in statuses)
@@ -284,6 +357,8 @@ class TaskStore:
         """All tasks (root + descendants) sharing a root_task_id."""
         if not root_task_id:
             return []
+        if self._pg:
+            return self._pg_select("root_task_id = %s", [root_task_id], limit)
         arr = (
             self._tbl.search()
             .where(f"root_task_id = '{_esc(root_task_id)}'")
@@ -296,6 +371,8 @@ class TaskStore:
         """Direct children only (one level deep)."""
         if not parent_task_id:
             return []
+        if self._pg:
+            return self._pg_select("parent_task_id = %s", [parent_task_id], limit)
         arr = (
             self._tbl.search()
             .where(f"parent_task_id = '{_esc(parent_task_id)}'")

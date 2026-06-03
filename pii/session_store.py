@@ -50,10 +50,35 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import lancedb
 import pyarrow as pa
 
 logger = logging.getLogger("veilguard.pii.session_store")
+
+# Backend select (mirrors the TCMM/ledger/audit switch). Postgres when
+# VEILGUARD_AUDIT_BACKEND / TCMM_STORAGE = postgres; else the legacy LanceDB
+# table. Same SessionId / add_mapping / rehydrate API either way.
+_PG = os.environ.get(
+    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "lance")
+).lower() in ("postgres", "postgresql")
+_PG_DSN = os.environ.get(
+    "VEILGUARD_AUDIT_DATABASE_URL",
+    os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm"),
+)
+_PG_DDL = """
+CREATE TABLE IF NOT EXISTS pii_session_mapping (
+    tenant_id   TEXT NOT NULL,
+    conv_id     TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    original_lc TEXT NOT NULL,
+    original    TEXT,
+    ref_token   TEXT NOT NULL,
+    counter     BIGINT,
+    created_ts  DOUBLE PRECISION,
+    PRIMARY KEY (tenant_id, conv_id, entity_type, original_lc)
+);
+CREATE INDEX IF NOT EXISTS ix_pii_sess_conv   ON pii_session_mapping (tenant_id, conv_id);
+CREATE INDEX IF NOT EXISTS ix_pii_sess_reftok ON pii_session_mapping (ref_token);
+"""
 
 
 # ── Schema ──────────────────────────────────────────────────────────────
@@ -152,6 +177,21 @@ class PIISessionStore:
     _instance_lock = threading.Lock()
 
     def __init__(self, db_path: Optional[str] = None):
+        # In-memory state shared by both backends (memo + write batch + counters).
+        self._memo: dict[tuple, str] = {}
+        self._pending_rows: list[dict] = []
+        self._counters: dict[tuple, int] = {}
+        self._pg = _PG
+        if self._pg:
+            import psycopg2
+            self._conn = psycopg2.connect(_PG_DSN)
+            self._conn.autocommit = True
+            with self._conn.cursor() as c:
+                c.execute(_PG_DDL)
+            self._tbl = None  # Lance-only handle; unused on Postgres
+            logger.info("[pii] session store on postgres")
+            return
+        import lancedb  # lazy: only the Lance backend needs it
         # Reuse the agent-runtime ledger DB by default — same Lance dir,
         # sibling table.  Override via VEILGUARD_PII_DB_PATH (or share
         # with agent-runtime's LEDGER_DB_PATH).
@@ -228,6 +268,8 @@ class PIISessionStore:
         redactor still works without indexes (just slower).  We log the
         warning loudly so it shows up in dashboards.
         """
+        if self._pg:
+            return  # Postgres manages its own indexes (DDL in __init__)
         try:
             existing = {idx.columns[0] for idx in self._tbl.list_indices()
                         if idx.columns}
@@ -256,6 +298,8 @@ class PIISessionStore:
 
         Returns a stats dict for logging / dashboard display.
         """
+        if self._pg:
+            return {"backend": "postgres", "skipped": "pg_autovacuum"}
         stats: dict = {}
         if self._get_tbl() is None:
             # Table not created yet (no PII ever redacted) → nothing to do.
@@ -330,10 +374,17 @@ class PIISessionStore:
         self, sid: SessionId, entity_type: str, original_lc: str
     ) -> Optional[str]:
         """Return existing ref_token for this PII, or None."""
+        sid_root = sid.root()
+        if self._pg:
+            with self._conn.cursor() as c:
+                c.execute("SELECT ref_token FROM pii_session_mapping WHERE tenant_id=%s "
+                          "AND conv_id=%s AND entity_type=%s AND original_lc=%s LIMIT 1",
+                          [sid_root.tenant_id, sid_root.conv_id, entity_type, original_lc])
+                row = c.fetchone()
+            return row[0] if row else None
         tbl = self._get_tbl()
         if tbl is None:
             return None
-        sid_root = sid.root()
         # Lance where supports == with string literals; escape single quotes.
         oq = original_lc.replace("'", "''")
         arr = (
@@ -352,10 +403,16 @@ class PIISessionStore:
 
     def _next_counter(self, sid: SessionId, entity_type: str) -> int:
         """Return the next counter for this (sid, entity_type)."""
+        sid_root = sid.root()
+        if self._pg:
+            with self._conn.cursor() as c:
+                c.execute("SELECT COALESCE(MAX(counter),0)+1 FROM pii_session_mapping WHERE "
+                          "tenant_id=%s AND conv_id=%s AND entity_type=%s",
+                          [sid_root.tenant_id, sid_root.conv_id, entity_type])
+                return int(c.fetchone()[0])
         tbl = self._get_tbl()
         if tbl is None:
             return 1
-        sid_root = sid.root()
         arr = (
             tbl.search()
             .where(
@@ -372,10 +429,15 @@ class PIISessionStore:
 
     def _rehydrate_map(self, sid: SessionId) -> dict[str, str]:
         """All token→original mappings for this session."""
+        sid_root = sid.root()
+        if self._pg:
+            with self._conn.cursor() as c:
+                c.execute("SELECT ref_token, original FROM pii_session_mapping WHERE "
+                          "tenant_id=%s AND conv_id=%s", [sid_root.tenant_id, sid_root.conv_id])
+                return {tok: orig for tok, orig in c.fetchall()}
         tbl = self._get_tbl()
         if tbl is None:
             return {}
-        sid_root = sid.root()
         arr = (
             tbl.search()
             .where(
@@ -481,6 +543,22 @@ class PIISessionStore:
                 return 0
             rows = self._pending_rows
             self._pending_rows = []
+            if self._pg:
+                try:
+                    with self._conn.cursor() as c:
+                        for row in rows:
+                            c.execute(
+                                "INSERT INTO pii_session_mapping (tenant_id,conv_id,entity_type,"
+                                "original_lc,original,ref_token,counter,created_ts) VALUES "
+                                "(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT "
+                                "(tenant_id,conv_id,entity_type,original_lc) DO NOTHING",
+                                [row["tenant_id"], row["conv_id"], row["entity_type"],
+                                 row["original_lc"], row["original"], row["ref_token"],
+                                 row["counter"], row["created_ts"]])
+                    return len(rows)
+                except Exception as e:
+                    logger.error(f"[pii] session-store flush failed ({len(rows)} rows): {e}")
+                    return 0
             try:
                 arrow = pa.Table.from_pylist(rows, schema=_SCHEMA)
                 # [PII_PERSIST_FIX_2026_05_31]  Create the table WITH data the
@@ -555,6 +633,21 @@ class PIISessionStore:
         tokens = sorted(set(_REF_TOKEN_RE.findall(text)))
         if not tokens:
             return text
+        if self._pg:
+            try:
+                with self._conn.cursor() as c:
+                    c.execute("SELECT ref_token, original, created_ts FROM pii_session_mapping "
+                              "WHERE ref_token = ANY(%s)", [tokens])
+                    rows = c.fetchall()
+            except Exception as e:
+                logger.warning(f"[pii] rehydrate_any query failed: {e}")
+                return text
+            best: dict[str, tuple[float, str]] = {}
+            for tk, og, t in rows:
+                if tk not in best or (t or 0) >= best[tk][0]:
+                    best[tk] = ((t or 0), og)
+            mapping = {tk: v[1] for tk, v in best.items()}
+            return _REF_TOKEN_RE.sub(lambda m: mapping.get(m.group(0), m.group(0)), text)
         in_list = ", ".join("'" + t.replace("'", "''") + "'" for t in tokens)
         try:
             arr = (

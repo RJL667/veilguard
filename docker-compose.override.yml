@@ -1,0 +1,29 @@
+# Local Postgres cutover (REVERSIBLE: delete this file + `docker compose up -d`
+# to revert the stack to LanceDB). Routes the agentic ledger + pii_audit + the
+# TCMM-memory/dashboard reads at the host `tcmm-pg` container (published on host
+# port 5433), reached via the docker host gateway — the same way these services
+# already reach the host TCMM service on :8811.
+services:
+  agent-runtime:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      TCMM_STORAGE: postgres
+      LEDGER_BACKEND: postgres
+      VEILGUARD_AUDIT_BACKEND: postgres
+      TCMM_DATABASE_URL: postgresql://tcmm:tcmm@host.docker.internal:5433/tcmm
+
+  pii-proxy:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      VEILGUARD_AUDIT_BACKEND: postgres
+      TCMM_DATABASE_URL: postgresql://tcmm:tcmm@host.docker.internal:5433/tcmm
+
+  admin:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      TCMM_STORAGE: postgres
+      VEILGUARD_AUDIT_BACKEND: postgres
+      TCMM_DATABASE_URL: postgresql://tcmm:tcmm@host.docker.internal:5433/tcmm

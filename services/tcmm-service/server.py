@@ -569,8 +569,11 @@ def _new_session_stats() -> dict:
 # ── Session Pool ─────────────────────────────────────────────────────────────
 
 STORAGE_BACKEND = os.environ.get("TCMM_STORAGE", "lance").lower()
-VECTOR_BACKEND = os.environ.get("TCMM_VECTOR", "lance").lower()
-SPARSE_BACKEND = os.environ.get("TCMM_SPARSE", "lance").lower()
+_PG_BACKEND = STORAGE_BACKEND in ("postgres", "postgresql")
+# On Postgres, vector + sparse live in the same DB — default them to postgres
+# too (not "lance") so a single TCMM_STORAGE=postgres switches the whole engine.
+VECTOR_BACKEND = os.environ.get("TCMM_VECTOR", STORAGE_BACKEND if _PG_BACKEND else "lance").lower()
+SPARSE_BACKEND = os.environ.get("TCMM_SPARSE", STORAGE_BACKEND if _PG_BACKEND else "lance").lower()
 LANCE_DB_NAME = os.environ.get("TCMM_LANCE_DB", "veilguard")
 
 
@@ -614,8 +617,10 @@ class SessionPool:
         start = time.time()
         _pool_phase = {}
 
-        # Shared LanceDB: one DB for all sessions, namespace=conversation_id
-        _is_db_storage = STORAGE_BACKEND in ("lance", "lancedb", "sqlite")
+        # Shared DB (Lance OR Postgres): one DB for all sessions, namespace=
+        # conversation_id. Postgres MUST take this path (not the per-session
+        # dir) so the provider gets a (user_id, namespace) scope.
+        _is_db_storage = STORAGE_BACKEND in ("lance", "lancedb", "sqlite", "postgres", "postgresql")
         if _is_db_storage:
             # Shared DB directory — all sessions in one database
             shared_data_dir = os.path.join(DATA_DIR, LANCE_DB_NAME)

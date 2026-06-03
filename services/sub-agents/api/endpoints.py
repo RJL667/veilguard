@@ -10,6 +10,14 @@ from utils.helpers import elapsed
 from utils.afk import is_afk
 from tools.managed_tasks import check_task_dependencies
 
+import os as _osenv
+# Org-status reads the ledger tables (agent_tasks / task_comments). When the
+# ledger is on Postgres, query it directly instead of the Lance fallback.
+_PG = _osenv.environ.get(
+    "LEDGER_BACKEND", _osenv.environ.get("TCMM_STORAGE", "lance")
+).lower() in ("postgres", "postgresql")
+_PG_DSN = _osenv.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm")
+
 
 async def api_stats(request):
     return JSONResponse({
@@ -139,7 +147,33 @@ async def api_agents(request):
     # ── 2. Last-active + task counts from agent_tasks ───────────────
     now = _time.time()
     by_owner: dict[str, dict] = {}
+    if _PG:
+        try:
+            import psycopg2
+            _conn = psycopg2.connect(_PG_DSN)
+            with _conn.cursor() as _cur:
+                _cur.execute("SELECT owner_id, status, COALESCE(updated_ts,0) FROM agent_tasks LIMIT 2000")
+                for _owner, _st, _ts in _cur.fetchall():
+                    if not _owner:
+                        continue
+                    _rec = by_owner.setdefault(_owner, {
+                        "tasks_total": 0, "tasks_active": 0,
+                        "tasks_done": 0, "tasks_cancelled": 0, "last_active_ts": 0.0})
+                    _rec["tasks_total"] += 1
+                    if _st in ("open", "accepted", "in_progress", "review"):
+                        _rec["tasks_active"] += 1
+                    elif _st == "done":
+                        _rec["tasks_done"] += 1
+                    elif _st == "cancelled":
+                        _rec["tasks_cancelled"] += 1
+                    if (_ts or 0.0) > _rec["last_active_ts"]:
+                        _rec["last_active_ts"] = _ts or 0.0
+            _conn.close()
+        except Exception:
+            pass
     try:
+        if _PG:
+            raise ImportError  # Postgres handled above; skip the Lance fallback
         import lancedb
         for db_path in (
             os.environ.get("VEILGUARD_AUDIT_DB_PATH"),
@@ -186,7 +220,22 @@ async def api_agents(request):
 
     # ── 3. Recent approvals (last 5 review_decision comments) ──────
     recent_approvals: list[dict] = []
+    if _PG:
+        try:
+            import psycopg2
+            _conn = psycopg2.connect(_PG_DSN)
+            with _conn.cursor() as _cur:
+                _cur.execute("SELECT ts, author_id, task_id, body FROM task_comments "
+                             "WHERE kind='review_decision' ORDER BY ts DESC LIMIT 5")
+                for _ts, _author, _tid, _body in _cur.fetchall():
+                    recent_approvals.append({"ts": _ts, "by": _author, "task_id": _tid,
+                                             "verdict": (_body or "")[:60]})
+            _conn.close()
+        except Exception:
+            pass
     try:
+        if _PG:
+            raise ImportError  # Postgres handled above; skip the Lance fallback
         import lancedb
         for db_path in (
             os.environ.get("VEILGUARD_AUDIT_DB_PATH"),

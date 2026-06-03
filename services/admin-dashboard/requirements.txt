@@ -6,3 +6,6 @@ pyjwt>=2.8.0
 motor>=3.3.0
 lancedb>=0.30.2
 pyarrow>=15.0.0
+
+# Postgres backend for the dashboard readers (TCMM_STORAGE/VEILGUARD_AUDIT_BACKEND=postgres).
+psycopg2-binary>=2.9.9

@@ -16,3 +16,6 @@ pyarrow>=15.0.0
 # ModuleNotFoundError on every container recreate (hot-install doesn't
 # persist).
 anthropic>=0.40.0
+
+# Postgres backend for the pii_audit writer (VEILGUARD_AUDIT_BACKEND=postgres).
+psycopg2-binary>=2.9.9
