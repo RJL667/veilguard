@@ -439,7 +439,7 @@ async def run_one_cycle(*, db_path: str = "/tcmm-data/veilguard/tcmm.db") -> dic
     except ImportError:
         return {"eligible": 0, "written": 0, "error": "lancedb missing"}
     try:
-        db = lancedb.connect(db_path)
+        from ..ledger.store import open_ledger_db; db = open_ledger_db(db_path)
     except Exception as e:
         return {"eligible": 0, "written": 0, "error": f"db connect: {e}"}
     # All five tables — caller errors are fatal-per-table not fatal-per-cycle

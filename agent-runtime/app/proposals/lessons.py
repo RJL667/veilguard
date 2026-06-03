@@ -365,7 +365,7 @@ async def run_one_cycle(
     except ImportError:
         return {"scanned": 0, "promoted": 0, "error": "lancedb missing"}
     try:
-        db = lancedb.connect(db_path)
+        from ..ledger.store import open_ledger_db; db = open_ledger_db(db_path)
         dream_tbl = db.open_table("dream_archive")
         # [M1_CUTOVER_2026_05_28] `org_memory` is gone post-cutover —
         # promote_one no longer needs a Lance table handle; it writes

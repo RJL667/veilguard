@@ -335,7 +335,7 @@ class DreamScanner:
             return {"rows_scanned": 0, "candidates": 0, "emitted": 0,
                     "skipped_dedup": 0, "by_signal": {}}
         try:
-            db = lancedb.connect(self.db_path)
+            from ..ledger.store import open_ledger_db; db = open_ledger_db(self.db_path)
             tbl = db.open_table("dream_archive")
         except Exception as e:
             logger.debug(f"[dream_scanner] dream_archive unavailable: {e}")

@@ -58,7 +58,7 @@ async def run_migration(
     from ..memory.phase_7_writers import record_discussion_comment
 
     try:
-        db = lancedb.connect(db_path)
+        from ..ledger.store import open_ledger_db; db = open_ledger_db(db_path)
         tbl = db.open_table("task_comments")
     except Exception as e:
         return {"error": f"db open failed: {e}",

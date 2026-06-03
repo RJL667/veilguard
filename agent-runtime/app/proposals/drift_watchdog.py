@@ -172,7 +172,7 @@ def run_one_cycle(
     except ImportError:
         return {"checked": 0, "paused": 0, "error": "lancedb missing"}
     try:
-        db = lancedb.connect(db_path)
+        from ..ledger.store import open_ledger_db; db = open_ledger_db(db_path)
         tbl = db.open_table("task_proposals")
     except Exception as e:
         return {"checked": 0, "paused": 0, "error": f"open: {e}"}

@@ -430,7 +430,7 @@ def run_one_cycle(
     """One pass — run both emitters.  Daily cadence is fine."""
     try:
         import lancedb
-        db = lancedb.connect(db_path)
+        from ..ledger.store import open_ledger_db; db = open_ledger_db(db_path)
         archive_tbl = db.open_table("archive")
         dream_tbl = db.open_table("dream_archive")
     except Exception as e:

@@ -312,7 +312,7 @@ async def backfill_from_org_memory(
     """
     import lancedb
     try:
-        db = lancedb.connect(db_path)
+        from ..ledger.store import open_ledger_db; db = open_ledger_db(db_path)
         tbl = db.open_table("org_memory")
     except Exception as e:
         return {"error": f"org_memory open failed: {e}",

@@ -170,7 +170,7 @@ async def run_one_cycle(
     """
     try:
         import lancedb
-        db = lancedb.connect(db_path)
+        from ..ledger.store import open_ledger_db; db = open_ledger_db(db_path)
         a = db.open_table("archive")
     except Exception as e:
         return {"scanned": 0, "proposed": 0, "error": f"open: {e}"}

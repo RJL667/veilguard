@@ -261,7 +261,7 @@ def run_one_cycle(
     except ImportError:
         return {"checked": 0, "adjusted": 0, "error": "lancedb missing"}
     try:
-        db = lancedb.connect(db_path)
+        from ..ledger.store import open_ledger_db; db = open_ledger_db(db_path)
         outcomes_tbl = db.open_table("proposal_outcomes")
         proposals_tbl = db.open_table("task_proposals")
         weights_tbl = db.open_table("alignment_weights")

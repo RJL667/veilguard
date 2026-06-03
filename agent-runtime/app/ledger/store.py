@@ -25,6 +25,18 @@ class LanceStoreError(RuntimeError):
     pass
 
 
+def open_ledger_db(db_path=None):
+    """Backend-aware ledger DB handle for modules that connect directly.
+    With LEDGER_BACKEND/TCMM_STORAGE=postgres -> the PgLedgerStore proxy (its
+    .open_table() serves ledger tables AND the TCMM archive/dream CTI views);
+    otherwise a raw lancedb connection. Keeps proposals/lessons backend-agnostic."""
+    if os.environ.get("LEDGER_BACKEND", os.environ.get("TCMM_STORAGE", "")).lower() in ("postgres", "postgresql"):
+        from .pg_store import PgLedgerStore
+        return PgLedgerStore.get()._db
+    import lancedb
+    return lancedb.connect(db_path)
+
+
 class LedgerStore:
     """Singleton wrapper around lancedb.connect() + table init.
 
@@ -36,7 +48,14 @@ class LedgerStore:
     _init_lock = threading.Lock()
 
     @classmethod
-    def get(cls, db_path: str | Path | None = None) -> "LedgerStore":
+    def get(cls, db_path: str | Path | None = None):
+        # Postgres backend (W4): LEDGER_BACKEND=postgres (or TCMM_STORAGE=postgres)
+        # routes the whole ledger to PgLedgerStore — a Lance-API-compatible shim
+        # over Postgres, so every consumer works unchanged.
+        _be = os.environ.get("LEDGER_BACKEND", os.environ.get("TCMM_STORAGE", "")).lower()
+        if _be in ("postgres", "postgresql"):
+            from .pg_store import PgLedgerStore
+            return PgLedgerStore.get()
         if cls._instance is not None:
             return cls._instance
         with cls._init_lock:
