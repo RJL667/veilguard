@@ -181,12 +181,15 @@ class PIISessionStore:
         self._memo: dict[tuple, str] = {}
         self._pending_rows: list[dict] = []
         self._counters: dict[tuple, int] = {}
+        self._warmed_sids: set = set()   # (tenant,conv) whose full map is memo-loaded
         self._pg = _PG
         if self._pg:
             import psycopg2
             self._conn = psycopg2.connect(_PG_DSN)
             self._conn.autocommit = True
             with self._conn.cursor() as c:
+                # redaction map is a derived cache — defer the WAL fsync per write
+                c.execute("SET synchronous_commit = off")
                 c.execute(_PG_DDL)
             self._tbl = None  # Lance-only handle; unused on Postgres
             logger.info("[pii] session store on postgres")
@@ -454,6 +457,28 @@ class PIISessionStore:
 
     # ── Write path ────────────────────────────────────────────────────
 
+    def _warm_session_memo(self, sid_root: "SessionId") -> None:
+        """[PG] Load a session's ENTIRE existing map into the memo + counters in
+        ONE query, once per (tenant,conv). After this, every add_mapping span is
+        memo-only (no per-span PG round-trip) — restoring the in-process speed
+        the batched Lance design had. A memo miss post-warm = genuinely new."""
+        key = (sid_root.tenant_id, sid_root.conv_id)
+        if key in self._warmed_sids:
+            return
+        try:
+            with self._conn.cursor() as c:
+                c.execute("SELECT entity_type, original_lc, ref_token, counter FROM "
+                          "pii_session_mapping WHERE tenant_id=%s AND conv_id=%s",
+                          [sid_root.tenant_id, sid_root.conv_id])
+                for et, olc, tok, cnt in c.fetchall():
+                    self._memo[(sid_root.tenant_id, sid_root.conv_id, et, olc)] = tok
+                    ck = (sid_root.tenant_id, sid_root.conv_id, et)
+                    if cnt is not None and cnt > self._counters.get(ck, 0):
+                        self._counters[ck] = cnt
+        except Exception as e:
+            logger.warning(f"[pii] session memo warm failed: {e}")
+        self._warmed_sids.add(key)
+
     def add_mapping(
         self,
         sid: SessionId,
@@ -469,20 +494,22 @@ class PIISessionStore:
         sid_root = sid.root()
         lookup_key = original.lower() if entity_type == "PERSON" else original
 
-        # [PII_MEMO_2026_05_29]  O(1) fast path — repeated PII (same person
-        # mentioned N times in a memory prefix) returns instantly without
-        # touching Lance.  This is the single biggest redaction speedup:
-        # the per-span Lance .search() was the bottleneck, not analyze.
+        # [PG] Prefetch the whole session map ONCE → per-span add is memo-only.
+        if self._pg:
+            self._warm_session_memo(sid_root)
+
+        # O(1) fast path — repeated PII (or anything the warm prefetch loaded).
         memo_key = (sid_root.tenant_id, sid_root.conv_id, entity_type, lookup_key)
         cached = self._memo.get(memo_key)
         if cached is not None:
             return cached
 
-        # Lance fast path: already mapped (cross-process / prior turn).
-        existing = self._query_token(sid_root, entity_type, lookup_key)
-        if existing:
-            self._memo[memo_key] = existing
-            return existing
+        # Lance fast path: per-span query (PG skips this — the warm covers it).
+        if not self._pg:
+            existing = self._query_token(sid_root, entity_type, lookup_key)
+            if existing:
+                self._memo[memo_key] = existing
+                return existing
 
         # Slow path: insert under write lock.  Re-check after acquiring
         # the lock to handle the case where two threads in this process
@@ -491,20 +518,19 @@ class PIISessionStore:
             cached = self._memo.get(memo_key)
             if cached is not None:
                 return cached
-            existing = self._query_token(sid_root, entity_type, lookup_key)
-            if existing:
-                self._memo[memo_key] = existing
-                return existing
+            if not self._pg:
+                existing = self._query_token(sid_root, entity_type, lookup_key)
+                if existing:
+                    self._memo[memo_key] = existing
+                    return existing
 
-            # [PII_BATCH_WRITE_2026_05_29]  Allocate the counter from the
-            # in-memory sequence (seeded once from Lance) so we don't
-            # re-query per token, and BUFFER the row instead of writing
-            # it now.  flush() persists the whole batch in one add().
+            # Allocate the counter from the in-memory sequence (PG: seeded by
+            # _warm_session_memo; Lance: seeded from _next_counter) — no
+            # per-token query. BUFFER the row; flush() writes the whole batch.
             ckey = (sid_root.tenant_id, sid_root.conv_id, entity_type)
             if ckey not in self._counters:
-                # Seed from Lance max (next_counter returns max+1 = next
-                # free); -1 gives last-used so the +1 below is correct.
-                self._counters[ckey] = self._next_counter(sid_root, entity_type) - 1
+                self._counters[ckey] = (0 if self._pg
+                                        else self._next_counter(sid_root, entity_type) - 1)
             self._counters[ckey] += 1
             counter = self._counters[ckey]
             short_type = (
@@ -545,16 +571,17 @@ class PIISessionStore:
             self._pending_rows = []
             if self._pg:
                 try:
+                    from psycopg2.extras import execute_values
+                    vals = [(r["tenant_id"], r["conv_id"], r["entity_type"], r["original_lc"],
+                             r["original"], r["ref_token"], r["counter"], r["created_ts"])
+                            for r in rows]
                     with self._conn.cursor() as c:
-                        for row in rows:
-                            c.execute(
-                                "INSERT INTO pii_session_mapping (tenant_id,conv_id,entity_type,"
-                                "original_lc,original,ref_token,counter,created_ts) VALUES "
-                                "(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT "
-                                "(tenant_id,conv_id,entity_type,original_lc) DO NOTHING",
-                                [row["tenant_id"], row["conv_id"], row["entity_type"],
-                                 row["original_lc"], row["original"], row["ref_token"],
-                                 row["counter"], row["created_ts"]])
+                        execute_values(
+                            c,
+                            "INSERT INTO pii_session_mapping (tenant_id,conv_id,entity_type,"
+                            "original_lc,original,ref_token,counter,created_ts) VALUES %s "
+                            "ON CONFLICT (tenant_id,conv_id,entity_type,original_lc) DO NOTHING",
+                            vals)
                     return len(rows)
                 except Exception as e:
                     logger.error(f"[pii] session-store flush failed ({len(rows)} rows): {e}")

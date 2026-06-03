@@ -111,10 +111,15 @@ def _pg_overview() -> dict[str, Any]:
         return out
     try:
         cur = conn.cursor()
-        for name in ("base_node", "archive", "dream", "dream_edges", "block_vectors", "pii_audit"):
+        # List EVERY user table (memory + agentic ledger + pii + embeddings),
+        # not a hardcoded subset — so the dashboard shows the whole Postgres
+        # surface (agent_tasks, task_comments, block_vectors, etc.).
+        cur.execute("SELECT relname FROM pg_stat_user_tables ORDER BY relname")
+        names = [r[0] for r in cur.fetchall()]
+        for name in names:
             rec: dict[str, Any] = {"name": name}
             try:
-                cur.execute(f"SELECT count(*) FROM {name}")
+                cur.execute(f'SELECT count(*) FROM "{name}"')
                 rec["rows"] = cur.fetchone()[0]
                 cur.execute("SELECT pg_total_relation_size(%s)", [name])
                 rec["disk_bytes"] = cur.fetchone()[0]

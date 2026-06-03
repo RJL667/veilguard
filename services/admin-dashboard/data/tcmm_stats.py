@@ -28,6 +28,7 @@ def _pg_nlp_progress() -> dict[str, int]:
     try:
         import psycopg2
         conn = psycopg2.connect(_TCMM_DSN)
+        conn.autocommit = True   # read-only stats: don't sit in an open transaction
         try:
             with conn.cursor() as c:
                 c.execute("SELECT count(*), count(*) FILTER (WHERE semantic_done), "

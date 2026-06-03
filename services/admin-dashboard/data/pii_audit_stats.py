@@ -75,6 +75,7 @@ def _pg_table(where_sql: str, params: list, cols: list):
     import pyarrow as pa
     sel = ", ".join(cols)
     conn = psycopg2.connect(_AUDIT_DSN)
+    conn.autocommit = True   # read-only stats: don't sit in an open transaction
     try:
         with conn.cursor() as cur:
             cur.execute(f"SELECT {sel} FROM pii_audit WHERE {where_sql}", params)
