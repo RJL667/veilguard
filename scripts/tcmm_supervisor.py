@@ -52,10 +52,14 @@ def _resolve_server_py() -> Path:
         p = Path(raw).expanduser()
         if p.is_file():
             return p
-    # Default lookup paths
+    # Default lookup paths. [DEDUP_2026-06-03] The local-first dev tree is the
+    # SINGLE source of truth — the old default pointed at a .veilguard/mcp-tools
+    # COPY that drifted from this one. Prefer the dev-tree master now; the VM
+    # path stays last so this script still works if ever run on the VM.
     candidates = [
-        Path.home() / ".veilguard" / "mcp-tools" / "tcmm-service" / "server.py",
-        Path("C:/Users/rudol/.veilguard/mcp-tools/tcmm-service/server.py"),
+        Path("C:/Users/rudol/Documents/veilguard/services/tcmm-service/server.py"),
+        Path.home() / "Documents" / "veilguard" / "services" / "tcmm-service" / "server.py",
+        Path("/home/rudol/veilguard/services/tcmm-service/server.py"),
         Path("/home/rudol/veilguard/mcp-tools/tcmm-service/server.py"),
     ]
     for p in candidates:

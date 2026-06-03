@@ -2588,109 +2588,16 @@ async def _sso_post_response(conv_id: str, user_id: str,
 # Provider-uniform: Anthropic, OpenAI, Grok all support tool_use
 # with this exact schema shape.
 
-_TCMM_RECORD_TURN_TOOL = {
-    "name": "tcmm_record_turn",
-    "description": (
-        "Veilguard-internal: record metadata about this assistant turn "
-        "for memory management. Call this as the LAST action of every "
-        "response, after any text and other tool calls. The user never "
-        "sees this tool. Do not announce that you're calling it."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "knowledge_class": {
-                "type": "string",
-                "enum": ["derived", "novel", "mixed"],
-                "description": (
-                    "derived = answer used only memory/general knowledge; "
-                    "novel = contains new information worth remembering; "
-                    "mixed = combination."
-                ),
-            },
-            "used": {
-                "type": "object",
-                "description": (
-                    "REQUIRED citation map. Keys = memory block IDs "
-                    "(as strings) the answer actually drew on. Values "
-                    "= relevance 0-1 (1 = directly quoted/restated, "
-                    "0.5 = informed reasoning, <0.3 = barely used). "
-                    "Emit {} ONLY when zero memory blocks contributed "
-                    "to this answer (pure general-knowledge response). "
-                    "Find block IDs in the [Memory index=N] headers "
-                    "of your memory context. This drives heat-based "
-                    "promotion of useful blocks and decay of stale "
-                    "ones, so under-reporting hurts long-term recall."
-                ),
-                "additionalProperties": {"type": "number"},
-            },
-            "epoch_complete": {
-                "type": "boolean",
-                "description": (
-                    "true if this turn closes a coherent thought "
-                    "(final answer / decision / resolution); false if "
-                    "you're mid-thought (partial reasoning, in-progress "
-                    "tool dispatch, planning out loud)."
-                ),
-            },
-            "emit_class": {
-                "type": "string",
-                "enum": [
-                    "FACT", "DECISION", "INSIGHT", "PROCEDURE", "STATE",
-                    "INTENT", "DERIVED_FACT", "ARTIFACT", "AGENT_NOTE",
-                    "CHATTER", "ACK", "QUERY", "TRANSIENT_DATA",
-                    "EXECUTION_LOG",
-                ],
-                "description": (
-                    "Required: classify this turn into the canonical "
-                    "episodic ontology. Pick the SINGLE best fit.\n"
-                    "- FACT: a verifiable statement about the world "
-                    "(\"Paris is the capital of France\").\n"
-                    "- DERIVED_FACT: a fact stitched together from "
-                    "memory blocks (\"based on block 3+5, the user "
-                    "prefers X\").\n"
-                    "- DECISION: a choice or commitment made "
-                    "(\"I'll use Python over Go for this\").\n"
-                    "- INSIGHT: a new connection or realization "
-                    "(\"so the bug is in the cache layer, not the "
-                    "renderer\").\n"
-                    "- PROCEDURE: action steps or how-to "
-                    "(\"1. install X 2. configure Y\").\n"
-                    "- STATE: current system or conversation state "
-                    "(\"the build is failing at step 3\").\n"
-                    "- INTENT: a stated goal or planned next action "
-                    "(\"next I'll patch the renderer\").\n"
-                    "- ARTIFACT: a piece of code/text/data you "
-                    "produced for the user (a code block, a config).\n"
-                    "- AGENT_NOTE: internal reasoning the user "
-                    "doesn't need to retain (\"hmm, let me think\").\n"
-                    "- CHATTER: small-talk, pleasantries (\"Hi\", "
-                    "\"You're welcome\").\n"
-                    "- ACK: pure acknowledgement (\"Got it.\", "
-                    "\"Done.\").\n"
-                    "- QUERY: a clarifying question back to the user "
-                    "(\"Did you mean X or Y?\").\n"
-                    "- TRANSIENT_DATA: ephemeral output like long "
-                    "listings or table dumps not worth recalling.\n"
-                    "- EXECUTION_LOG: traces of tool invocations or "
-                    "command output (\"ran `ls`, got 12 files\")."
-                ),
-            },
-        },
-        # [FORCE_EMIT_CLASS_2026_05_20] emit_class now REQUIRED so tier 2
-        # of TCMM\'s classification hierarchy always fires. Was optional
-        # before; model skipped it ~90% of the time, forcing fallback to
-        # Gemini at tier 3-4 (which is rate-limited).
-        # [FORCE_USED_2026_05_22] `used` now REQUIRED too — it's the
-        # citation signal that drives heat reinforcement and tier
-        # promotion of memory blocks. Optional => model skipped it on
-        # most turns => no heat updates => no promotion => recall
-        # quality decays. Emitting {} is fine when no memory was used;
-        # the requirement is just that the model EXPLICITLY decides
-        # per turn rather than silently omitting the field.
-        "required": ["knowledge_class", "epoch_complete", "emit_class", "used"],
-    },
-}
+# [DEDUP_SHADOW_TOOL_2026-06-03] Single source of truth. The canonical
+# tcmm_record_turn schema lives in agent/shadow_tool.py — the LIVE chat-agent
+# path uses it. This (mostly-dormant) SSO path used to keep a SECOND inline
+# copy, and the two DRIFTED: the emit_class enums diverged, so post_response
+# rejected every class except "decision" and nothing got classified. Importing
+# the one schema kills that whole class of bug. agent/ is mounted as a sibling
+# of pii/ (PYTHONPATH=/ in the container; the sys.path probe above also puts
+# the repo root on the path in local dev), so this resolves at module load
+# exactly like the `from pii import ...` on line 52.
+from agent.shadow_tool import TCMM_RECORD_TURN_TOOL as _TCMM_RECORD_TURN_TOOL
 
 
 def _inject_tcmm_record_tool(tools_list):
