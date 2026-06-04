@@ -323,13 +323,29 @@ if __name__ == "__main__":
 
         sse = SseServerTransport("/messages/")
 
+        # [SSE_NONE_RETURN_FIX 2026-06-03] Starlette 0.52+ requires route
+        # handlers to return a Response: the dispatcher does
+        #   response = await f(request); await response(scope, receive, send)
+        # connect_sse() streams to the client itself so the handler has
+        # nothing to return — the implicit None then crashes with
+        # "TypeError: 'NoneType' object is not callable" on stream teardown,
+        # which LibreChat's MCP client surfaces as a failed tool call (this
+        # is the "excel tool gives errors" report). Return a Response shim
+        # that owns the SSE lifecycle so Starlette dispatches into it once.
+        # (Canonical version lives in sub-agents/server.py. A bare
+        # `return Response()` is wrong — it double-sends after the SSE stream
+        # already started; Mount on a bare /sse 307-redirects to /sse/ which
+        # LibreChat won't follow.)
+        class _SseResponse:
+            """Minimal Response shim that owns the SSE stream lifecycle."""
+            async def __call__(self, scope, receive, send):
+                async with sse.connect_sse(scope, receive, send) as (read, write):
+                    await mcp._mcp_server.run(
+                        read, write, mcp._mcp_server.create_initialization_options()
+                    )
+
         async def handle_sse(request):
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send
-            ) as (read, write):
-                await mcp._mcp_server.run(
-                    read, write, mcp._mcp_server.create_initialization_options()
-                )
+            return _SseResponse()
 
         app = Starlette(
             routes=[

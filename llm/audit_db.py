@@ -42,7 +42,7 @@ logger = logging.getLogger("veilguard.audit_db")
 # VEILGUARD_AUDIT_BACKEND (or TCMM_STORAGE) is postgres, pii_audit is a real
 # Postgres table; otherwise the legacy LanceDB table. Same record() API either way.
 _AUDIT_BACKEND = os.environ.get(
-    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "lance")
+    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "postgres")
 ).lower()
 _PG = _AUDIT_BACKEND in ("postgres", "postgresql")
 _AUDIT_DSN = os.environ.get(

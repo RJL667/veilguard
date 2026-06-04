@@ -2,20 +2,23 @@
 
 Tools: google_search, browse_url, fetch_page
 
-Search backend: Vertex AI Gemini with ``google_search`` grounding.
-Reasons we moved off the Custom Search JSON API (Jan 2026):
-  * Google deprecated "Search the entire web" on Programmable Search
-    Engine — new engines are site-restricted (≤50 domains) and the
-    feature sunsets entirely on 2027-01-01.
-  * Google officially points users at Vertex AI for enterprise-grade
-    web search, which is what TCMM already uses for embeddings and
-    classification — so we're unifying onto one auth path.
+Search backend: Grounding with Google Search via the Gemini API
+(AI Studio — https://generativelanguage.googleapis.com) on a Gemini 3
+model. The model runs Google searches and returns a grounded summary
+plus the source URLs (groundingMetadata) for the agent to read/cite.
 
-Auth: Application Default Credentials.  On the prod VM this resolves
-to the GCE instance's service account via the metadata server at
-169.254.169.254.  Locally it picks up ``gcloud auth
-application-default login``.  No API keys in ``.env`` any more — the
-old GOOGLE_API_KEY / GOOGLE_CSE_KEY / GOOGLE_CSE_ID are unused.
+Why this path (chosen 2026-06-03):
+  * Google Custom Search JSON API is being shut down (closed to new
+    signups; "search entire web" sunsets 2027-01-01) — new projects get
+    403 "no access".
+  * google_search grounding is Google's current "search via API".
+    Gemini 3 grounding is billed per query at ~$14/1k.
+  * AI Studio uses a plain API key (GOOGLE_API_KEY) — no ADC/IAM/billing
+    project setup like Vertex — and works the same locally and on the VM.
+
+Auth: set ``GOOGLE_API_KEY`` (the AI Studio / Gemini API key). The key's
+project must have billing credit — grounding needs the paid tier.
+``browse_url`` / ``fetch_page`` need no key.
 """
 
 import asyncio
@@ -42,10 +45,16 @@ from tool_cost import record_cost, format_cost_hint  # noqa: E402
 
 mcp = FastMCP("web", instructions="Web tools for searching Google, browsing URLs, and fetching pages.")
 
-# Vertex AI configuration — same project TCMM uses.
-VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-VERTEX_LOCATION = os.environ.get("VERTEX_REGION", "us-central1")
-VERTEX_SEARCH_MODEL = os.environ.get("VERTEX_SEARCH_MODEL", "gemini-2.5-flash")
+# Gemini API (AI Studio) — google_search grounding on a Gemini 3 model.
+GEMINI_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+# gemini-3.1-flash-lite: CHEAPEST grounding tier ($14/1k, Gemini-3 per-query)
+# + cheapest model tokens. Grounds in ~1.4s median (Gemini-3 "thinking" can
+# spike to ~4s; the 503-retry below covers transient overload). Chosen for cost.
+# Faster-but-pricier alt: gemini-2.5-flash-lite (consistent ~1.5s, $35/1k).
+# Avoid: gemini-3-flash-preview (~22s+503s), gemini-3.5-flash (hangs),
+# gemini-3-pro-preview/gemini-2.0-flash-lite (404). Verified 2026-06-03.
+GEMINI_SEARCH_MODEL = os.environ.get("GEMINI_SEARCH_MODEL", "gemini-3.1-flash-lite")
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
@@ -98,95 +107,97 @@ async def _get_access_token() -> Optional[str]:
 @mcp.tool()
 @cached(ttl_seconds=600)
 async def google_search(query: str, num_results: int = 10) -> str:
-    """Search the web via Vertex AI Gemini with google_search grounding.
+    """Search the web via Google Search grounding on a Gemini 3 model.
 
-    Results are cached for 10 minutes — the same query in quick
-    succession returns the same result set without re-billing Vertex.
-    For news/breaking-event queries where 10min staleness matters,
-    vary the query slightly to bypass the cache.
+    The model runs Google searches and returns a grounded, factual
+    summary plus the real source URLs it used — feed both to the
+    reasoning agent. Cached 10 minutes so identical queries don't
+    re-bill; vary the query slightly for fresh breaking-news results.
 
     Args:
         query: Search query
-        num_results: Number of result-citations to return (max 10)
+        num_results: How many source citations to include (1-20)
     """
-    num_results = min(num_results, 10)
+    num_results = min(max(num_results, 1), 20)
 
-    if not VERTEX_PROJECT:
+    if not GEMINI_API_KEY:
         return (
-            "Error: GOOGLE_CLOUD_PROJECT env not set on the web MCP server. "
-            "Vertex AI search requires the project the service account is "
-            "scoped to."
+            "Error: web search is not configured — set GOOGLE_API_KEY (the "
+            "AI Studio / Gemini API key) in the environment. "
+            "(browse_url / fetch_page work without a key.)"
         )
 
-    token = await _get_access_token()
-    if not token:
-        return (
-            "Error: Vertex AI credentials unavailable. On GCE the VM's "
-            "service account must have roles/aiplatform.user; locally "
-            "run `gcloud auth application-default login`."
-        )
-
-    url = (
-        f"https://{VERTEX_LOCATION}-aiplatform.googleapis.com/v1/"
-        f"projects/{VERTEX_PROJECT}/locations/{VERTEX_LOCATION}/"
-        f"publishers/google/models/{VERTEX_SEARCH_MODEL}:generateContent"
-    )
+    url = f"{GEMINI_ENDPOINT}/{GEMINI_SEARCH_MODEL}:generateContent"
     payload = {
         "contents": [{
             "role": "user",
             "parts": [{"text":
-                f"Search the web and return the {num_results} most relevant "
-                f"results for: {query}\n\n"
-                f"For each result provide:\n"
-                f"- Title\n- URL\n- One-sentence summary\n"
-                f"Cite the sources in the grounding metadata."
+                f"Search Google and answer: {query}\n\n"
+                f"Give a concise, factual summary grounded in the search "
+                f"results, then list the {num_results} most relevant sources."
             }],
         }],
         "tools": [{"google_search": {}}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 1024,
-        },
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
     }
 
-    async with httpx.AsyncClient(timeout=45) as client:
-        resp = await client.post(
-            url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-        )
+    resp = None
+    try:
+        # Key via header, not ?key= query param, so it isn't logged in URLs.
+        async with httpx.AsyncClient(timeout=45) as client:
+            for attempt in range(3):
+                resp = await client.post(
+                    url, headers={"x-goog-api-key": GEMINI_API_KEY}, json=payload
+                )
+                if resp.status_code != 503:
+                    break
+                # 503 = transient model-overload ("high demand"); back off and retry.
+                await asyncio.sleep(2 * (attempt + 1))
+    except Exception as e:
+        return f"Error: Gemini search request failed: {type(e).__name__}: {e}"
 
+    if resp is None or resp.status_code == 503:
+        return (
+            "Error: web search model is overloaded (503) and didn't recover "
+            "after retries — try again in a moment."
+        )
+    if resp.status_code == 429:
+        return (
+            "Error: web search hit 429 — the AI Studio project is out of "
+            "prepayment credits (grounding needs the paid tier). Top up at "
+            "https://ai.studio/projects, or point GOOGLE_API_KEY at a funded key."
+        )
+    if resp.status_code == 404:
+        return (
+            f"Error: model {GEMINI_SEARCH_MODEL!r} not available for this key "
+            f"(404). Set GEMINI_SEARCH_MODEL to an available model "
+            f"(e.g. gemini-3-pro-preview or gemini-3.5-flash)."
+        )
     if resp.status_code != 200:
-        return f"Vertex search error: {resp.status_code} {resp.text[:300]}"
+        return f"Error: Gemini search HTTP {resp.status_code}: {resp.text[:200]}"
 
     data = resp.json()
-    results: list[str] = []
-    candidates = data.get("candidates", [])
-    if candidates:
-        cand = candidates[0]
-        for part in cand.get("content", {}).get("parts", []) or []:
-            if "text" in part:
-                results.append(part["text"])
-
-        # Grounding metadata carries the actual Google Search sources —
-        # emit them as a citations block so downstream agents can cite
-        # URLs directly.
-        grounding = cand.get("groundingMetadata", {})
-        chunks = grounding.get("groundingChunks", []) or []
-        if chunks:
-            results.append("\n## Sources:")
-            for i, chunk in enumerate(chunks[:num_results], 1):
-                web = chunk.get("web", {}) or {}
-                title = web.get("title", "Untitled")
-                uri = web.get("uri", "")
-                results.append(f"{i}. **{title}**\n   {uri}")
-
-    if not results:
+    cands = data.get("candidates") or []
+    if not cands:
         return f"No results for: {query}"
-    return "\n\n".join(results)
+    cand = cands[0]
+
+    out: list[str] = []
+    for part in cand.get("content", {}).get("parts", []) or []:
+        if "text" in part:
+            out.append(part["text"])
+
+    # groundingMetadata carries the actual Google Search sources.
+    chunks = (cand.get("groundingMetadata", {}) or {}).get("groundingChunks", []) or []
+    if chunks:
+        out.append("\n## Sources")
+        for i, ch in enumerate(chunks[:num_results], 1):
+            web = ch.get("web", {}) or {}
+            out.append(f"{i}. {web.get('title', 'Untitled')}\n   {web.get('uri', '')}")
+
+    if not out:
+        return f"No results for: {query}"
+    return "\n\n".join(out)
 
 
 @mcp.tool()

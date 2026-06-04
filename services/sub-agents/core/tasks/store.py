@@ -36,7 +36,7 @@ logger = logging.getLogger("veilguard.tasks.store")
 # Backend select — Postgres when TCMM_STORAGE / VEILGUARD_AUDIT_BACKEND=postgres,
 # else the legacy LanceDB table. Same TaskStore API either way.
 _PG = os.environ.get(
-    "TCMM_STORAGE", os.environ.get("VEILGUARD_AUDIT_BACKEND", "lance")
+    "TCMM_STORAGE", os.environ.get("VEILGUARD_AUDIT_BACKEND", "postgres")
 ).lower() in ("postgres", "postgresql")
 _PG_DSN = os.environ.get(
     "VEILGUARD_TASKS_DATABASE_URL",

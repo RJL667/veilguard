@@ -17,7 +17,7 @@ TIMEOUT = 3.0
 
 # When TCMM is on Postgres, the NLP/embedding-progress counts come from the CTI
 # `archive` stage flags instead of a Lance scan.
-_PG = os.environ.get("TCMM_STORAGE", "lance").lower() in ("postgres", "postgresql")
+_PG = os.environ.get("TCMM_STORAGE", "postgres").lower() in ("postgres", "postgresql")
 _TCMM_DSN = os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm")
 
 

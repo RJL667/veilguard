@@ -7,7 +7,7 @@
     },
     "created_at": 1774480490.7211657,
     "updated_at": 1774480490.7211657,
-    "run_count": 2,
+    "run_count": 6,
     "last_error": null
   },
   "fetch_url": {
@@ -18,7 +18,7 @@
     },
     "created_at": 1776777261.8852274,
     "updated_at": 1776777261.8852277,
-    "run_count": 6,
+    "run_count": 8,
     "last_error": null
   },
   "fetch_text": {
@@ -30,7 +30,7 @@
     },
     "created_at": 1776777302.6802204,
     "updated_at": 1776777302.6802206,
-    "run_count": 19,
+    "run_count": 23,
     "last_error": null
   },
   "send_email": {
@@ -50,7 +50,7 @@
     "created_at": 1778714053.2042024,
     "updated_at": 1778714303.29934,
     "run_count": 13,
-    "last_error": null
+    "last_error": "run() got an unexpected keyword argument 'smtp_host'"
   },
   "extract_pdf": {
     "name": "extract_pdf",
@@ -60,7 +60,7 @@
     },
     "created_at": 1780327869.668721,
     "updated_at": 1780327869.668721,
-    "run_count": 2,
+    "run_count": 6,
     "last_error": null
   },
   "excel_test": {
@@ -72,7 +72,18 @@
     },
     "created_at": 1780328315.0709321,
     "updated_at": 1780328315.0709321,
-    "run_count": 0,
+    "run_count": 12,
+    "last_error": null
+  },
+  "gen_test_rows": {
+    "name": "gen_test_rows",
+    "description": "Generate fake Name/Score/Status rows as JSON",
+    "args": {
+      "n": "int"
+    },
+    "created_at": 1780492444.5156653,
+    "updated_at": 1780492461.0694108,
+    "run_count": 5,
     "last_error": null
   }
 }

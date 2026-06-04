@@ -170,9 +170,10 @@ def create_pdf(path: str, content: str, title: str = "") -> str:
                 fontname="helv",
             )
 
+        page_count = doc.page_count  # capture BEFORE close — len(doc) on a closed doc raises "document closed"
         doc.save(str(p))
         doc.close()
-        return f"Created PDF: {p} ({len(doc) if doc else (len(lines) // lines_per_page + 1)} pages)"
+        return f"Created PDF: {p} ({page_count} pages)"
     except Exception as e:
         return f"Error creating PDF: {e}"
 
@@ -300,9 +301,18 @@ def pdf_delete_pages(path: str, pages: str) -> str:
         for idx in indices:
             doc.delete_page(idx)
 
-        doc.save(str(p), garbage=4, deflate=True)
+        # PyMuPDF rejects a non-incremental save back to the source path
+        # ("save to original must be incremental"), and an incremental save
+        # can't reclaim the deleted pages. Write to a temp file in the same
+        # dir, then atomically replace the original.
+        import os, tempfile
+        deleted = len(indices)
+        fd, tmp = tempfile.mkstemp(suffix=".pdf", dir=str(p.parent))
+        os.close(fd)
+        doc.save(tmp, garbage=4, deflate=True)
         doc.close()
-        return f"Deleted {len(indices)} page(s) from {p.name} ({total} → {total - len(indices)} pages)"
+        os.replace(tmp, str(p))
+        return f"Deleted {deleted} page(s) from {p.name} ({total} → {total - deleted} pages)"
     except Exception as e:
         return f"Error deleting pages: {e}"
 
@@ -359,23 +369,27 @@ def pdf_add_watermark(path: str, text: str = "CONFIDENTIAL", opacity: float = 0.
 
     try:
         doc = fitz.open(str(p))
+        page_count = doc.page_count  # capture before close
         for pg in doc:
             rect = pg.rect
-            # Diagonal across page
             center = fitz.Point(rect.width / 2, rect.height / 2)
+            # insert_text(rotate=) only accepts 0/90/180/270; a true 45°
+            # diagonal needs morph=(pivot, Matrix(deg)). fill_opacity wires
+            # up the previously-ignored `opacity` arg.
             pg.insert_text(
                 center,
                 text,
                 fontsize=60,
                 fontname="helv",
                 color=(0.8, 0.8, 0.8),
-                rotate=45,
+                fill_opacity=opacity,
+                morph=(center, fitz.Matrix(45)),
                 overlay=True,
             )
 
         doc.save(str(p), incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
         doc.close()
-        return f"Added watermark '{text}' to {len(doc)} pages in {p.name}"
+        return f"Added watermark '{text}' to {page_count} pages in {p.name}"
     except Exception as e:
         return f"Error adding watermark: {e}"
 

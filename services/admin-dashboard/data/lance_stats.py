@@ -27,7 +27,7 @@ LANCE_DIR = os.environ.get(
 
 # Backend select — when TCMM moved to Postgres these stats read the CTI tables
 # (base_node / archive / dream) instead of the Lance dir.
-_TCMM_BACKEND = os.environ.get("TCMM_STORAGE", "lance").lower()
+_TCMM_BACKEND = os.environ.get("TCMM_STORAGE", "postgres").lower()
 _PG = _TCMM_BACKEND in ("postgres", "postgresql")
 _TCMM_DSN = os.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm")
 

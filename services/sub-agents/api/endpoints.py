@@ -14,7 +14,7 @@ import os as _osenv
 # Org-status reads the ledger tables (agent_tasks / task_comments). When the
 # ledger is on Postgres, query it directly instead of the Lance fallback.
 _PG = _osenv.environ.get(
-    "LEDGER_BACKEND", _osenv.environ.get("TCMM_STORAGE", "lance")
+    "LEDGER_BACKEND", _osenv.environ.get("TCMM_STORAGE", "postgres")
 ).lower() in ("postgres", "postgresql")
 _PG_DSN = _osenv.environ.get("TCMM_DATABASE_URL", "postgresql://tcmm:tcmm@localhost:5432/tcmm")
 

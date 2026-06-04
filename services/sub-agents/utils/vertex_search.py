@@ -1,152 +1,100 @@
-"""Vertex AI Gemini with google_search grounding.
+"""Gemini google_search grounding for sub-agents' ``web_search`` tool.
 
-Shared helper used by sub-agents' ``web_search`` tool (and anywhere
-else that wants real, grounded web results).  Authenticates via ADC —
-on the prod GCE VM this resolves to the instance's default service
-account through the metadata server; locally it picks up whatever
-``gcloud auth application-default login`` left behind.
-
-Mirrors ``services/web/server.py::google_search`` intentionally (same
-endpoint, same token cache, same citations block) but lives in
-sub-agents so both callers can use it without cross-package imports.
-Happy to collapse the two implementations into a single shared module
-once we add a ``packages/veilguard-common`` home for this kind of
-plumbing.
+[WEB_SEARCH_AISTUDIO_2026-06-04] Rewired off the dead Vertex AI path. The old
+implementation authenticated via ADC against ``{region}-aiplatform.googleapis.com``
+— but Vertex ADC is expired (and the prod SA lost aiplatform access), so every
+sub-agent web_search returned "Vertex AI credentials unavailable" and researchers
+silently degraded to memory-only. This now mirrors ``services/web/server.py::
+google_search`` EXACTLY: AI Studio (Generative Language API) with ``google_search``
+grounding, authed by the ``GOOGLE_API_KEY`` header — no ADC, no GOOGLE_CLOUD_PROJECT,
+no region. Function name kept (``vertex_grounded_search``) so callers are unchanged.
 """
 
 import asyncio
 import os
-import time
-from typing import Optional
+import random
+from typing import Optional  # noqa: F401 (kept for signature parity)
 
 import httpx
 
-
-_VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "")
-_VERTEX_LOCATION = os.environ.get("VERTEX_REGION", "us-central1")
-_VERTEX_MODEL = os.environ.get("VERTEX_SEARCH_MODEL", "gemini-2.5-flash")
-
-_TOKEN_CACHE = {"token": None, "expiry": 0.0}
-_TOKEN_LOCK = asyncio.Lock()
-
-
-async def _get_access_token() -> Optional[str]:
-    """Fetch an OAuth access token via ADC; cache until 2 min before expiry."""
-    async with _TOKEN_LOCK:
-        now = time.time()
-        if _TOKEN_CACHE["token"] and _TOKEN_CACHE["expiry"] - now > 120:
-            return _TOKEN_CACHE["token"]
-
-        def _refresh():
-            import google.auth
-            from google.auth.transport.requests import Request
-            credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"],
-            )
-            credentials.refresh(Request())
-            return credentials
-
-        try:
-            creds = await asyncio.to_thread(_refresh)
-        except Exception:
-            return None
-
-        _TOKEN_CACHE["token"] = creds.token
-        _TOKEN_CACHE["expiry"] = (
-            creds.expiry.timestamp()
-            if getattr(creds, "expiry", None)
-            else now + 3600
-        )
-        return creds.token
+# Same model + endpoint as services/web/server.py (verified 2026-06-03):
+# gemini-3.1-flash-lite is the cheapest grounding tier (~1.4s median; 503 spikes
+# covered by the retry below). Avoid 3-flash-preview/3.5/pro variants (slow/404).
+_SEARCH_MODEL = os.environ.get(
+    "GEMINI_SEARCH_MODEL", os.environ.get("VERTEX_SEARCH_MODEL", "gemini-3.1-flash-lite")
+)
+_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
+_API_KEY = (
+    os.environ.get("GOOGLE_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+).strip()
 
 
 async def vertex_grounded_search(query: str, num_results: int = 8) -> str:
-    """Search the web via Vertex AI Gemini ``google_search`` grounding.
+    """Search the web via Gemini ``google_search`` grounding (AI Studio).
 
-    Returns a markdown-ish string — model-generated summaries + a
-    ``## Sources:`` block with the grounding chunk URLs.  On any
-    failure returns a readable error string (callers never need to
-    handle exceptions).
+    Returns a markdown-ish string — the model's grounded summary + a
+    ``## Sources:`` block with the real grounding-chunk URLs. On any failure
+    returns a readable error string (callers never need to handle exceptions).
     """
     query = (query or "").strip()
     if not query:
         return "Error: empty query"
     num_results = max(1, min(int(num_results), 10))
 
-    if not _VERTEX_PROJECT:
+    if not _API_KEY:
         return (
-            "Error: GOOGLE_CLOUD_PROJECT env not set — Vertex search "
-            "needs the project the service account is scoped to."
+            "Error: web search is not configured — set GOOGLE_API_KEY (the "
+            "AI Studio / Gemini API key) in the environment. "
+            "(web_fetch works without a key.)"
         )
 
-    token = await _get_access_token()
-    if not token:
-        return (
-            "Error: Vertex AI credentials unavailable.  On GCE the "
-            "VM's service account must have roles/aiplatform.user; "
-            "locally run `gcloud auth application-default login`."
-        )
-
-    url = (
-        f"https://{_VERTEX_LOCATION}-aiplatform.googleapis.com/v1/"
-        f"projects/{_VERTEX_PROJECT}/locations/{_VERTEX_LOCATION}/"
-        f"publishers/google/models/{_VERTEX_MODEL}:generateContent"
-    )
+    url = f"{_ENDPOINT}/{_SEARCH_MODEL}:generateContent"
     payload = {
         "contents": [{
             "role": "user",
             "parts": [{"text":
-                f"Search the web and return the {num_results} most "
-                f"relevant results for: {query}\n\n"
-                f"For each result provide:\n"
-                f"- Title\n- URL\n- One-sentence summary\n"
-                f"Cite the sources in the grounding metadata."
+                f"Search Google and answer: {query}\n\n"
+                f"Give a concise, factual summary grounded in the search "
+                f"results, then list the {num_results} most relevant sources "
+                f"(Title + URL + one-sentence summary each)."
             }],
         }],
         "tools": [{"google_search": {}}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
     }
 
-    # Retry on 429 (per-project quota) and transient 5xx with an
-    # exponential backoff + small jitter. Parallel sub-agent bursts
-    # regularly trip the Gemini-Flash per-minute cap — without this,
-    # every fan-out drops 1-3 workers on the floor instead of
-    # producing results a second later. Max ~8s total before giving
-    # up; anything longer and the caller looks wedged.
-    import random as _random
+    # Retry on 429 (quota) + transient 5xx with exponential backoff + jitter.
+    # Parallel sub-agent bursts trip the per-minute cap; without this each
+    # fan-out drops workers instead of producing results a second later.
     _RETRYABLE = {429, 500, 502, 503, 504}
-    _MAX_ATTEMPTS = 4
     backoff = 0.5
-
     resp = None
-    async with httpx.AsyncClient(timeout=45) as client:
-        for attempt in range(_MAX_ATTEMPTS):
-            resp = await client.post(
-                url,
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-            )
-            if resp.status_code not in _RETRYABLE:
-                break
-            if attempt == _MAX_ATTEMPTS - 1:
-                break
-            # Honor Retry-After when present, else exponential.
-            retry_after = resp.headers.get("retry-after")
-            try:
-                wait_s = float(retry_after) if retry_after else backoff
-            except ValueError:
-                wait_s = backoff
-            wait_s = min(wait_s, 4.0) + _random.uniform(0, 0.25)
-            await asyncio.sleep(wait_s)
-            backoff *= 2
+    try:
+        # Key via header (x-goog-api-key), not ?key= query param, so it never
+        # lands in URL logs.
+        async with httpx.AsyncClient(timeout=45) as client:
+            for attempt in range(4):
+                resp = await client.post(
+                    url, headers={"x-goog-api-key": _API_KEY}, json=payload
+                )
+                if resp.status_code not in _RETRYABLE:
+                    break
+                if attempt == 3:
+                    break
+                retry_after = resp.headers.get("retry-after")
+                try:
+                    wait_s = float(retry_after) if retry_after else backoff
+                except ValueError:
+                    wait_s = backoff
+                await asyncio.sleep(min(wait_s, 4.0) + random.uniform(0, 0.25))
+                backoff *= 2
+    except Exception as e:
+        return f"Error: Gemini search request failed: {type(e).__name__}: {e}"
 
     if resp is None or resp.status_code != 200:
         code = resp.status_code if resp is not None else "no-response"
         body = resp.text[:300] if resp is not None else ""
-        return f"Vertex search error: {code} {body}"
+        return f"Gemini search error: {code} {body}"
 
     data = resp.json()
     out: list[str] = []
@@ -160,9 +108,6 @@ async def vertex_grounded_search(query: str, num_results: int = 8) -> str:
             out.append("\n## Sources:")
             for i, chunk in enumerate(chunks[:num_results], 1):
                 web = chunk.get("web", {}) or {}
-                title = web.get("title", "Untitled")
-                uri = web.get("uri", "")
-                out.append(f"{i}. **{title}**\n   {uri}")
-        break  # only the first candidate matters for grounding
-
+                out.append(f"{i}. **{web.get('title', 'Untitled')}**\n   {web.get('uri', '')}")
+        break  # only the first candidate carries grounding
     return "\n\n".join(out) if out else f"No results for: {query}"

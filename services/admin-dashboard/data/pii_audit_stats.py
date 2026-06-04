@@ -52,7 +52,7 @@ KIND_RE = re.compile(r"REF_([A-Z_]+?)_\d+")
 
 
 _AUDIT_BACKEND = os.environ.get(
-    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "lance")
+    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "postgres")
 ).lower()
 _PG = _AUDIT_BACKEND in ("postgres", "postgresql")
 _AUDIT_DSN = os.environ.get(

@@ -488,7 +488,7 @@ def _init_shared_resources():
     # built the existing index, recall silently breaks. Refuse to start on
     # mismatch unless TCMM_ALLOW_EMBEDDER_SWAP=1 (operator has accepted that
     # they must re-embed).
-    storage_backend_now = os.environ.get("TCMM_STORAGE", "lance").lower()
+    storage_backend_now = os.environ.get("TCMM_STORAGE", "postgres").lower()
     if storage_backend_now in ("lance", "lancedb"):
         from core.providers.lance import check_embedder_compatibility
         lance_db_name_now = os.environ.get("TCMM_LANCE_DB", "veilguard")
@@ -568,7 +568,7 @@ def _new_session_stats() -> dict:
 
 # ── Session Pool ─────────────────────────────────────────────────────────────
 
-STORAGE_BACKEND = os.environ.get("TCMM_STORAGE", "lance").lower()
+STORAGE_BACKEND = os.environ.get("TCMM_STORAGE", "postgres").lower()
 _PG_BACKEND = STORAGE_BACKEND in ("postgres", "postgresql")
 # On Postgres, vector + sparse live in the same DB — default them to postgres
 # too (not "lance") so a single TCMM_STORAGE=postgres switches the whole engine.
@@ -3111,7 +3111,13 @@ async def trigger_dream():
             archive_count = len(tcmm.archive)
             dream_count = len(getattr(tcmm, "dream_archive", {}))
 
-            instance.run_dream_cycle()
+            # [DREAM_OFFLOOP_2026-06-04] Run the (long, synchronous) dream cycle
+            # in a worker thread so the FastAPI event loop stays free to answer
+            # /health. Otherwise the cycle blocks the loop >30s during fact-distill,
+            # the supervisor's health probe times out (dead_after_s=30) and it
+            # KILLS+restarts TCMM mid-cycle — which truncated the pipeline right
+            # after identity bootstrap (no meta/domain tiers, no dream_edges).
+            await asyncio.to_thread(instance.run_dream_cycle)
 
             new_dream_count = len(getattr(tcmm, "dream_archive", {}))
             return {

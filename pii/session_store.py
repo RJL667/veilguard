@@ -58,7 +58,7 @@ logger = logging.getLogger("veilguard.pii.session_store")
 # VEILGUARD_AUDIT_BACKEND / TCMM_STORAGE = postgres; else the legacy LanceDB
 # table. Same SessionId / add_mapping / rehydrate API either way.
 _PG = os.environ.get(
-    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "lance")
+    "VEILGUARD_AUDIT_BACKEND", os.environ.get("TCMM_STORAGE", "postgres")
 ).lower() in ("postgres", "postgresql")
 _PG_DSN = os.environ.get(
     "VEILGUARD_AUDIT_DATABASE_URL",

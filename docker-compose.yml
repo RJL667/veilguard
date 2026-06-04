@@ -98,6 +98,11 @@ services:
       - ADMIN_LANCE_DIR=/tcmm-data/veilguard/tcmm.db
       - ADMIN_HOST=0.0.0.0
       - ADMIN_PORT=8820
+      # [DASHBOARD_PG_2026-06-03] lance_stats.py defaults TCMM_STORAGE to "lance"
+      # — without these the dashboard reads the stale Lance file instead of the
+      # migrated Postgres. Match the agent-runtime DSN (tcmm-pg on host :5433).
+      - TCMM_STORAGE=postgres
+      - TCMM_DATABASE_URL=postgresql://tcmm:tcmm@host.docker.internal:5433/tcmm
     volumes:
       # Bind-mount source so edits hot-reload without rebuild
       - ./services/admin-dashboard:/app
@@ -174,6 +179,14 @@ services:
       - ANTHROPIC_DUMP_REQUESTS=1
       - TCMM_ENABLED=${TCMM_ENABLED:-true}
       - TCMM_URL=${TCMM_URL:-http://host.docker.internal:8811}
+      # [RETIRE_LANCE_2026-06-04] Pin Postgres for TCMM memory + ledger + audit.
+      # Without these the Python defaults silently fall back to LanceDB (the
+      # recurring "localhost on lancedb" bug). host.docker.internal:5433 reaches
+      # the tcmm-pg container from both containers and host processes.
+      - TCMM_STORAGE=${TCMM_STORAGE:-postgres}
+      - TCMM_VECTOR=${TCMM_VECTOR:-postgres}
+      - TCMM_SPARSE=${TCMM_SPARSE:-postgres}
+      - TCMM_DATABASE_URL=${TCMM_DATABASE_URL:-postgresql://tcmm:tcmm@host.docker.internal:5433/tcmm}
       # [PII_RENDER_REDACT_2026_05_30] memory redacted at render → boundary
       # skips re-scanning system blocks (only redacts the latest prompt).
       - VEILGUARD_REDACT_IN_RENDER=${VEILGUARD_REDACT_IN_RENDER:-1}
@@ -328,6 +341,14 @@ services:
       - MIN_SCORE=${MIN_SCORE:-0.7}
       - TCMM_ENABLED=${TCMM_ENABLED:-false}
       - TCMM_URL=${TCMM_URL:-http://host.docker.internal:8811}
+      # [RETIRE_LANCE_2026-06-04] Pin Postgres for pii_audit + session_store.
+      # The proxy WRITES the pii_audit LLM-call log; with these unset it wrote to
+      # LanceDB while the admin dashboard reads Postgres -> "no LLM calls in the
+      # dashboard". Aligns the writer with the reader.
+      - TCMM_STORAGE=${TCMM_STORAGE:-postgres}
+      - TCMM_VECTOR=${TCMM_VECTOR:-postgres}
+      - TCMM_SPARSE=${TCMM_SPARSE:-postgres}
+      - TCMM_DATABASE_URL=${TCMM_DATABASE_URL:-postgresql://tcmm:tcmm@host.docker.internal:5433/tcmm}
       # [PII_RENDER_REDACT_2026_05_30] skip re-redacting pre-redacted memory.
       - VEILGUARD_REDACT_IN_RENDER=${VEILGUARD_REDACT_IN_RENDER:-1}
       # Where audit_db.py writes the pii_audit table.  Must be the

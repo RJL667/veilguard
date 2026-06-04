@@ -305,13 +305,22 @@ if __name__ == "__main__":
 
         sse = SseServerTransport("/messages/")
 
+        # [SSE_NONE_RETURN_FIX 2026-06-03] Starlette 0.52+ requires route
+        # handlers to return a Response (dispatcher does
+        # `response = await f(request); await response(scope, receive, send)`).
+        # connect_sse() streams itself, so returning None crashes with
+        # "TypeError: 'NoneType' object is not callable" on teardown. Return a
+        # Response shim that owns the SSE lifecycle. See sub-agents/server.py.
+        class _SseResponse:
+            """Minimal Response shim that owns the SSE stream lifecycle."""
+            async def __call__(self, scope, receive, send):
+                async with sse.connect_sse(scope, receive, send) as (read, write):
+                    await mcp._mcp_server.run(
+                        read, write, mcp._mcp_server.create_initialization_options()
+                    )
+
         async def handle_sse(request):
-            async with sse.connect_sse(
-                request.scope, request.receive, request._send
-            ) as (read, write):
-                await mcp._mcp_server.run(
-                    read, write, mcp._mcp_server.create_initialization_options()
-                )
+            return _SseResponse()
 
         # Webhook auth token — set via WEBHOOK_TOKEN env var or defaults to random
         import secrets as _secrets

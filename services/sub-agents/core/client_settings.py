@@ -48,7 +48,7 @@ logger = logging.getLogger("veilguard.client_settings")
 
 # Backend select — Postgres when TCMM_STORAGE / VEILGUARD_AUDIT_BACKEND=postgres.
 _PG = os.environ.get(
-    "TCMM_STORAGE", os.environ.get("VEILGUARD_AUDIT_BACKEND", "lance")
+    "TCMM_STORAGE", os.environ.get("VEILGUARD_AUDIT_BACKEND", "postgres")
 ).lower() in ("postgres", "postgresql")
 _PG_DSN = os.environ.get(
     "VEILGUARD_CLIENT_SETTINGS_DATABASE_URL",
