@@ -8,6 +8,12 @@ REM turns (15-30s generations). This runs server.py directly on :8811, minimized
 REM logging to .veilguard\logs\tcmm-direct.log. Close the minimized window to stop.
 setlocal
 set "REPO=%~dp0.."
+REM [UTF8_2026-06-04] Force UTF-8 stdio. The dream engine prints Unicode (→, box
+REM glyphs, emoji); under Windows cp1252 stdout (esp. when logs are redirected to
+REM a file) those throw UnicodeEncodeError and ABORT the dream cycle mid-run
+REM (right after the arc phase — before identity bootstrap / meta clustering).
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 set "TCMM_STORAGE=postgres"
 set "TCMM_VECTOR=postgres"
 set "TCMM_SPARSE=postgres"
