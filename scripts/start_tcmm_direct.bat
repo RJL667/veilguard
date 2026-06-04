@@ -23,6 +23,12 @@ set "TCMM_DATA_DIR=C:\Users\rudol\.veilguard\tcmm-data"
 set "TCMM_PG_POOL_MAX=16"
 set "TCMM_SKIP_NLP_GPU=1"
 set "EMBED_BACKEND=local"
+REM [DREAM_BACKEND_2026-06-04] Dream synthesizer = AI Studio Gemini (cloud, via
+REM GOOGLE_API_KEY in .env). Unset => the adapter falls back to a local llama.cpp
+REM GGUF that (a) crashes the process when synthesizing on this CPU/GPU-locked
+REM box and (b) leaves synth.backend falsy so the fact-sheet LLM distillation
+REM pass is skipped -> raw fragmentary fact sheets. "vertex" fixes both.
+set "DREAM_BACKEND=vertex"
 set "VEILGUARD_TCMM_SERVER_PY=%REPO%\services\tcmm-service\server.py"
 set "VEILGUARD_TCMM_LOG_DIR=C:\Users\rudol\.veilguard\logs"
 cd /d "%REPO%\services\tcmm-service"
