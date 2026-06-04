@@ -11,6 +11,8 @@ logs/
 tcmm-data/
 mongo-data/
 meili-data/
+agent-runtime/data/
+.flashrank_cache/
 
 # Vendor source checkouts
 librechat-src/

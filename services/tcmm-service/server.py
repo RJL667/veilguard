@@ -687,6 +687,67 @@ class SessionPool:
         except Exception as _e:
             logger.debug(f"[POOL] pre-warm skipped: {_e}")
 
+        # [DREAM_ANCHOR_LOAD_2026-06-04] Load this session's consolidated dream
+        # identity anchors into the STABLE tier at session creation, so the
+        # agent/chat boots already aware of its key entities (read-and-pin, NOT
+        # ingestion; demotable; the LLM promotes by citing). Scoped to this
+        # session's own (namespace, user_id).
+        try:
+            _t = time.time()
+            if hasattr(instance.tcmm, "load_dream_anchors"):
+                try:
+                    instance.tcmm._active_session_id = sid
+                except Exception:
+                    pass
+                # [DREAM_RECALL_2026_06_04] Enable dream-node recall (dream
+                # vector + identity-chain token match + entity/topic/claims
+                # BM25 over the dream substrate). Gated by TCMM_DREAM_RECALL
+                # (default ON). Without it dream_mode defaults False and ONLY
+                # the pre-loaded identity anchors reach the prompt — the other
+                # ~54 dream nodes (fact sheets, narrative arcs, reasoning
+                # traces) are never recalled.
+                if os.environ.get("TCMM_DREAM_RECALL", "1").lower() not in ("0", "false", "no"):
+                    try:
+                        instance.tcmm.dream_mode = True
+                    except Exception:
+                        pass
+                # Purge any prior anchor blocks (from an earlier code version,
+                # a re-render, or a re-dream) so every boot reflects the CURRENT
+                # dream state + anchor format. load_dream_anchors dedups on
+                # origin_archive_id, so without this an already-loaded (stale)
+                # anchor would be SKIPPED and never refreshed.
+                try:
+                    _lb = instance.tcmm.live_blocks
+                    _lb[:] = [_b for _b in _lb
+                              if getattr(_b, "source", "") != "dream_anchor"
+                              and not (getattr(_b, "text", "") or "").startswith("[Memory anchor]")]
+                    if hasattr(instance.tcmm, "_loaded_anchor_names"):
+                        instance.tcmm._loaded_anchor_names.clear()
+                except Exception:
+                    pass
+                # (1) Personal/conversational anchors — THIS session's own scope.
+                _n_own = instance.tcmm.load_dream_anchors()
+                # (2) Domain/org anchors — SHARED knowledge namespaces loaded into
+                # EVERY session of the tenant, regardless of which conversation
+                # ingested the docs. Configured as TCMM_SHARED_ANCHOR_SCOPES=
+                # "ns:user,ns2:user2". Cross-scope name-dedup is handled inside
+                # load_dream_anchors so an entity in both scopes isn't shown twice.
+                _n_shared = 0
+                for _pair in os.environ.get("TCMM_SHARED_ANCHOR_SCOPES", "").split(","):
+                    _pair = _pair.strip()
+                    if ":" in _pair:
+                        _sns, _suser = _pair.split(":", 1)
+                        if _sns.strip() and _suser.strip():
+                            _n_shared += instance.tcmm.load_dream_anchors(
+                                top_k=4, namespace=_sns.strip(), user_id=_suser.strip())
+                _pool_phase["dream_anchors"] = (time.time() - _t) * 1000
+                logger.info(
+                    f"[POOL] dream anchors: own={_n_own} shared={_n_shared} "
+                    f"shared_scopes={os.environ.get('TCMM_SHARED_ANCHOR_SCOPES','')!r} sid={sid}"
+                )
+        except Exception as _e:
+            logger.warning(f"[POOL] dream-anchor load FAILED: {_e!r}", exc_info=True)
+
         elapsed = time.time() - start
         status = instance.get_status()
         logger.info(
@@ -1877,7 +1938,15 @@ async def generate(body: GenerateBody):
 
     _t0 = _time.time()
     try:
-        text = adapter.generate(body.user_message, label=body.label or "api_generate") or ""
+        # [GENERATE_OFF_EVENT_LOOP_2026_06_04] Run the blocking LLM call in a
+        # worker thread so uvicorn's single event loop stays free to answer
+        # /health (and other requests) during the ~15s generation. Previously
+        # this ran inline on the loop; a slow/heavy turn starved /health long
+        # enough that the supervisor watchdog (dead_after=120s) killed the
+        # whole server mid-conversation. Mirrors the /dream to_thread fix.
+        text = await asyncio.to_thread(
+            adapter.generate, body.user_message, label=body.label or "api_generate"
+        ) or ""
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"adapter.generate failed: {e}")
     duration_ms = (_time.time() - _t0) * 1000
@@ -1899,6 +1968,90 @@ async def generate(body: GenerateBody):
         "content":     getattr(adapter, "last_response_blocks", None),
         "stop_reason": getattr(adapter, "last_stop_reason", None),
     }
+
+
+@app.post("/generate_stream")
+async def generate_stream(body: GenerateBody):
+    """[TRUE_STREAMING_2026_06_04] Streaming twin of /generate. Emits SSE:
+      event: ttft  data: {"ms": <time-to-first-token>}
+      event: delta data: {"text": "..."}   (one per model chunk)
+      event: done  data: {"usage": {...}, "total_ms": N, "content": [...], "stop_reason": ...}
+      event: error data: {"message": "..."}
+    The blocking adapter.generate_stream() runs in a worker thread; deltas are
+    bridged to the event loop via an asyncio.Queue so /health stays responsive.
+    Same render + adapter setup as /generate (memory-aware, cache_control blocks).
+    """
+    from fastapi.responses import StreamingResponse
+    import time as _time
+    import json
+    if not body.user_message or not body.user_message.strip():
+        raise HTTPException(status_code=400, detail="user_message is required")
+
+    sys_prompt = body.system_prompt
+    _sys_blocks = None
+    if body.include_memory and not sys_prompt:
+        try:
+            instance = pool.get(body.conversation_id, user_id=body.user_id)
+            from core.renderers.anthropic_renderer import AnthropicRenderer
+            from core.renderers.base_renderer import RenderConfig
+            cfg = RenderConfig(renderer_profile="anthropic-v1", **_ANTHROPIC_TTL_CAP)
+            renderer = AnthropicRenderer(instance.tcmm, config=cfg)
+            _r = renderer.render_structured(body.task_query or body.user_message)
+            sys_prompt = _r.get("prompt") or None
+            _sys_blocks = _r.get("blocks") if sys_prompt else None
+        except Exception as e:
+            logger.warning("[/generate_stream] render failed (continuing without memory): %s", e)
+            sys_prompt = None
+    if body.workspace_block and _sys_blocks:
+        _sys_blocks = list(_sys_blocks) + [{"type": "text", "text": body.workspace_block}]
+
+    try:
+        from adapters.anthropic_adapter import AnthropicGenerationAdapter
+        adapter = AnthropicGenerationAdapter(
+            api_key="", model_name=body.model, system_prompt=sys_prompt,
+            system_blocks=_sys_blocks, tools=body.tools or None,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"adapter ctor failed: {e}")
+
+    async def _sse():
+        q: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        t0 = _time.time()
+
+        def _produce():
+            try:
+                for delta in adapter.generate_stream(body.user_message, label=body.label or "api_generate_stream"):
+                    loop.call_soon_threadsafe(q.put_nowait, ("delta", delta))
+            except Exception as e:  # noqa: BLE001
+                loop.call_soon_threadsafe(q.put_nowait, ("error", str(e)))
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, ("done", None))
+
+        import threading
+        threading.Thread(target=_produce, daemon=True).start()
+        _first = True
+        while True:
+            kind, val = await q.get()
+            if kind == "delta":
+                if _first:
+                    yield f"event: ttft\ndata: {json.dumps({'ms': round((_time.time()-t0)*1000)})}\n\n"
+                    _first = False
+                yield f"event: delta\ndata: {json.dumps({'text': val})}\n\n"
+            elif kind == "error":
+                yield f"event: error\ndata: {json.dumps({'message': val})}\n\n"
+                return
+            else:
+                done = {
+                    "usage":       getattr(adapter, "last_usage", None) or {},
+                    "content":     getattr(adapter, "last_response_blocks", None),
+                    "stop_reason": getattr(adapter, "last_stop_reason", None),
+                    "total_ms":    round((_time.time() - t0) * 1000),
+                }
+                yield f"event: done\ndata: {json.dumps(done)}\n\n"
+                return
+
+    return StreamingResponse(_sse(), media_type="text/event-stream")
 
 
 # [RENDER_PII_HOOK_2026_05_30]  In-render PII redaction.  TCMM's renderer

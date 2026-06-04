@@ -228,8 +228,13 @@ async def handle_chat_request(
     )
 
     if is_stream:
+        # [TRUE_STREAMING_2026_06_04] When VEILGUARD_STREAM=1, base.py streams
+        # token deltas as assistant_text events → emit them as live SSE
+        # content_block_delta. Default OFF → the legacy one-chunk synthesizer.
+        _true_stream = os.environ.get("VEILGUARD_STREAM", "0").lower() in ("1", "true", "yes")
+        _sse = _stream_anthropic_sse_true if _true_stream else _stream_anthropic_sse
         return StreamingResponse(
-            _stream_anthropic_sse(chat, body.get("messages", []), ctx),
+            _sse(chat, body.get("messages", []), ctx),
             media_type="text/event-stream",
         )
     return await _build_anthropic_json(chat, body.get("messages", []), ctx)
@@ -305,6 +310,89 @@ async def _build_anthropic_json(chat, messages: list, ctx):
 
 
 # ── Anthropic SSE stream synthesizer ────────────────────────────────────
+
+
+async def _stream_anthropic_sse_true(chat, messages: list, ctx) -> AsyncIterator[str]:
+    """[TRUE_STREAMING_2026_06_04] Real incremental Anthropic SSE.
+
+    Emits ``content_block_delta`` per ``assistant_text`` event as base.py
+    streams token deltas (VEILGUARD_STREAM=1). The terminal ``assistant`` event
+    supplies tool_use blocks + final usage/stop_reason. Text is streamed live;
+    tool_use blocks are emitted whole after the text block closes.
+    """
+    msg_id = f"msg_{uuid.uuid4().hex}"
+    model = chat._model
+
+    def _ev(name: str, payload: dict) -> str:
+        return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
+
+    yield _ev("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id, "type": "message", "role": "assistant", "model": model,
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        },
+    })
+    yield _ev("content_block_start", {
+        "type": "content_block_start", "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    })
+
+    usage: dict = {}
+    stop_reason: str = "end_turn"
+    final_content: list = []
+    error: Optional[dict] = None
+
+    async for ev in chat.run_turn(messages, ctx):
+        et = ev.get("type")
+        if et == "assistant_text":
+            t = ev.get("text") or ""
+            if t:
+                yield _ev("content_block_delta", {
+                    "type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": t},
+                })
+        elif et == "assistant":
+            inner = ev.get("message", {})
+            final_content = inner.get("content") or []
+            usage = inner.get("usage") or {}
+            stop_reason = inner.get("stop_reason") or stop_reason
+        elif et == "audit":
+            _write_audit(ev, conversation_id=ctx.conversation_id,
+                         user_id=ctx.user_id, is_stream=True)
+        elif et == "error":
+            error = {"type": ev.get("code", "api_error"), "message": ev.get("message", "")}
+
+    if error:
+        yield _ev("error", {"type": "error", "error": error})
+        return
+
+    yield _ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+
+    _idx = 1
+    for blk in final_content:
+        if isinstance(blk, dict) and blk.get("type") == "tool_use":
+            yield _ev("content_block_start", {
+                "type": "content_block_start", "index": _idx,
+                "content_block": {"type": "tool_use", "id": blk.get("id", ""),
+                                  "name": blk.get("name", ""), "input": {}},
+            })
+            yield _ev("content_block_delta", {
+                "type": "content_block_delta", "index": _idx,
+                "delta": {"type": "input_json_delta",
+                          "partial_json": json.dumps(blk.get("input", {}) or {})},
+            })
+            yield _ev("content_block_stop", {"type": "content_block_stop", "index": _idx})
+            _idx += 1
+
+    yield _ev("message_delta", {
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+        "usage": {"output_tokens": usage.get("output_tokens", 0)},
+    })
+    yield _ev("message_stop", {"type": "message_stop"})
 
 
 async def _stream_anthropic_sse(chat, messages: list, ctx) -> AsyncIterator[str]:

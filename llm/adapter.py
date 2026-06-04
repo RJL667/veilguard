@@ -289,5 +289,67 @@ class AnthropicAdapter:
             model=self._model,
         )
 
+    async def generate_stream(self, user_message: str, *, label: str = "veilguard"):
+        """[TRUE_STREAMING_2026_06_04] Async generator: yields ("delta", text)
+        as the model produces text, then exactly one ("final", AdapterResult).
+
+        Bridges the inner TCMM adapter's SYNC generate_stream() generator to
+        async via a worker thread + queue (so the event loop stays free).  The
+        knowledge-contract (tcmm_record_turn) rides out-of-band as a tool_use in
+        the inner's last_response_blocks — it is NOT in the text deltas — so the
+        streamed text is the pure answer.  Falls back to a single-shot delta if
+        the inner adapter has no streaming method.
+        """
+        import threading
+        if not hasattr(self._inner, "generate_stream"):
+            res = await self.generate(user_message, label=label)
+            if res.text:
+                yield ("delta", res.text)
+            yield ("final", res)
+            return
+
+        q: "asyncio.Queue" = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def _produce():
+            try:
+                for d in self._inner.generate_stream(user_message, label):
+                    if d:
+                        loop.call_soon_threadsafe(q.put_nowait, ("delta", d))
+            except Exception as e:  # noqa: BLE001
+                loop.call_soon_threadsafe(q.put_nowait, ("error", e))
+            finally:
+                loop.call_soon_threadsafe(q.put_nowait, ("eos", None))
+
+        threading.Thread(target=_produce, daemon=True).start()
+
+        _parts: list[str] = []
+        while True:
+            kind, val = await q.get()
+            if kind == "delta":
+                _parts.append(val)
+                yield ("delta", val)
+            elif kind == "error":
+                raise val
+            else:  # eos
+                break
+
+        # Inner's last_* are populated after the stream drains (final message).
+        blocks = getattr(self._inner, "last_response_blocks", None)
+        text = "".join(_parts)
+        if not isinstance(blocks, list) or not blocks:
+            blocks = [{"type": "text", "text": text}]
+        usage = getattr(self._inner, "last_usage", None) or {}
+        stop_reason = getattr(self._inner, "last_stop_reason", None) or "end_turn"
+        mode = getattr(self._inner, "_mode", "") or ""
+        yield ("final", AdapterResult(
+            text=text,
+            content_blocks=blocks,
+            usage=dict(usage) if isinstance(usage, dict) else {},
+            stop_reason=stop_reason,
+            mode=mode,
+            model=self._model,
+        ))
+
 
 __all__ = ["AnthropicAdapter", "AdapterResult"]

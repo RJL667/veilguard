@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio as _asyncio
 import logging
+import os
 import time
 import uuid
 from abc import ABC
@@ -769,9 +770,53 @@ class Agent(ABC):
             )
             redacted_user_msg = redactor.redact_text(raw_user_msg, sid)
             _t_marks["S3_adapter_pre"] = _t.time()
-            result = await adapter.generate(
-                redacted_user_msg, label=f"agent:{self.agent_id}",
+            # [TRUE_STREAMING_2026_06_04] When VEILGUARD_STREAM=1 and the adapter
+            # supports it, consume token deltas and yield incremental
+            # assistant_text events so the UI shows text in ~2s instead of
+            # waiting the full generation. The contract (tcmm_record_turn) is a
+            # tool_use captured in the final result (not in the text), so the
+            # streamed text is the pure answer. Deltas are rehydrated through a
+            # 48-char boundary buffer so a PII token spanning a chunk edge still
+            # round-trips (token len << 48). Default OFF → existing blocking path.
+            _stream_enabled = (
+                os.environ.get("VEILGUARD_STREAM", "0").lower() in ("1", "true", "yes")
+                and hasattr(adapter, "generate_stream")
             )
+            _streamed_text = False
+            if _stream_enabled:
+                _rbuf = {"s": ""}
+
+                def _rehydrate_stream(delta: str, flush: bool = False) -> str:
+                    _rbuf["s"] += delta
+                    if flush:
+                        out, _rbuf["s"] = _rbuf["s"], ""
+                    elif len(_rbuf["s"]) > 48:
+                        out, _rbuf["s"] = _rbuf["s"][:-48], _rbuf["s"][-48:]
+                    else:
+                        out = ""
+                    return redactor.rehydrate_text(out, sid) if out else ""
+
+                result = None
+                async for _kind, _val in adapter.generate_stream(
+                    redacted_user_msg, label=f"agent:{self.agent_id}",
+                ):
+                    if _kind == "delta":
+                        _piece = _rehydrate_stream(_val)
+                        if _piece:
+                            _streamed_text = True
+                            yield events.assistant_text(_piece)
+                    elif _kind == "final":
+                        result = _val
+                _tail = _rehydrate_stream("", flush=True)
+                if _tail:
+                    _streamed_text = True
+                    yield events.assistant_text(_tail)
+                if result is None:
+                    raise RuntimeError("streaming adapter produced no final result")
+            else:
+                result = await adapter.generate(
+                    redacted_user_msg, label=f"agent:{self.agent_id}",
+                )
             _t_marks["S3_adapter_done"] = _t.time()
             try:
                 _spans = []
@@ -908,6 +953,8 @@ class Agent(ABC):
         for blk in raw_content:
             btype = blk.get("type")
             if btype == "text":
+                if _streamed_text:
+                    continue  # already emitted incrementally during streaming
                 t = blk.get("text", "")
                 if t:
                     yield events.assistant_text(t)
