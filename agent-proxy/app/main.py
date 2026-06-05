@@ -3744,6 +3744,21 @@ async def gateway(request: Request, path: str):
                 # to their dated form for workspaces that only expose
                 # the dated id. Safe no-op when the alias works as-is.
                 _rewrite_claude_dated_alias(data)
+                # [MAX_TOKENS_FLOOR_2026-06-05] LibreChat defaults Opus to
+                # max_tokens=8192, which silently truncates long answers
+                # mid-word (the model stops at EXACTLY 8192 — observed reciting
+                # a policy doc, cut at "...Communicable Dis"). Opus 4.7 supports
+                # far more output, so raise the FLOOR for opus models. This is a
+                # cap, not a target: short answers still stop at end_turn, so it
+                # only affects responses that would otherwise be cut. Env-tunable
+                # via VEILGUARD_OPUS_MAX_TOKENS (default 16384).
+                try:
+                    if "opus" in str(data.get("model") or "").lower():
+                        _mt_floor = int(os.environ.get("VEILGUARD_OPUS_MAX_TOKENS", "16384"))
+                        if int(data.get("max_tokens") or 0) < _mt_floor:
+                            data["max_tokens"] = _mt_floor
+                except Exception:
+                    pass
                 is_stream = data.get("stream", False)
                 # Iter 11: SSO early-route ─ if model ends in '-sso',
                 # bypass the api.anthropic.com forward and call TCMM
