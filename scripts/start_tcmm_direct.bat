@@ -29,6 +29,12 @@ REM GGUF that (a) crashes the process when synthesizing on this CPU/GPU-locked
 REM box and (b) leaves synth.backend falsy so the fact-sheet LLM distillation
 REM pass is skipped -> raw fragmentary fact sheets. "vertex" fixes both.
 set "DREAM_BACKEND=vertex"
+REM [DREAM_CYCLE_CACHE_2026-06-05] Restore full dream-mutation persistence on PG
+REM (the engine's ~321 in-place node edits were silently lost on the stateless
+REM proxy -> the dream ran "lobotomized": 1 principle, frozen stability). With
+REM the volatile analytical passes now re-stabilized (causal/actor/chain gates +
+REM final dedup), cache-on audits FLAWLESS at ~171 nodes. Set to 0 to disable.
+set "TCMM_DREAM_CYCLE_CACHE=1"
 set "VEILGUARD_TCMM_SERVER_PY=%REPO%\services\tcmm-service\server.py"
 set "VEILGUARD_TCMM_LOG_DIR=C:\Users\rudol\.veilguard\logs"
 cd /d "%REPO%\services\tcmm-service"
