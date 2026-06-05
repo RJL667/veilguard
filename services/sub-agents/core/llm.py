@@ -134,6 +134,11 @@ async def call_llm(
                     "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json",
                 }
+                # [SUBAGENT_XUSERID_2026-06-05] The proxy's chat_agent path
+                # requires the x-user-id HEADER (it was only in payload metadata),
+                # else it 401s "x-user-id header required" and the sub-agent dies.
+                if active_uid:
+                    headers["x-user-id"] = active_uid
                 payload = {
                     "model": use_model,
                     "max_tokens": 4096,
@@ -155,6 +160,8 @@ async def call_llm(
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 }
+                if active_uid:  # forward x-user-id (proxy chat_agent path needs it)
+                    headers["x-user-id"] = active_uid
                 payload = {
                     "model": use_model,
                     "messages": [
@@ -254,6 +261,11 @@ async def call_llm_with_tools(
                     "anthropic-version": "2023-06-01",
                     "Content-Type": "application/json",
                 }
+                # [SUBAGENT_XUSERID_2026-06-05] The proxy's chat_agent path
+                # requires the x-user-id HEADER (it was only in payload metadata),
+                # else it 401s "x-user-id header required" and the sub-agent dies.
+                if active_uid:
+                    headers["x-user-id"] = active_uid
                 payload = {
                     "model": use_model,
                     "max_tokens": 4096,
@@ -278,6 +290,8 @@ async def call_llm_with_tools(
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 }
+                if active_uid:  # forward x-user-id (proxy chat_agent path needs it)
+                    headers["x-user-id"] = active_uid
                 oai_messages = [{"role": "system", "content": build_prompt(system_prompt)}]
                 for m in messages:
                     if isinstance(m.get("content"), str):
