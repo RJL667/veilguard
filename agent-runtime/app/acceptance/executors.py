@@ -65,6 +65,7 @@ CHECK_KINDS: frozenset[str] = frozenset({
     "output_path_matches_regex",
     "output_path_jsonschema",
     "test_passes",
+    "word_count_range",   # [AC_WORD_COUNT_2026-06-05] deterministic word-count gate
     "manual_user",
     "llm_verify",     # Phase 7.5 — quality lift only; pairing rule enforced
 })
@@ -79,6 +80,7 @@ MECHANICAL_CHECK_KINDS: frozenset[str] = frozenset({
     "output_path_matches_regex",
     "output_path_jsonschema",
     "test_passes",
+    "word_count_range",   # [AC_WORD_COUNT_2026-06-05]
 })
 
 # AC-8 — `test_passes` sandbox bounds.  Set once at import time; the
@@ -238,6 +240,7 @@ def _exec_output_path_matches_regex(args: dict, ctx: dict) -> CheckResult:
         if not path_str or pattern is None:
             return CheckResult(
                 "error",
+                evidence={"ac_malformed": True},
                 reason="check_args.path and check_args.pattern required",
             )
         flags_str = args.get("flags", "")
@@ -290,6 +293,77 @@ def _exec_output_path_matches_regex(args: dict, ctx: dict) -> CheckResult:
                 "body_sha256": _sha256_bytes(body.encode("utf-8")),
             },
         )
+    except PermissionError as e:
+        return CheckResult("error", reason=str(e))
+    except Exception as e:
+        return CheckResult("error", reason=f"unexpected: {type(e).__name__}: {e}")
+
+
+@_register("word_count_range")
+def _exec_word_count_range(args: dict, ctx: dict) -> CheckResult:
+    """[AC_WORD_COUNT_2026-06-05] File exists and its word count is within
+    [min_words, max_words] (inclusive).
+
+    Word count = whitespace-delimited tokens in the file text — deterministic,
+    so it replaces the LLM critic's non-deterministic counting (live-observed
+    the same critic counting 118 then 165 words for one unchanged file).
+    At least one of min/max is required; accepts several arg spellings the
+    model tends to emit (min_words/min/minimum, max_words/max/maximum).
+    """
+    try:
+        path_str = args.get("path")
+        if not path_str:
+            return CheckResult(
+                "error",
+                evidence={"ac_malformed": True},
+                reason="check_args.path required",
+            )
+
+        def _as_int(*keys):
+            for k in keys:
+                v = args.get(k)
+                if v is not None:
+                    try:
+                        return int(v)
+                    except (TypeError, ValueError):
+                        pass
+            return None
+
+        min_w = _as_int("min_words", "min", "min_count", "minimum")
+        max_w = _as_int("max_words", "max", "max_count", "maximum")
+        if min_w is None and max_w is None:
+            return CheckResult(
+                "error",
+                evidence={"ac_malformed": True},
+                reason="check_args needs min_words and/or max_words",
+            )
+        path = _safe_path(path_str, ctx.get("workspace_root"))
+        if not path.exists():
+            return CheckResult(
+                "fail",
+                evidence={"path": str(path_str), "exists": False},
+                reason=f"file does not exist: {path_str!r}",
+            )
+        body = path.read_text(encoding="utf-8", errors="replace")
+        if not body.strip():
+            return CheckResult(
+                "fail",
+                evidence={"path": str(path_str), "size_bytes": path.stat().st_size},
+                reason="file is empty / whitespace-only (anti-false-positive)",
+            )
+        words = len(body.split())
+        ev = {
+            "path": str(path_str),
+            "word_count": words,
+            "min_words": min_w,
+            "max_words": max_w,
+            "body_sha256": _sha256_bytes(body.encode("utf-8")),
+        }
+        if min_w is not None and words < min_w:
+            return CheckResult("fail", evidence=ev, reason=f"word count {words} below min {min_w}")
+        if max_w is not None and words > max_w:
+            return CheckResult("fail", evidence=ev, reason=f"word count {words} above max {max_w}")
+        return CheckResult("pass", evidence=ev)
     except PermissionError as e:
         return CheckResult("error", reason=str(e))
     except Exception as e:
@@ -815,11 +889,13 @@ def run_check(
         except json.JSONDecodeError as e:
             return CheckResult(
                 "error",
+                evidence={"ac_malformed": True},
                 reason=f"check_args JSON parse failed: {e}",
             )
     if not isinstance(check_args, dict):
         return CheckResult(
             "error",
+            evidence={"ac_malformed": True},
             reason=f"check_args must be dict or JSON string, got {type(check_args).__name__}",
         )
     ctx = dict(context or {})  # copy so we can inject without aliasing
@@ -827,6 +903,7 @@ def run_check(
     if executor is None:
         return CheckResult(
             "error",
+            evidence={"ac_malformed": True},  # broken AC definition, not artifact
             reason=f"unknown check_kind {check_kind!r}; "
             f"known kinds: {sorted(EXECUTOR_REGISTRY.keys())}",
         )

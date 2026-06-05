@@ -800,7 +800,7 @@ def _run_required_ac_checks(
     """
     import os as _os
     import json as _json
-    from ..acceptance.executors import run_check
+    from ..acceptance.executors import run_check, CHECK_KINDS
     from ..ledger.store import LedgerStore, ns_filter
 
     tbl = LedgerStore.get().table("agent_tasks")
@@ -833,11 +833,37 @@ def _run_required_ac_checks(
         # If the AC's check_args has no path but the task has exactly one
         # output, default to that output (covers the synthesized
         # AC-default when the IC wrote to the spec'd path).
-        if check_kind in ("output_path_exists", "output_path_matches_regex"):
+        if check_kind in ("output_path_exists", "output_path_matches_regex", "word_count_range"):
             if isinstance(check_args, dict) and not check_args.get("path") and outputs:
                 check_args = {**check_args, "path": outputs[0]}
         res = run_check(check_kind, check_args, ctx_for_check)
         status = getattr(res, "status", "error")
+        # [AC_MALFORMED_NONBLOCK_2026-06-05] A *malformed AC definition*
+        # (unknown check_kind, or unparseable/missing check_args — a SYNTHESIS
+        # fault by whoever authored the AC, not the artifact) is un-runnable
+        # and MUST NOT gate the task. Treating "we couldn't even run this
+        # broken check" as "the artifact failed" cancels good work the critic
+        # approved (live-observed 2026-06-05: a 118-word memo meeting every
+        # criterion was auto-cancelled because the author emitted check_kind
+        # 'word_count_range' before it existed + argless regex checks). Record
+        # such ACs as a non-gating 'pass' (so NEITHER this downgrade gate NOR
+        # the hard-gate in update_status — which requires ac_results=='pass' —
+        # cancels over a broken check) and surface them loudly for repair.
+        _ev = getattr(res, "evidence", {}) or {}
+        if status == "error" and (
+            check_kind not in CHECK_KINDS or _ev.get("ac_malformed")
+        ):
+            results[ac_id] = "pass"
+            detail.append(
+                f"{ac_id} [{check_kind}] → skipped: malformed AC spec, NOT "
+                f"gating ({getattr(res, 'reason', '')})"
+            )
+            logger.warning(
+                f"[ac_checks] task {task_id} AC {ac_id} malformed "
+                f"(kind={check_kind!r}); skipped as non-gating: "
+                f"{getattr(res, 'reason', '')}"
+            )
+            continue
         results[ac_id] = status
         detail.append(
             f"{ac_id} [{check_kind}] → {status}"
@@ -935,24 +961,32 @@ async def review_decision_tool(args: dict[str, Any]) -> dict[str, Any]:
         _prior_rejections = 0
         if decision == "changes_requested":
             try:
-                for _c in comments.list_comments(
-                    task_id=args["task_id"],
-                    tenant_id=ctx.tenant_id,
-                    user_id=ctx.user_id,
-                ):
-                    if (_c.get("kind") == "review_decision"
-                            and (_c.get("body") or "").startswith(
-                                "changes_requested")):
-                        _prior_rejections += 1
+                # [REVISION_CAP_COUNTS_SUBMISSIONS_2026-06-05] Count genuine IC
+                # SUBMISSIONS (review_request comments), NOT rejections. A
+                # single critic dispatch can emit several changes_requested
+                # decisions with NO IC revision between them — e.g. an approval
+                # auto-downgraded by a mechanical check, then a second explicit
+                # rejection (live-observed 2026-06-05). Counting rejections let
+                # those burn the cap and cancel the task before the IC ever
+                # revised. Counting submissions guarantees the IC actually gets
+                # _MAX_REVISION_ROUNDS attempts.
+                _ic_submissions = sum(
+                    1 for _c in comments.list_comments(
+                        task_id=args["task_id"],
+                        tenant_id=ctx.tenant_id,
+                        user_id=ctx.user_id,
+                    )
+                    if _c.get("kind") == "review_request"
+                )
             except Exception:
-                _prior_rejections = 0
-            # This decision would be the (_prior_rejections + 1)-th rejection.
-            if _prior_rejections + 1 >= _MAX_REVISION_ROUNDS:
+                _ic_submissions = 0
+            _prior_rejections = _ic_submissions  # reused in the cap-hit body
+            if _ic_submissions >= _MAX_REVISION_ROUNDS:
                 _cap_hit = True
                 logger.warning(
                     f"[review_decision] task {args['task_id']} hit revision-"
-                    f"round cap ({_MAX_REVISION_ROUNDS}) on rejection "
-                    f"#{_prior_rejections + 1}; CANCELLING instead of bouncing "
+                    f"round cap ({_MAX_REVISION_ROUNDS}) after {_ic_submissions} "
+                    f"IC submission(s); CANCELLING instead of bouncing "
                     f"to in_progress (IC↔critic could not converge)."
                 )
 
@@ -960,7 +994,7 @@ async def review_decision_tool(args: dict[str, Any]) -> dict[str, Any]:
         if _cap_hit:
             body = (
                 f"changes_requested: {args['notes']}  "
-                f"[REVISION-CAP HIT] rejection #{_prior_rejections + 1} ≥ cap "
+                f"[REVISION-CAP HIT] {_prior_rejections} IC submission(s) ≥ cap "
                 f"{_MAX_REVISION_ROUNDS} → task auto-CANCELLED to stop the "
                 f"IC↔critic loop. Re-scope the brief and re-create the task "
                 f"if the work is still needed."

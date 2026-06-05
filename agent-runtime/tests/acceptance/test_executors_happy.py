@@ -24,8 +24,9 @@ from app.acceptance import (
 # ── AC-4 — Registry completeness ────────────────────────────────────────
 
 
-def test_ac4_executor_registry_has_six_mechanical_plus_manual_and_llm_verify():
-    """AC-4 (post-Phase 7.5): 6 mechanical kinds + manual_user + llm_verify.
+def test_ac4_executor_registry_has_seven_mechanical_plus_manual_and_llm_verify():
+    """AC-4 (post-Phase 7.5 + word_count_range 2026-06-05): 7 mechanical
+    kinds + manual_user + llm_verify.
     llm_verify is in CHECK_KINDS (it's executable) but NOT in
     MECHANICAL_CHECK_KINDS — the Director's "≥1 required mechanical AC"
     rule keeps the iron rule intact (llm_verify can lift quality but
@@ -33,13 +34,13 @@ def test_ac4_executor_registry_has_six_mechanical_plus_manual_and_llm_verify():
     expected_kinds = {
         "claim_count", "claim_predicate",
         "output_path_exists", "output_path_matches_regex",
-        "output_path_jsonschema", "test_passes",
+        "output_path_jsonschema", "test_passes", "word_count_range",
         "manual_user", "llm_verify",
     }
     expected_mechanical = {
         "claim_count", "claim_predicate",
         "output_path_exists", "output_path_matches_regex",
-        "output_path_jsonschema", "test_passes",
+        "output_path_jsonschema", "test_passes", "word_count_range",
     }
     assert set(EXECUTOR_REGISTRY.keys()) == expected_kinds
     assert "llm_verify" in EXECUTOR_REGISTRY  # Phase 7.5
@@ -49,6 +50,44 @@ def test_ac4_executor_registry_has_six_mechanical_plus_manual_and_llm_verify():
     # toward the mechanical-required AC requirement.
     assert "llm_verify" not in MECHANICAL_CHECK_KINDS
     assert "manual_user" not in MECHANICAL_CHECK_KINDS
+
+
+# ── word_count_range (2026-06-05) — deterministic word-count gate ───────
+
+
+def test_word_count_range_happy(tmp_path: Path):
+    """Word count within [min, max] → pass; count is deterministic."""
+    p = tmp_path / "memo.md"
+    p.write_text("one two three four five six seven eight")  # 8 words
+    r = run_check(
+        "word_count_range",
+        {"path": str(p), "min_words": 5, "max_words": 10},
+        {"workspace_root": tmp_path},
+    )
+    assert r.status == "pass", f"expected pass, got {r.status}: {r.reason}"
+    assert r.evidence["word_count"] == 8
+
+
+def test_word_count_range_out_of_range_fails(tmp_path: Path):
+    """Below min or above max → fail (artifact wrong, not a spec error)."""
+    p = tmp_path / "memo.md"
+    p.write_text("one two three")  # 3 words
+    lo = run_check("word_count_range", {"path": str(p), "min_words": 5},
+                   {"workspace_root": tmp_path})
+    hi = run_check("word_count_range", {"path": str(p), "max_words": 2},
+                   {"workspace_root": tmp_path})
+    assert lo.status == "fail" and hi.status == "fail"
+
+
+def test_word_count_range_missing_bounds_is_malformed(tmp_path: Path):
+    """No min/max bounds → error tagged ac_malformed (a broken AC spec,
+    NOT the artifact) so the ledger gate can treat it as non-gating."""
+    p = tmp_path / "memo.md"
+    p.write_text("hello world")
+    r = run_check("word_count_range", {"path": str(p)},
+                  {"workspace_root": tmp_path})
+    assert r.status == "error"
+    assert r.evidence.get("ac_malformed") is True
 
 
 # ── AC-5 — Happy path per executor ──────────────────────────────────────
