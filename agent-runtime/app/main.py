@@ -1205,6 +1205,15 @@ async def delegate_to_org(request: Request) -> JSONResponse:
     if not brief:
         raise HTTPException(status_code=400, detail="brief required")
     spec = (body.get("deliverable_spec") or "").strip()
+    # [DAG_TEAMS_2026-06-07] Optional DAG / team wiring for orchestration tests:
+    # inputs/depends_on gate the poller's claim until upstream tasks are terminal;
+    # team_id assigns to a team (budget + knowledge lane); parent_id makes it a
+    # coordinator subtask. All validated by create_task (acyclic depends_on, team
+    # existence/budget). Omitted -> a plain standalone IC task (unchanged).
+    _inputs = body.get("inputs") or []
+    _depends_on = body.get("depends_on") or []
+    _parent_id = (body.get("parent_id") or "").strip() or None
+    _team_id = (body.get("team_id") or "").strip() or None
 
     from .workers.inbox_poller import ELIGIBLE_OWNERS
     owner = (body.get("owner_hint") or "").strip().lower()
@@ -1222,7 +1231,10 @@ async def delegate_to_org(request: Request) -> JSONResponse:
             brief=brief,
             deliverable_spec=spec,
             acceptance_criteria=acs or None,
-            inputs=[],
+            inputs=_inputs,
+            depends_on=_depends_on or None,
+            parent_id=_parent_id,
+            team_id=_team_id,
             origin="foreground",
             pattern="A",
             _phase_6_legacy_exempt=(not acs),
@@ -1238,6 +1250,40 @@ async def delegate_to_org(request: Request) -> JSONResponse:
         "message":  f"Task {tid} created and assigned to {owner}. The org is on it "
                     f"— track it in the Work Queue.",
     })
+
+
+@app.post("/teams")
+async def create_team_endpoint(request: Request) -> JSONResponse:
+    """[DAG_TEAMS_2026-06-07] Create a team (for orchestration tests + the
+    chat->org path). Auth: X-Internal-Secret. Body: {tenant_id, user_id, name,
+    lead_agent_id?, member_agent_ids?, budget_usd?}. Returns {team_id}.
+    NOTE: budget_usd=0 means 'no spend allowed' — pass a real budget for a team
+    whose tasks should run.
+    """
+    from .config import VEILGUARD_INTERNAL_SECRET
+    if VEILGUARD_INTERNAL_SECRET and request.headers.get("x-internal-secret") != VEILGUARD_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    tenant_id = (body.get("tenant_id") or "").strip()
+    user_id = (body.get("user_id") or "").strip()
+    name = (body.get("name") or "").strip()
+    if not (tenant_id and user_id and name):
+        raise HTTPException(status_code=400, detail="tenant_id + user_id + name required")
+    from .ledger import teams as _teams
+    try:
+        team_id = _teams.create_team(
+            tenant_id=tenant_id, user_id=user_id, name=name,
+            lead_agent_id=(body.get("lead_agent_id") or "team-lead").strip(),
+            member_agent_ids=body.get("member_agent_ids") or [],
+            budget_usd=float(body.get("budget_usd") or 0.0),
+            created_by_agent_id="director",
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"team create: {e}")
+    return JSONResponse({"team_id": team_id, "name": name})
 
 
 @app.get("/workspace/file")
