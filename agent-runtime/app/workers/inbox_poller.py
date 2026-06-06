@@ -597,6 +597,12 @@ class InboxPoller:
             f"attempting claims as {self._worker_id}"
         )
 
+        # [BLOCKER_RETRY_CAP_2026-06-07] tooling for the auto-cancel guard below.
+        import os as _os
+        from ..ledger import comments as _cm
+        from ..ledger.store import ns_filter
+        _blocker_cap = int(_os.environ.get("BLOCKER_RETRY_CAP", "2") or "2")
+
         for i in range(arr.num_rows):
             task_id = arr.column("id")[i].as_py()
             if task_id in self._in_flight:
@@ -611,6 +617,48 @@ class InboxPoller:
                     f"[inbox_poller] persona cap reached for "
                     f"{row_owner!r}; skipping {task_id} this cycle"
                 )
+                continue
+
+            # [BLOCKER_RETRY_CAP_2026-06-07] A task that keeps raising
+            # blocker_raised (a refusal of an out-of-bounds request, or an
+            # unrecoverable scope problem) stays claimable and LOOPS:
+            # re-dispatched -> re-refused, burning LLM cycles. Edge-test
+            # 2026-06-06 saw the "delete prod data" probe refused 3x while
+            # its status stayed claimable. Cap it: after N blockers, terminally
+            # CANCEL (valid transition from open/in_progress/review; cancelled
+            # is never re-claimed) so the task parks instead of looping.
+            # Recoverable blockers still get N-1 Director re-scope windows.
+            _t_tenant = arr.column("tenant_id")[i].as_py() or ""
+            _t_user = arr.column("user_id")[i].as_py() or ""
+            try:
+                _n_block = sum(
+                    1 for c in _cm.list_comments(
+                        task_id=task_id, tenant_id=_t_tenant, user_id=_t_user)
+                    if c.get("kind") == "blocker_raised"
+                )
+            except Exception:
+                _n_block = 0
+            if _n_block >= _blocker_cap:
+                try:
+                    tbl.update(
+                        where=f"{ns_filter(_t_tenant, _t_user)} AND id = '{task_id}'",
+                        values={"status": "cancelled", "updated_ts": now,
+                                "lease_owner": "", "lease_until": 0.0},
+                    )
+                    _cm.add_comment(
+                        task_id=task_id, tenant_id=_t_tenant, user_id=_t_user,
+                        author_id="inbox-poller", kind="status_change",
+                        body=(f"auto-cancelled: {_n_block} blocker_raised comments "
+                              f"(>= cap {_blocker_cap}) — task is unrecoverable "
+                              f"(refusal or persistent blocker); parking terminally "
+                              f"to stop the re-dispatch loop."),
+                    )
+                    logger.info(
+                        f"[inbox_poller] auto-cancelled {task_id}: "
+                        f"{_n_block} blockers >= cap {_blocker_cap}")
+                except Exception as e:
+                    logger.warning(
+                        f"[inbox_poller] auto-cancel of {task_id} failed: {e}")
                 continue
 
             # [F7_DEPENDENCY_AWARE_CLAIM_2026_05_26] If this task's
