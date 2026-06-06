@@ -1163,6 +1163,83 @@ async def proposal_convert(proposal_id: str, request: Request) -> JSONResponse:
     })
 
 
+@app.post("/delegate")
+async def delegate_to_org(request: Request) -> JSONResponse:
+    """Inbound bridge: the chat assistant hands a task to the org.
+
+    Creates an IC task directly in the durable ``agent_tasks`` ledger so the
+    inbox-poller dispatches it (researcher/builder execute -> critic reviews ->
+    done, visible in the Work Queue with cost). This is the single sanctioned
+    chat->org path. Hardened per the 2026-06-06 architecture review:
+      - owner is coerced to the 4 poller-scannable ELIGIBLE_OWNERS (default
+        ``researcher``). A coordinator-owned (director/team-lead) or otherwise
+        non-eligible owner passes create-validation then hangs OPEN forever
+        because the poller never scans it -- so we never allow it here.
+      - refuses unless the ledger is Postgres-backed: a Lance-backed "governed"
+        task is a false-durability claim, worse than not delegating at all.
+      - auth (X-Internal-Secret) + tenant/user threaded & required so a
+        cross-tenant insert is impossible.
+
+    Body: ``{tenant_id, user_id, brief, deliverable_spec?, owner_hint?}``
+    Returns: ``{task_id, owner_id, status, message}``
+    """
+    from .config import VEILGUARD_INTERNAL_SECRET
+    if VEILGUARD_INTERNAL_SECRET and request.headers.get("x-internal-secret") != VEILGUARD_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    _be = os.environ.get("LEDGER_BACKEND", os.environ.get("TCMM_STORAGE", "")).lower()
+    if _be not in ("postgres", "postgresql"):
+        raise HTTPException(
+            status_code=503,
+            detail="ledger is not Postgres-backed; refusing to create a "
+                   "non-durable task (set LEDGER_BACKEND=postgres)",
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid JSON body")
+    tenant_id = (body.get("tenant_id") or "").strip()
+    user_id   = (body.get("user_id") or "").strip()
+    if not (tenant_id and user_id):
+        raise HTTPException(status_code=400, detail="tenant_id + user_id required")
+    brief = (body.get("brief") or "").strip()
+    if not brief:
+        raise HTTPException(status_code=400, detail="brief required")
+    spec = (body.get("deliverable_spec") or "").strip()
+
+    from .workers.inbox_poller import ELIGIBLE_OWNERS
+    owner = (body.get("owner_hint") or "").strip().lower()
+    if owner not in ELIGIBLE_OWNERS:
+        owner = "researcher"
+
+    from .ledger import tasks as _tasks
+    acs = _tasks.synthesize_default_acceptance_criteria(owner, spec)
+    try:
+        tid = _tasks.create_task(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            owner_id=owner,
+            assigner_id="director",
+            brief=brief,
+            deliverable_spec=spec,
+            acceptance_criteria=acs or None,
+            inputs=[],
+            origin="foreground",
+            pattern="A",
+            _phase_6_legacy_exempt=(not acs),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"task create: {e}")
+    logger.info("[delegate] chat->org task=%s owner=%s tenant=%s",
+                tid, owner, tenant_id[:12])
+    return JSONResponse({
+        "task_id":  tid,
+        "owner_id": owner,
+        "status":   "open",
+        "message":  f"Task {tid} created and assigned to {owner}. The org is on it "
+                    f"— track it in the Work Queue.",
+    })
+
+
 @app.post("/proposals/{proposal_id}/decision")
 async def proposal_decision(proposal_id: str, request: Request) -> JSONResponse:
     """Phase 3 — apply a user/Director decision to a single proposal.

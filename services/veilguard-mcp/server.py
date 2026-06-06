@@ -48,6 +48,10 @@ HOST = os.environ.get("VEILGUARD_MCP_HOST", "0.0.0.0")
 # Per-call HTTP timeout. Search is bounded (recall pipeline is ~1-2s
 # steady-state), traverse is even smaller. 30s is generous head-room.
 HTTP_TIMEOUT = float(os.environ.get("VEILGUARD_MCP_TIMEOUT", "30"))
+# Agent-runtime (the Director org). delegate_to_org POSTs tasks into its durable
+# ledger. From the host this is the container's published port (5000:5000).
+AGENT_RUNTIME_URL = os.environ.get("AGENT_RUNTIME_URL", "http://localhost:5000").rstrip("/")
+INTERNAL_SECRET = os.environ.get("VEILGUARD_INTERNAL_SECRET", "")
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -179,6 +183,72 @@ def search_memory(
     except httpx.HTTPError as e:
         return json.dumps({"error": f"tcmm-service: {e}", "results": []})
     return json.dumps(result, default=str)
+
+
+@mcp.tool()
+def delegate_to_org(
+    brief: str,
+    ctx: Context,
+    deliverable_spec: str = "",
+    owner_hint: str = "",
+) -> str:
+    """Hand a task to the Veilguard agent ORG to work on asynchronously.
+
+    Use this when the user wants real, tracked, governed work done by the
+    organization -- NOT a quick inline answer. The task lands in the org's
+    durable ledger; an IC (researcher/builder) executes it, a critic reviews
+    it, and it appears live in the user's Work Queue panel with cost tracking.
+
+    Rule of thumb: if the user needs the answer *now, in this conversation*,
+    use your own tools (or a quick helper). If the work should be *tracked,
+    reviewed, or done by the org over time*, use delegate_to_org.
+
+    Args:
+        brief: A clear, self-contained description of what the org should do.
+            The assigned agent will NOT see this conversation, so put all the
+            context it needs into the brief itself.
+        deliverable_spec: Optional -- what the finished artifact should be,
+            e.g. "a 300-500 word summary written to team/research/x.md with
+            sections Overview / Findings / Notes". A concrete spec gives the
+            critic a real acceptance check.
+        owner_hint: Optional persona to assign -- one of: researcher, builder,
+            critic-claim, critic-prose. Anything else (or blank) -> researcher.
+
+    Returns:
+        JSON: {"task_id", "owner_id", "status": "open", "message"} on success,
+        or {"error": str} on failure.
+    """
+    _conv, user_id = _ctx_ids(ctx)
+    if not user_id:
+        return json.dumps({
+            "error": "no user context -- cannot scope the task to a tenant; "
+                     "call from a LibreChat session",
+        })
+    # Veilguard scopes the Work Queue by the LibreChat user id (veilguardClient.js
+    # proxyRuntime sets tenant_id = user_id), so the delegated task must use the
+    # same id for both to surface in the panel.
+    payload = {
+        "tenant_id": user_id,
+        "user_id": user_id,
+        "brief": brief,
+        "deliverable_spec": deliverable_spec,
+        "owner_hint": owner_hint,
+    }
+    headers = {"X-Internal-Secret": INTERNAL_SECRET} if INTERNAL_SECRET else {}
+    try:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as client:
+            resp = client.post(f"{AGENT_RUNTIME_URL}/delegate", json=payload, headers=headers)
+            resp.raise_for_status()
+            return json.dumps(resp.json(), default=str)
+    except httpx.HTTPStatusError as e:
+        detail = ""
+        try:
+            detail = e.response.text[:300]
+        except Exception:
+            pass
+        return json.dumps({"error": f"agent-runtime /delegate {e.response.status_code}: {detail}"})
+    except httpx.HTTPError as e:
+        return json.dumps({"error": f"agent-runtime unreachable: {e}"})
 
 
 @mcp.tool()
