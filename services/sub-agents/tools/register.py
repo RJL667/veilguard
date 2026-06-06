@@ -1,27 +1,37 @@
-"""Tool registration helper. Each tool module calls register() to add its tools to the MCP server."""
+"""Tool registration helper. Each tool module exposes a register(mcp) entry point."""
+
+import importlib
+import logging
+
+_log = logging.getLogger("sub-agents")
 
 
 def register_all(mcp):
-    """Register all tool modules with the MCP server instance."""
-    from tools import clipboard, notifications, schedules, agents, tasks
-    from tools import managed_tasks, daemons, teams, messaging
-    from tools import utility, verify, transcripts, playbooks, file_tools
-    from tools import ask_user, tool_search, plans, client_admin
-    from tools import host_docs
+    """Register the EXPOSED tool modules with the MCP server.
 
-    # NOTE: scratchpad NOT registered as MCP tool — Claude misuses it to "save" user info.
-    # Scratchpad is available inside spawn_agentic via the agentic tool handler.
-    # TCMM handles memory, not scratchpad.
+    Modules are imported by name and skipped if absent, so a deployment that
+    lacks a newer module (e.g. an older tree without client_admin/host_docs)
+    starts cleanly instead of crash-looping on ImportError.
 
-    for mod in [clipboard, notifications, schedules, agents, tasks,
-                managed_tasks, daemons, teams, messaging,
-                utility, verify, transcripts, playbooks, file_tools,
-                ask_user, tool_search, plans,
-                # Phase C/D: daemon task introspection + permission_level
-                # MCP tools (list_my_tasks / task_status / cancel_task /
-                # get_permission_level / set_permission_level).
-                client_admin,
-                # [HOST_DOC_READ_2026_06_01] read_pdf on the host (parses
-                # Windows-path PDFs the container documents server can't see).
-                host_docs]:
+    [DELEGATE_CONSOLIDATION_2026-06-06] tasks / managed_tasks / teams /
+    messaging are intentionally NOT exposed: they wrote to in-process RAM
+    stores that never reached the Director ledger (two parallel task systems),
+    so a user-facing task_create / team_create / start_task silently no-op'd.
+    Durable, tracked, governed delegation now has ONE front door --
+    veilguard-mcp `delegate_to_org` -> agent-runtime ledger -> Work Queue.
+    Inline "do it now" help stays on spawn_agent / spawn_agentic (agents).
+    (scratchpad is also intentionally unregistered -- Claude misuses it as a
+    place to "save" user info; TCMM handles memory.)
+    """
+    exposed = [
+        "clipboard", "notifications", "schedules", "agents", "daemons",
+        "utility", "verify", "transcripts", "playbooks", "file_tools",
+        "ask_user", "tool_search", "plans", "client_admin", "host_docs",
+    ]
+    for name in exposed:
+        try:
+            mod = importlib.import_module(f"tools.{name}")
+        except ImportError as e:
+            _log.warning("[register] skipping unavailable module tools.%s: %s", name, e)
+            continue
         mod.register(mcp)

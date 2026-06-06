@@ -27,20 +27,10 @@ TOOL_CATALOG = {
     "pipeline": "Run sequential agent pipeline (each step feeds the next)",
     "review_loop": "Agent with automatic quality review loop (work → critique → revise)",
     "run_playbook": "Run a pre-built incident playbook",
-    # Tasks
-    "start_task": "Start a background task (async, returns task ID)",
-    "smart_task": "Background task with auto-wait polling",
-    "check_task": "Check status of a background task",
-    "get_result": "Get full result of a completed task",
-    "list_tasks": "List all background tasks",
-    "cancel_task": "Cancel a running background task",
-    "start_parallel_tasks": "Start multiple background tasks in parallel",
-    "wait_for_tasks": "Wait for multiple tasks to complete",
-    # Managed tasks (with dependencies)
-    "task_create": "Create a managed task with optional dependencies",
-    "task_update": "Update a managed task status or result",
-    "task_list": "List all managed tasks (filtered by status)",
-    "task_graph": "Show task dependency graph",
+    # Delegate durable, tracked, reviewed work to the Director org — the ONE
+    # way to schedule governed work; it appears in the Work Queue. For quick
+    # inline help that answers in this same turn, use spawn_agent/spawn_agentic.
+    "delegate_to_org": "Hand a tracked, reviewed task to the agent org (async) — shows live in the Work Queue",
     # Daemons
     "start_daemon": "Start a persistent background daemon on a schedule",
     "stop_daemon": "Stop a running daemon",
@@ -54,15 +44,6 @@ TOOL_CATALOG = {
     "pause_schedule": "Pause a scheduled task",
     "resume_schedule": "Resume a paused scheduled task",
     "delete_schedule": "Delete a scheduled task",
-    # Teams
-    "team_create": "Create an agent team for collaborative work",
-    "team_assign": "Assign a task to a team member",
-    "team_status": "Show team status (members, tasks, progress)",
-    "team_delete": "Disband an agent team",
-    # Messaging
-    "agent_send": "Send a message to another agent's mailbox",
-    "agent_inbox": "Check an agent's inbox",
-    "agent_broadcast": "Broadcast to all agents",
     "ask_user": "Ask the user a question and wait for response",
     # Data
     "clipboard_copy": "Copy content to a named clipboard slot (in-memory)",
