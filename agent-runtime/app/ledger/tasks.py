@@ -105,11 +105,17 @@ def synthesize_default_acceptance_criteria(
     if owner_id in _COORDINATOR_OWNERS:
         return []
     import re as _re
+    import uuid as _uuid
     m = _re.search(
         r"([a-zA-Z0-9_./\-]+\.(?:md|txt|json|yaml|yml|html|csv|pdf|py|js|ts|tsx))",
         deliverable_spec or "",
     )
-    target_path = m.group(1) if m else "deliverable.md"
+    # [DELIVERABLE_COLLISION_FIX_2026-06-06] When the spec names no path, default
+    # to a UNIQUE task-scoped drafts file instead of a shared "deliverable.md".
+    # Concurrent spec-less tasks were all writing to (and clobbering) the same
+    # deliverable.md; the IC writes to whatever this AC names, so a unique path
+    # here means a unique, readable artifact per task.
+    target_path = m.group(1) if m else f"team/drafts/deliverable-{_uuid.uuid4().hex[:8]}.md"
     return [{
         "id":         "AC-default",
         "statement":  f"Output file {target_path!r} exists and is non-empty",

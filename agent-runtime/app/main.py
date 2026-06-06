@@ -1240,6 +1240,37 @@ async def delegate_to_org(request: Request) -> JSONResponse:
     })
 
 
+@app.get("/workspace/file")
+async def workspace_file(request: Request) -> JSONResponse:
+    """Read one team-workspace artifact (a task's deliverable) so the Work
+    Queue UI can render clickable, readable outputs.
+
+    Sandboxed to VEILGUARD_WORKSPACE_ROOT via workspace_fs._resolve (no path
+    escape); auth via X-Internal-Secret (same gate as /delegate).
+
+        GET /workspace/file?path=team/drafts/<file>.md  ->  {path, content} | {error}
+    """
+    from .config import VEILGUARD_INTERNAL_SECRET
+    if VEILGUARD_INTERNAL_SECRET and request.headers.get("x-internal-secret") != VEILGUARD_INTERNAL_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    rel = (request.query_params.get("path") or "").strip()
+    if not rel:
+        raise HTTPException(status_code=400, detail="path query param required")
+    from .tools import workspace_fs
+    target, err = workspace_fs._resolve(rel)
+    if err or target is None:
+        return JSONResponse({"error": err or "could not resolve path"}, status_code=400)
+    if not target.exists() or target.is_dir():
+        return JSONResponse({"error": f"no readable file at {rel!r} yet"}, status_code=404)
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return JSONResponse({"error": f"could not read {rel!r}: {e}"}, status_code=500)
+    if len(content) > 200_000:
+        content = content[:200_000] + "\n\n[truncated at 200000 chars]"
+    return JSONResponse({"path": rel, "content": content})
+
+
 @app.post("/proposals/{proposal_id}/decision")
 async def proposal_decision(proposal_id: str, request: Request) -> JSONResponse:
     """Phase 3 — apply a user/Director decision to a single proposal.
