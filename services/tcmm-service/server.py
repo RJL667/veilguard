@@ -604,11 +604,20 @@ class SessionPool:
         # lock; do the heavy construction OUTSIDE the lock; double-check
         # on registration to handle races where two threads create for
         # the same sid (the loser discards their instance).
+        # [CROSS_TENANT_POOL_FIX_2026-06-06] _normalize_id truncates to 24 chars,
+        # which drops the user_id from long agent namespaces
+        # (agent/<persona>/observations/<user> -> agent_<persona>_observa), so
+        # different tenants of the same persona collided on ONE pooled instance
+        # bound to the first-arriving tenant -> cross-tenant recall+write leak.
+        # Key the pool on (user_id, sid) so each tenant gets its own instance
+        # with the correct user_id scope. Provider namespace stays `sid` (the
+        # user_id COLUMN is the real isolation), so stored data is unchanged.
+        key = f"{user_id or 'default'}::{sid}"
         with self._lock:
-            if sid in self._instances:
-                self._instances.move_to_end(sid)
-                self._active_session = sid
-                return self._instances[sid]
+            if key in self._instances:
+                self._instances.move_to_end(key)
+                self._active_session = key
+                return self._instances[key]
 
         # Slow path — OUTSIDE the lock so other sids can construct in
         # parallel. Lance handles concurrent reads/connects fine; the
@@ -769,18 +778,18 @@ class SessionPool:
         # the map — if another thread created the same sid while we
         # were outside the lock, return theirs and discard ours.
         with self._lock:
-                if sid in self._instances:
-                    self._instances.move_to_end(sid)
-                    self._active_session = sid
-                    return self._instances[sid]
+                if key in self._instances:
+                    self._instances.move_to_end(key)
+                    self._active_session = key
+                    return self._instances[key]
                 # Evict oldest if at capacity
                 if len(self._instances) >= self._max_size:
                     evicted_id, evicted = self._instances.popitem(last=False)
-                    self._stats.pop(evicted_id, None)
+                    self._stats.pop(evicted_id.split("::", 1)[-1], None)
                     logger.info(f"[POOL] Evicted oldest session: {evicted_id}")
-                self._instances[sid] = instance
+                self._instances[key] = instance
                 self._stats[sid] = _new_session_stats()
-                self._active_session = sid
+                self._active_session = key
                 return instance
 
     def get_stats(self, conversation_id: str) -> dict:
@@ -794,13 +803,15 @@ class SessionPool:
     def get_active(self) -> tuple:
         """Get the most recently used (session_id, instance, stats)."""
         with self._lock:
-            sid = self._active_session
-            if sid and sid in self._instances:
-                return sid, self._instances[sid], self._stats.get(sid, _new_session_stats())
+            key = self._active_session
+            if key and key in self._instances:
+                sid = key.split("::", 1)[-1]
+                return sid, self._instances[key], self._stats.get(sid, _new_session_stats())
             # Fallback: last item
             if self._instances:
-                sid = next(reversed(self._instances))
-                return sid, self._instances[sid], self._stats.get(sid, _new_session_stats())
+                key = next(reversed(self._instances))
+                sid = key.split("::", 1)[-1]
+                return sid, self._instances[key], self._stats.get(sid, _new_session_stats())
             return None, None, _new_session_stats()
 
     def list_sessions(self) -> list:
