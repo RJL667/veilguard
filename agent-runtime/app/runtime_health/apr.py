@@ -25,6 +25,7 @@ When the collapse signal fires:
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -33,8 +34,17 @@ from dataclasses import dataclass, field
 # fast-firing fixtures (AC-35).
 HEALTHY_LOW: float = 0.5
 HEALTHY_HIGH: float = 2.0
-CIRCUIT_BREAKER_FLOOR: float = 0.1
-CIRCUIT_BREAKER_WINDOW_S: float = 1800.0  # 30 minutes
+# [APR_FLOOR_RECALIBRATION_2026-06-06] The original 0.1 floor assumed the
+# 0.5-2.0 artifacts/1k-tokens band, but a REAL multi-turn agent org (Sonnet
+# researcher + a large system prompt re-sent every turn + web_search result
+# tokens) legitimately runs FAR lower: measured ~0.02 on live tasks (failed
+# web_search burst 0.026, successful web research 0.019 — both well under 0.1).
+# At 0.1 the breaker false-trips on ALL normal work and stalls the entire queue
+# (tasks stuck `open` until POST /apr/resume). Lowered to 0.005 — still ~4x
+# below normal so it catches a genuine Auto-GPT collapse (many tokens, ~zero
+# artifacts) without punishing legitimately token-heavy research. Env-overridable.
+CIRCUIT_BREAKER_FLOOR: float = float(os.environ.get("APR_CIRCUIT_BREAKER_FLOOR", "0.005"))
+CIRCUIT_BREAKER_WINDOW_S: float = float(os.environ.get("APR_CIRCUIT_BREAKER_WINDOW_S", "1800.0"))  # 30 minutes
 
 
 @dataclass
