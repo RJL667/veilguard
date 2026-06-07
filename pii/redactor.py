@@ -164,20 +164,22 @@ def _load_allow_list_db() -> list[str]:
 
 
 def _load_allow_list() -> list[str]:
-    """The whitelist is the `pii_allow_list` DB table — the SINGLE source of
-    truth (seeded from the legacy file). The file is now a DISASTER fallback
-    ONLY: used iff the DB is empty/unreachable, so a fully-down DB still never
-    fails open. New/promoted terms go to the DB; the file is frozen.
+    """The whitelist is the `pii_allow_list` DB table — the ONLY runtime source.
+    No file is read during redaction. If the DB returns nothing (empty or
+    unreachable) the list is EMPTY → the redactor OVER-redacts (fail-closed,
+    never leaks) until the DB recovers; the background refresh keeps the last
+    good list in memory across transient blips. `allow_list.txt` is retained
+    purely as a one-time SEED source for the table — never loaded here.
     """
     db = _load_allow_list_db()
     if db:
         logger.info("[pii] allow_list = %d terms from DB (pii_allow_list)", len(db))
-        return db
-    fb = _load_allow_list_file()
-    logger.warning(
-        "[pii] DB allow_list empty/unreachable — FELL BACK to %d file terms", len(fb)
-    )
-    return fb
+    else:
+        logger.warning(
+            "[pii] allow_list DB returned 0 terms — EMPTY allow_list "
+            "(fail-closed; brands/code may over-redact until the DB recovers)"
+        )
+    return db
 
 
 # ── Redactor ────────────────────────────────────────────────────────────
