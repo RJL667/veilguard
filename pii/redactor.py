@@ -105,6 +105,7 @@ PII_ENTITIES = [
     "SA_PHONE_NUMBER",
     "SA_BANK_ACCOUNT",
     "PASSPORT_NUMBER",
+    "DENY_PII",
 ]
 
 
@@ -184,6 +185,48 @@ def _load_allow_list() -> list[str]:
     return db
 
 
+def _load_deny_list() -> list[str]:
+    """[DENYLIST_2026-06-07] Active terms from the `pii_deny_list` table — the
+    LLM-fed BLACKLIST of high-confidence MISSED PII. These are FORCE-redacted
+    even when the default recognizers miss them. This is the SAFE direction:
+    over-redacting is a quality bug, not a leak, so the LLM's flags auto-apply
+    with NO confirm gate (the asymmetric opposite of the whitelist). Returns []
+    on ANY failure (defaults still run). Disable with PII_DENYLIST_DB=0."""
+    if os.environ.get("PII_DENYLIST_DB", "1").lower() in ("0", "false", "no", "off"):
+        return []
+    try:
+        from .session_store import _PG_DSN
+        import psycopg2
+        conn = psycopg2.connect(_PG_DSN, connect_timeout=3)
+        try:
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute("SELECT term FROM pii_deny_list WHERE active = true")
+            terms = [r[0] for r in cur.fetchall() if r and r[0]]
+        finally:
+            conn.close()
+        logger.info("[pii] deny_list = %d terms from DB (pii_deny_list)", len(terms))
+        return terms
+    except Exception as e:
+        logger.warning("[pii] deny_list DB unavailable (%s); none this cycle", type(e).__name__)
+        return []
+
+
+def _build_deny_recognizer(terms):
+    """Presidio recognizer that FORCE-flags blacklist terms (score 1.0) so they
+    redact even when the default recognizers don't catch them. Passed per-call
+    as an ad-hoc recognizer; None when empty (no-op)."""
+    terms = [t.strip() for t in (terms or []) if t and t.strip()]
+    if not terms:
+        return None
+    try:
+        from presidio_analyzer import PatternRecognizer
+        return PatternRecognizer(supported_entity="DENY_PII", deny_list=terms)
+    except Exception as e:
+        logger.warning("[pii] deny recognizer build failed (%s)", type(e).__name__)
+        return None
+
+
 # ── Redactor ────────────────────────────────────────────────────────────
 
 
@@ -253,6 +296,8 @@ class PIIRedactor:
             logger.warning("[pii] pipeline trim skipped (%s)", e)
         self.anonymizer = AnonymizerEngine()
         self.allow_list = _load_allow_list()
+        self.deny_list = _load_deny_list()
+        self.deny_recognizer = _build_deny_recognizer(self.deny_list)
         self.store = _get_store()
 
         # [PII_AID_CACHE_2026_05_30]  THE blazingly-fast layer, keyed on the
@@ -320,6 +365,9 @@ class PIIRedactor:
                         fresh = _load_allow_list()
                         if fresh:
                             self.allow_list = fresh
+                        # deny_list: reload + rebuild the recognizer (may be empty)
+                        self.deny_list = _load_deny_list()
+                        self.deny_recognizer = _build_deny_recognizer(self.deny_list)
                     except Exception:
                         pass
             threading.Thread(
@@ -404,6 +452,10 @@ class PIIRedactor:
                 language="en",
                 score_threshold=self.min_score,
                 allow_list=self.allow_list if self.allow_list else None,
+                ad_hoc_recognizers=(
+                    [self.deny_recognizer]
+                    if getattr(self, "deny_recognizer", None) else None
+                ),
             )
         except Exception as e:
             logger.error("[pii] analyze failed: %s", e)
