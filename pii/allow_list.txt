@@ -1726,3 +1726,93 @@ Clearing
 Custody
 Issuance
 Acquiring
+
+# ══════════════════════════════════════════════════════════════════════
+# CODE / SOFTWARE IDENTIFIERS (class/role nouns NER mis-types as PERSON)
+# ══════════════════════════════════════════════════════════════════════
+# Single capitalised role-nouns common in source code (class names like
+# `Scheduler`, `Dispatcher`) false-positive as PERSON at ~0.85, so agents
+# reading code see REF_PERSON tokens INSIDE the source. Added 2026-06-07
+# after the taskq coding-DAG run: critics saw these tokens in reviewed
+# code and false-rejected the deliverables (revision churn / cancellations).
+# Curated to exclude real occupational surnames (Walker, Carter, Mason,
+# Cooper, Porter, Hunter, Fletcher, Tanner, Parker, Archer).
+Scheduler
+Worker
+Dispatcher
+Handler
+Manager
+Builder
+Runner
+Parser
+Logger
+Adapter
+Provider
+Factory
+Registry
+Controller
+Resolver
+Renderer
+Serializer
+Deserializer
+Connector
+Listener
+Observer
+Publisher
+Subscriber
+Consumer
+Producer
+Broker
+Router
+Gateway
+Interceptor
+Decorator
+Iterator
+Generator
+Collector
+Aggregator
+Transformer
+Formatter
+Encoder
+Decoder
+Compiler
+Loader
+Reader
+Writer
+Validator
+Sanitizer
+Tokenizer
+Lexer
+Executor
+Orchestrator
+Supervisor
+Coordinator
+Mapper
+Reducer
+Selector
+Marshaller
+Normalizer
+Initializer
+Finalizer
+Profiler
+Tracer
+Monitor
+Watcher
+Poller
+Sampler
+Scanner
+Crawler
+Fetcher
+Streamer
+Splitter
+Merger
+Comparator
+Sorter
+Indexer
+Repository
+Datastore
+Middleware
+Wrapper
+Helper
+Accumulator
+Allocator
