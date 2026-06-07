@@ -117,7 +117,7 @@ class ChatAgent(Agent):
         return inject_into_tools(tools)
 
     def intercept_response(
-        self, content_blocks: list[dict], stop_reason: str,
+        self, content_blocks: list[dict], stop_reason: str, sid: str = None,
     ) -> tuple[list[dict], dict, str]:
         """Strip the shadow tcmm_record_turn block before yielding to
         the caller.  Capture its input as flag_obj — the next
@@ -129,7 +129,7 @@ class ChatAgent(Agent):
         tool_result on a tool we consumed internally.
         """
         from .shadow_tool import intercept_response as _intercept
-        return _intercept(content_blocks, stop_reason)
+        return _intercept(content_blocks, stop_reason, sid)
 
     async def prepare_session(self, ctx) -> None:
         """ChatAgent-specific pinning on top of the base preamble.

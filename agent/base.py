@@ -312,7 +312,7 @@ class Agent(ABC):
         return inject_into_tools(tools)
 
     def intercept_response(
-        self, content_blocks: list[dict], stop_reason: str,
+        self, content_blocks: list[dict], stop_reason: str, sid: str = None,
     ) -> tuple[list[dict], dict, str]:
         """Hook fired AFTER the adapter returns, BEFORE rehydrate.
 
@@ -330,7 +330,7 @@ class Agent(ABC):
         Returns: (cleaned_blocks, flag_obj, new_stop_reason)
         """
         from .shadow_tool import intercept_response as _intercept
-        return _intercept(content_blocks, stop_reason)
+        return _intercept(content_blocks, stop_reason, sid)
 
     # ── The pipeline (subclasses do NOT override) ─────────────────────
 
@@ -851,7 +851,7 @@ class Agent(ABC):
         # tool's input dict (which is metadata, not PII) doesn't go
         # through the redactor.
         intercepted_blocks, flag_obj, intercepted_stop = self.intercept_response(
-            result.content_blocks, result.stop_reason,
+            result.content_blocks, result.stop_reason, sid,
         )
 
         # STEP 4 — Rehydrate before yielding to caller.  Both response

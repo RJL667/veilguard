@@ -119,6 +119,45 @@ TCMM_RECORD_TURN_TOOL: dict = {
                     "command output (\"ran `ls`, got 12 files\")."
                 ),
             },
+            "redaction_audit": {
+                "type": "object",
+                "description": (
+                    "OPTIONAL PII-boundary audit of THIS turn's visible text. "
+                    "Only include it when you actually notice something — most "
+                    "turns omit it. over_redacted: REF_* tokens that are clearly "
+                    "PUBLIC entities (companies, products, security tools, threat "
+                    "actors) wrongly tokenized as people — candidates to STOP "
+                    "redacting. missed: literal PII strings you can SEE "
+                    "un-redacted in the text (a person's name, email, account or "
+                    "ID number) that SHOULD have been redacted."
+                ),
+                "properties": {
+                    "over_redacted": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "token": {"type": "string"},
+                                "reason": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["token"],
+                        },
+                    },
+                    "missed": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "pii_type": {"type": "string"},
+                                "confidence": {"type": "number"},
+                            },
+                            "required": ["text"],
+                        },
+                    },
+                },
+            },
         },
         "required": ["knowledge_class", "epoch_complete", "emit_class", "used"],
     },
@@ -142,6 +181,7 @@ def inject_into_tools(tools_list: Optional[list[dict]]) -> list[dict]:
 def intercept_response(
     content_blocks: Optional[list[dict]],
     stop_reason: Optional[str],
+    sid: Optional[str] = None,
 ) -> tuple[list[dict], dict, str]:
     """Strip the shadow tool_use block from the response.
 
@@ -183,7 +223,78 @@ def intercept_response(
         if not has_real_tool_use:
             new_stop = "end_turn"
 
+    # [REDACTION_AUDIT_2026-06-07] fan out the model's PII-boundary audit
+    # (best-effort; a DB blip must never break the turn).
+    if flag_obj:
+        process_redaction_audit(flag_obj, sid)
+
     return cleaned, flag_obj, new_stop
+
+
+def _resolve_token(token: str, sid):
+    """Resolve a REF_* token back to its original via the redactor's
+    rehydrate_text (reads the per-session token map). None if it can't
+    (no sid / no mapping) → the over_redacted candidate is skipped."""
+    if not sid:
+        return None
+    try:
+        from pii import get_redactor
+        out = get_redactor().rehydrate_text(token, sid)
+        if out and out != token:
+            return out
+    except Exception:
+        pass
+    return None
+
+
+def process_redaction_audit(flag_obj: dict, sid=None) -> None:
+    """[REDACTION_AUDIT_2026-06-07] Fan out the model's redaction_audit:
+      missed         -> pii_deny_list  (FORCE-redact; safe direction, auto-applied)
+      over_redacted  -> resolve REF_* token -> original -> redaction_suggestions
+                        (whitelist CANDIDATE; gated later by the promoter/confirm)
+    Best-effort: never raises (a DB hiccup must not break the turn)."""
+    try:
+        audit = (flag_obj or {}).get("redaction_audit")
+        if not isinstance(audit, dict):
+            return
+        missed = audit.get("missed") or []
+        over = audit.get("over_redacted") or []
+        if not missed and not over:
+            return
+        import psycopg2
+        from pii.session_store import _PG_DSN
+        conn = psycopg2.connect(_PG_DSN, connect_timeout=3)
+        conn.autocommit = True
+        cur = conn.cursor()
+        for m in missed:
+            term = ((m.get("text") if isinstance(m, dict) else m) or "").strip()
+            if len(term) < 2:
+                continue
+            ptype = m.get("pii_type") if isinstance(m, dict) else None
+            cur.execute(
+                "INSERT INTO pii_deny_list (term, entity_type, source, added_by, active) "
+                "VALUES (%s,%s,'llm-audit','llm',true) "
+                "ON CONFLICT (term) DO UPDATE SET active=true",
+                (term, ptype),
+            )
+        for o in over:
+            token = ((o.get("token") if isinstance(o, dict) else o) or "").strip()
+            if "REF_" not in token:
+                continue
+            original = _resolve_token(token, sid)
+            if not original or len(original) < 2:
+                continue
+            cur.execute(
+                "INSERT INTO redaction_suggestions "
+                "(term, kind, entity_type, support_count, status, last_seen) "
+                "VALUES (%s,'whitelist','llm_over_redacted',1,'staged',now()) "
+                "ON CONFLICT (term, kind) DO UPDATE SET "
+                "support_count = redaction_suggestions.support_count + 1, last_seen=now()",
+                (original,),
+            )
+        conn.close()
+    except Exception:
+        pass
 
 
 __all__ = [
