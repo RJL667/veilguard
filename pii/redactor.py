@@ -106,10 +106,10 @@ PII_ENTITIES = [
 ]
 
 
-def _load_allow_list() -> list[str]:
-    """Load brand/tech allow_list so Presidio doesn't redact `Docker`,
-    `LibreChat`, etc. as PERSON.  spaCy en_core_web_lg false-positives
-    those at ~0.85 confidence.
+def _load_allow_list_file() -> list[str]:
+    """Load the STATIC allow_list FILE — the immutable fail-safe base so
+    Presidio doesn't redact `Docker`, `LibreChat`, etc. as PERSON (spaCy
+    en_core_web_lg false-positives those at ~0.85).
 
     Search order:
       1. ${PII_ALLOW_LIST_PATH} env override
@@ -130,10 +130,54 @@ def _load_allow_list() -> list[str]:
                     line.strip() for line in f
                     if line.strip() and not line.strip().startswith("#")
                 ]
-            logger.info(f"[pii] loaded {len(terms)} allow_list terms from {p}")
+            logger.info(f"[pii] loaded {len(terms)} allow_list terms from file {p}")
             return terms
     logger.warning("[pii] no allow_list.txt found — brand names may false-positive")
     return []
+
+
+def _load_allow_list_db() -> list[str]:
+    """[ALLOWLIST_DB_OVERLAY_2026-06-07] Active terms from the `pii_allow_list`
+    table — the LIVE, loop-maintained whitelist. Returns [] on ANY failure;
+    the caller always has the file base, so DB problems degrade to file-only
+    (never fail-open, never drop the base). Disable with PII_ALLOWLIST_DB=0.
+    """
+    if os.environ.get("PII_ALLOWLIST_DB", "1").lower() in ("0", "false", "no", "off"):
+        return []
+    try:
+        from .session_store import _PG_DSN
+        import psycopg2
+        conn = psycopg2.connect(_PG_DSN, connect_timeout=3)
+        try:
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute("SELECT term FROM pii_allow_list WHERE active = true")
+            return [r[0] for r in cur.fetchall() if r and r[0]]
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(
+            "[pii] allow_list DB overlay unavailable (%s); file-only this cycle",
+            type(e).__name__,
+        )
+        return []
+
+
+def _load_allow_list() -> list[str]:
+    """file base ∪ DB overlay. The file is the immutable fail-safe; the DB
+    (`pii_allow_list`) holds live/promoted terms. Union => the result is
+    NEVER smaller than the file, so a DB outage can't regress redaction.
+    """
+    base = _load_allow_list_file()
+    overlay = _load_allow_list_db()
+    if overlay:
+        merged = sorted(set(base) | set(overlay))
+        logger.info(
+            "[pii] allow_list = %d file + %d DB overlay = %d total",
+            len(base), len(overlay), len(merged),
+        )
+        return merged
+    return base
 
 
 # ── Redactor ────────────────────────────────────────────────────────────
@@ -253,6 +297,29 @@ class PIIRedactor:
             f"fail_closed={self._fail_closed} clean_skip={self._clean_skip} "
             f"redact_in_render={self._redact_in_render} aid_cache_max={self._aid_cache_max})"
         )
+
+        # [ALLOWLIST_DB_OVERLAY_2026-06-07] Background refresh of the DB overlay
+        # so loop-promoted terms apply WITHOUT a restart. Strictly off the hot
+        # path: a daemon thread reloads every PII_ALLOW_LIST_TTL_S and atomically
+        # swaps self.allow_list (analyze() reads it per-call, so no rebuild).
+        # All failures swallowed → the current list is kept; self.allow_list is
+        # only ever replaced with a non-empty list (>= the file base).
+        self._allow_ttl_s = float(os.environ.get("PII_ALLOW_LIST_TTL_S", "300"))
+        _db_on = os.environ.get("PII_ALLOWLIST_DB", "1").lower() not in ("0", "false", "no", "off")
+        if self._allow_ttl_s > 0 and _db_on:
+            import threading, time as _time
+            def _allow_refresh_loop():
+                while True:
+                    _time.sleep(self._allow_ttl_s)
+                    try:
+                        fresh = _load_allow_list()
+                        if fresh:
+                            self.allow_list = fresh
+                    except Exception:
+                        pass
+            threading.Thread(
+                target=_allow_refresh_loop, daemon=True, name="pii-allowlist-refresh",
+            ).start()
 
     @staticmethod
     def _load_clean_fingerprints() -> tuple:
