@@ -29,6 +29,7 @@ from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
 from presidio_anonymizer import AnonymizerEngine
 
 from .recognizers import (
+    PassportRecognizer,
     SouthAfricanBankAccountRecognizer,
     SouthAfricanIDRecognizer,
     SouthAfricanPhoneRecognizer,
@@ -103,6 +104,7 @@ PII_ENTITIES = [
     "SA_ID_NUMBER",
     "SA_PHONE_NUMBER",
     "SA_BANK_ACCOUNT",
+    "PASSPORT_NUMBER",
 ]
 
 
@@ -208,6 +210,7 @@ class PIIRedactor:
         registry.add_recognizer(SouthAfricanIDRecognizer())
         registry.add_recognizer(SouthAfricanPhoneRecognizer())
         registry.add_recognizer(SouthAfricanBankAccountRecognizer())
+        registry.add_recognizer(PassportRecognizer())
 
         self.analyzer = AnalyzerEngine(registry=registry)
         # [PII_PIPELINE_TRIM_2026_05_29]  THE redaction-speed fix.
