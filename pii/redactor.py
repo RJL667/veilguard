@@ -164,20 +164,20 @@ def _load_allow_list_db() -> list[str]:
 
 
 def _load_allow_list() -> list[str]:
-    """file base ∪ DB overlay. The file is the immutable fail-safe; the DB
-    (`pii_allow_list`) holds live/promoted terms. Union => the result is
-    NEVER smaller than the file, so a DB outage can't regress redaction.
+    """The whitelist is the `pii_allow_list` DB table — the SINGLE source of
+    truth (seeded from the legacy file). The file is now a DISASTER fallback
+    ONLY: used iff the DB is empty/unreachable, so a fully-down DB still never
+    fails open. New/promoted terms go to the DB; the file is frozen.
     """
-    base = _load_allow_list_file()
-    overlay = _load_allow_list_db()
-    if overlay:
-        merged = sorted(set(base) | set(overlay))
-        logger.info(
-            "[pii] allow_list = %d file + %d DB overlay = %d total",
-            len(base), len(overlay), len(merged),
-        )
-        return merged
-    return base
+    db = _load_allow_list_db()
+    if db:
+        logger.info("[pii] allow_list = %d terms from DB (pii_allow_list)", len(db))
+        return db
+    fb = _load_allow_list_file()
+    logger.warning(
+        "[pii] DB allow_list empty/unreachable — FELL BACK to %d file terms", len(fb)
+    )
+    return fb
 
 
 # ── Redactor ────────────────────────────────────────────────────────────
