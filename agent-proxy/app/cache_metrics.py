@@ -338,18 +338,46 @@ def record_from_usage(
     model: str | None = None,
     tier_hints: dict[str, Any] | None = None,
 ) -> None:
-    """Extract usage fields from an Anthropic response.usage dict and
-    record. Safe to call with usage=None (no-op).
+    """Extract usage fields from a response.usage dict and record.
+
+    Handles two shapes:
+      - Anthropic: top-level ``input_tokens`` / ``output_tokens`` /
+        ``cache_creation_input_tokens`` / ``cache_read_input_tokens``.
+      - OpenAI / xAI / Grok: ``prompt_tokens`` / ``completion_tokens``,
+        and cache reads under ``prompt_tokens_details.cached_tokens``.
+        (No explicit creation counter — caching is provider-implicit.)
+
+    Safe to call with usage=None (no-op).
     """
     if not isinstance(usage, dict):
         return
+
+    # Try Anthropic shape first.
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    cache_create = usage.get("cache_creation_input_tokens")
+    cache_read = usage.get("cache_read_input_tokens")
+
+    # Fall back to OpenAI / xAI shape for anything still missing. Most
+    # importantly the cache_read count which lives in a nested dict.
+    if input_tokens is None:
+        input_tokens = usage.get("prompt_tokens")
+    if output_tokens is None:
+        output_tokens = usage.get("completion_tokens")
+    if cache_read is None:
+        details = usage.get("prompt_tokens_details") or {}
+        cache_read = details.get("cached_tokens")
+    # cache_create stays None for OpenAI/xAI — they don't expose a
+    # separate creation counter. Record as 0 if cache_read fired but
+    # create is unknown, so dashboard math (read / total) works.
+
     record_request(
         tenant_id=tenant_id,
         conv_id=conv_id,
         model=model,
-        cache_create=usage.get("cache_creation_input_tokens"),
-        cache_read=usage.get("cache_read_input_tokens"),
-        input_tokens=usage.get("input_tokens"),
-        output_tokens=usage.get("output_tokens"),
+        cache_create=cache_create,
+        cache_read=cache_read,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
         tier_hints=tier_hints,
     )
