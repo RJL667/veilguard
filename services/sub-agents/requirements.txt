@@ -1,2 +1,7 @@
 mcp[cli]>=1.0.0
 httpx>=0.28.0
+
+# Host-side document tools (tools/host_docs.py): create_pdf / create_xlsx / read_pdf / read_xlsx
+reportlab>=4.0
+openpyxl>=3.1
+PyMuPDF>=1.24

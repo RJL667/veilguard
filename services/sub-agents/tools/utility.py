@@ -93,8 +93,13 @@ def register(mcp):
         async with httpx.AsyncClient(timeout=5) as client:
             for name, url in services:
                 try:
-                    resp = await client.get(url)
-                    lines.append(f"- **{name}**: {'UP' if resp.status_code < 400 else 'DEGRADED'} ({resp.status_code})")
+                    # stream() + status only — never read the body. SSE
+                    # endpoints (/sse) hold the connection open indefinitely, so
+                    # a plain client.get() blocks until the timeout and gets
+                    # mis-reported as DOWN even when the service is healthy.
+                    async with client.stream("GET", url) as resp:
+                        code = resp.status_code
+                    lines.append(f"- **{name}**: {'UP' if code < 400 else 'DEGRADED'} ({code})")
                 except Exception:
                     lines.append(f"- **{name}**: DOWN")
 

@@ -199,3 +199,89 @@ def register(mcp):
             return f"Created XLSX {rp} ({ws.max_row} rows, sheet {sheet_name!r})"
         except Exception as e:
             return f"Error creating XLSX: {e}"
+
+    @mcp.tool()
+    async def create_pdf(path: str, content: str, title: str = "") -> str:
+        """Create a PDF document ON the user's WINDOWS machine.
+
+        USE THIS — not the container 'documents' tools, and WITHOUT any
+        Host-Exec dependency — to write a .pdf straight onto the user's
+        filesystem, e.g. 'C:/Users/rudol/Downloads/report.pdf'. Runs on the
+        host with reportlab. This is the PDF counterpart to create_xlsx.
+
+        Args:
+            path: Output PDF path (absolute Windows path or relative to the user's home).
+            content: Body as light markdown, parsed per line: '# '/'## '/'### '
+                     headings, '- ' or '* ' bullets, blank line = spacer,
+                     '**bold**' inline; anything else = a paragraph.
+            title: Optional title rendered as a large heading on page 1.
+        """
+        import html as _html
+        import re as _re2
+        rp, err = _resolve_write(path)
+        if err:
+            return err
+        if rp.suffix.lower() != ".pdf":
+            rp = rp.with_suffix(".pdf")
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import cm
+            from reportlab.lib import colors
+            from reportlab.platypus import (SimpleDocTemplate, Paragraph,
+                                            Spacer, HRFlowable)
+        except Exception as e:
+            return f"Error: PDF writer (reportlab) unavailable on host: {e}"
+
+        def _inline(s: str) -> str:
+            s = _html.escape(s, quote=False)
+            return _re2.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+
+        styles = getSampleStyleSheet()
+        body = ParagraphStyle("CRBody", parent=styles["BodyText"], fontSize=10.5, leading=15, spaceAfter=6)
+        h1 = ParagraphStyle("CRH1", parent=styles["Heading1"], fontSize=16, spaceBefore=10, spaceAfter=6)
+        h2 = ParagraphStyle("CRH2", parent=styles["Heading2"], fontSize=13, spaceBefore=8, spaceAfter=4)
+        h3 = ParagraphStyle("CRH3", parent=styles["Heading3"], fontSize=11.5, spaceBefore=6, spaceAfter=3)
+        bul = ParagraphStyle("CRBul", parent=body, leftIndent=14, bulletIndent=2, spaceAfter=3)
+        ttl = ParagraphStyle("CRTitle", parent=styles["Title"], fontSize=22, spaceAfter=4)
+
+        story = []
+        if title.strip():
+            story.append(Paragraph(_inline(title.strip()), ttl))
+            story.append(HRFlowable(width="100%", thickness=1.2, color=colors.HexColor("#444444"), spaceAfter=10))
+        for raw in (content or "").replace("\r\n", "\n").split("\n"):
+            s = raw.strip()
+            if not s:
+                story.append(Spacer(1, 6)); continue
+            if s.startswith("### "):
+                story.append(Paragraph(_inline(s[4:]), h3))
+            elif s.startswith("## "):
+                story.append(Paragraph(_inline(s[3:]), h2))
+            elif s.startswith("# "):
+                story.append(Paragraph(_inline(s[2:]), h1))
+            elif s[:2] in ("- ", "* "):
+                story.append(Paragraph(_inline(s[2:]), bul, bulletText="•"))
+            else:
+                story.append(Paragraph(_inline(s), body))
+        if not story:
+            story.append(Paragraph("(empty document)", body))
+
+        def _footer(canvas, doc_):
+            canvas.saveState()
+            canvas.setFont("Helvetica", 8)
+            canvas.setFillColor(colors.HexColor("#888888"))
+            canvas.drawRightString(A4[0] - 2 * cm, 1.2 * cm, f"Page {doc_.page}")
+            canvas.restoreState()
+
+        try:
+            doc = SimpleDocTemplate(str(rp), pagesize=A4, leftMargin=2 * cm,
+                                    rightMargin=2 * cm, topMargin=2 * cm,
+                                    bottomMargin=2 * cm, title=(title.strip() or rp.stem))
+            doc.build(story, onFirstPage=_footer, onLaterPages=_footer)
+        except Exception as e:
+            return f"Error creating PDF: {e}"
+        try:
+            size = rp.stat().st_size
+        except Exception:
+            size = 0
+        return f"Created PDF {rp} ({size} bytes)"
