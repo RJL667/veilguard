@@ -39,8 +39,8 @@ INSTALLER_DIR = HERE / "installer_output"
 MANIFEST_LOCAL = INSTALLER_DIR / "version.json"
 
 # Remote targets (GCE VM)
-VM_NAME = "veilguard-prod"
-VM_ZONE = "us-central1-a"
+VM_NAME = os.environ.get("VEILGUARD_VM_NAME", "veilguard-prod-jnb")
+VM_ZONE = os.environ.get("VEILGUARD_VM_ZONE", "africa-south1-a")
 REMOTE_DIR = "/home/rudol/veilguard/downloads"
 
 
