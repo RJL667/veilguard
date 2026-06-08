@@ -176,9 +176,11 @@ mcpServers:
     args:
       - "/app/mcp-tools/image/server.py"
 
-  # Web: Google Custom Search + URL fetching + HTML-to-markdown.
-  # Uses GOOGLE_CSE_KEY + GOOGLE_CSE_ID from .env — both live under the
-  # admin@phishield.com GCP project and Programmable Search Engine.
+  # Web: Gemini google_search grounding + URL fetching + HTML-to-markdown.
+  # Uses GOOGLE_API_KEY (AI Studio / Gemini key). It MUST be passed explicitly
+  # via the env block below — stdio MCP subprocesses do NOT inherit the
+  # container env, so without this the server reports "web search is not
+  # configured" even though the api container has GOOGLE_API_KEY set.
   # Stdio spawn (like documents/image) — lives inside the LibreChat
   # container so the Agents endpoint can dispatch google_search alongside
   # the other MCP tools.
@@ -187,6 +189,8 @@ mcpServers:
     command: python
     args:
       - "/app/mcp-tools/web/server.py"
+    env:
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY}"
 
   # Veilguard MCP: search_memory + traverse_memory — TCMM-backed
   # tools exposed via the dedicated MCP server on host:8812.
