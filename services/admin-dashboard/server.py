@@ -294,6 +294,12 @@ async def api_redactions_suspected_misses(
     )
 
 
+@app.get("/api/nlp/errors")
+async def api_nlp_errors(limit: int = 40, user=Depends(require_admin)):
+    """Recent NLP worker errors (nlp_error_log) for the spot-check panel."""
+    return await asyncio.to_thread(pii_audit_stats.nlp_errors, limit)
+
+
 @app.get("/api/messages/per-user")
 async def api_messages_per_user(
     window: Optional[str] = "24h",

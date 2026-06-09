@@ -749,6 +749,40 @@ def suspected_pii_misses(
     return out[:limit]
 
 
+def nlp_errors(limit: int = 40) -> dict[str, Any]:
+    """Recent NLP worker errors from nlp_error_log + a count-by-kind summary,
+    for the 'see NLP worker errors' panel. Fully-shaped empty result on the
+    Lance backend or any error."""
+    out: dict[str, Any] = {"recent": [], "by_kind": {}, "total": 0}
+    if not _PG:
+        return out
+    import psycopg2
+    try:
+        conn = psycopg2.connect(_AUDIT_DSN)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT error_kind, count(*) FROM nlp_error_log GROUP BY 1 ORDER BY 2 DESC")
+                out["by_kind"] = {(k or "?"): int(c) for k, c in cur.fetchall()}
+                out["total"] = sum(out["by_kind"].values())
+                cur.execute(
+                    "SELECT extract(epoch FROM ts), aid, stage, error_kind, finish_reason, "
+                    "left(detail,160), left(text_snippet,100) FROM nlp_error_log "
+                    "ORDER BY ts DESC NULLS LAST LIMIT %s", [int(limit)])
+                for ts, aid, stage, kind, fr, detail, snip in cur.fetchall():
+                    out["recent"].append({
+                        "ts": float(ts) if ts is not None else None,
+                        "aid": aid, "stage": stage, "error_kind": kind,
+                        "finish_reason": fr, "detail": detail or "",
+                        "snippet": " ".join((snip or "").split())[:100],
+                    })
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("nlp_errors failed: %s", e)
+    return out
+
+
 def messages_per_user(
     window_hours: Optional[int] = 24,
     top_n: int = 50,

@@ -556,6 +556,35 @@
     </div>
   </section>
 
+  <!-- ─── ROW: NLP WORKER ERRORS (nlp_error_log) ──────────────────────── -->
+  <section class="rounded-xl bg-bg-900 border border-line shadow-card p-5 mb-5">
+    <div class="flex items-baseline justify-between mb-3">
+      <h2 class="text-sm font-semibold text-text-hi tracking-wide">NLP WORKER ERRORS</h2>
+      <span class="text-[11px]" :class="(nlpErrors.total || 0) ? 'text-warn' : 'text-em'"
+            x-text="(nlpErrors.total || 0) ? ((nlpErrors.total) + ' logged') : '✓ none'"></span>
+    </div>
+    <p class="text-[10px] text-text-lo mb-2">Rows where NLP enrichment failed (breaker open / 429 / 5xx / empty Gemini output). Empty = workers healthy. Transient failures re-enrich automatically when AI-Studio recovers.</p>
+    <div class="flex flex-wrap gap-2 mb-3 text-[10px]" x-show="Object.keys(nlpErrors.by_kind || {}).length">
+      <template x-for="(c, k) in (nlpErrors.by_kind || {})" :key="k">
+        <span class="font-mono px-1.5 py-0.5 rounded bg-warn/15 text-warn" x-text="k + ' · ' + c"></span>
+      </template>
+    </div>
+    <div class="max-h-64 overflow-y-auto text-[11px]">
+      <template x-for="(e, i) in (nlpErrors.recent || [])" :key="i">
+        <div class="flex items-center gap-2 py-1 border-t border-line/30">
+          <span class="font-mono px-1.5 py-0.5 rounded bg-warn/15 text-warn" x-text="e.error_kind"></span>
+          <span class="text-text-lo" x-text="e.stage"></span>
+          <span class="text-text-mid font-mono" x-text="'aid ' + e.aid"></span>
+          <span class="text-text-mid truncate" x-text="e.snippet"></span>
+          <span class="ml-auto text-text-lo whitespace-nowrap" x-text="fmtTime(e.ts)"></span>
+        </div>
+      </template>
+      <template x-if="!(nlpErrors.recent || []).length">
+        <div class="py-3 text-center text-em">✓ no NLP worker errors logged</div>
+      </template>
+    </div>
+  </section>
+
   <!-- ─── ROW: PROMPT CACHE (window-scoped) ───────────────────────────── -->
   <section class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
 
@@ -952,6 +981,7 @@ function dashboard() {
     recent: [],
     recentBlocks: [],
     suspectedMisses: [],
+    nlpErrors: { recent: [], by_kind: {}, total: 0 },
     users: { summary: {}, users: [] },
     messagesPerUser: [],
 
@@ -1029,7 +1059,7 @@ function dashboard() {
     async refreshAll() {
       try {
         const qs = this._qs();
-        const [h, r, ho, nl, l, ro, rr, mpu, us, ca, bl, pm] = await Promise.all([
+        const [h, r, ho, nl, l, ro, rr, mpu, us, ca, bl, pm, ne] = await Promise.all([
           this._j('api/health'),
           this._j('api/recall-perf'),
           this._j('api/host'),
@@ -1042,6 +1072,7 @@ function dashboard() {
           this._j('api/cache/overview?' + qs),
           this._j('api/blocks/recent?limit=40'),
           this._j('api/redactions/suspected-misses?limit=40&' + qs),
+          this._j('api/nlp/errors?limit=40'),
         ]);
         this.health = h; this.recall = r; this.host = ho; this.nlp = nl; this.lance = l;
         this.redact = ro; this.recent = rr;
@@ -1050,6 +1081,7 @@ function dashboard() {
         this.cache = ca;
         this.recentBlocks = bl || [];
         this.suspectedMisses = pm || [];
+        this.nlpErrors = ne || { recent: [], by_kind: {}, total: 0 };
         this.lastUpdate = new Date().toLocaleTimeString();
         this._renderCharts();
       } catch (e) { console.error(e); }
