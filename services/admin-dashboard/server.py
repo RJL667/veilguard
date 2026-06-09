@@ -268,6 +268,32 @@ async def api_redactions_recent(
     return rows
 
 
+@app.get("/api/blocks/recent")
+async def api_blocks_recent(
+    limit: int = 40,
+    user=Depends(require_admin),
+):
+    """Recent TCMM archive blocks + block_class — classification spot-check."""
+    return await asyncio.to_thread(pii_audit_stats.recent_blocks, limit)
+
+
+@app.get("/api/redactions/suspected-misses")
+async def api_redactions_suspected_misses(
+    limit: int = 40,
+    window: Optional[str] = "24h",
+    start_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    user_id: Optional[str] = None,
+    user=Depends(require_admin),
+):
+    """Raw PII the redactor MISSED in recent TO_LLM content (gap scanner)."""
+    s, e = _resolve_window(window, start_ts, end_ts)
+    return await asyncio.to_thread(
+        pii_audit_stats.suspected_pii_misses,
+        limit, start_ts=s, end_ts=e, user_id=user_id,
+    )
+
+
 @app.get("/api/messages/per-user")
 async def api_messages_per_user(
     window: Optional[str] = "24h",

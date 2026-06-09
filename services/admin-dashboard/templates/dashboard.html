@@ -503,6 +503,59 @@
     </div>
   </section>
 
+  <!-- ─── ROW: SPOT-CHECK · classification + redaction gaps ───────────── -->
+  <section class="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
+
+    <!-- Block-class spot-check: ground truth of what TCMM stored each turn as -->
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">CLASSIFICATION SPOT-CHECK</h2>
+        <span class="text-[11px] text-text-lo" x-text="(recentBlocks || []).length + ' recent blocks'"></span>
+      </div>
+      <div class="max-h-72 overflow-y-auto text-[11px]">
+        <table class="w-full">
+          <thead class="text-text-lo sticky top-0 bg-bg-900">
+            <tr><th class="text-left pb-1 pr-2">block_class</th><th class="text-left pb-1 pr-2">rec?</th><th class="text-left pb-1">preview</th></tr>
+          </thead>
+          <tbody>
+            <template x-for="b in (recentBlocks || [])" :key="b.aid">
+              <tr class="border-t border-line/30">
+                <td class="py-1 pr-2 align-top"><span class="font-mono px-1.5 py-0.5 rounded bg-text-lo/15 text-text-hi" x-text="b.block_class"></span></td>
+                <td class="py-1 pr-2 align-top" :class="b.recallable ? 'text-em' : 'text-text-lo'" x-text="b.recallable ? '✓' : '·'"></td>
+                <td class="py-1 text-text-mid align-top" x-text="b.preview"></td>
+              </tr>
+            </template>
+            <template x-if="!(recentBlocks || []).length">
+              <tr><td colspan="3" class="py-3 text-center text-text-lo">no blocks</td></tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Suspected MISSED PII: unredacted PII shapes left in the prompt -->
+    <div class="rounded-xl bg-bg-900 border border-line shadow-card p-5">
+      <div class="flex items-baseline justify-between mb-3">
+        <h2 class="text-sm font-semibold text-text-hi tracking-wide">SUSPECTED MISSED PII · <span x-text="windowLabel()"></span></h2>
+        <span class="text-[11px]" :class="(suspectedMisses || []).length ? 'text-warn' : 'text-em'"
+              x-text="(suspectedMisses || []).length ? ((suspectedMisses || []).length + ' flagged') : '✓ none'"></span>
+      </div>
+      <p class="text-[10px] text-text-lo mb-2">Unambiguous PII shapes still in plain text AFTER redaction — i.e. the redactor missed them. Review for allow/deny-list gaps.</p>
+      <div class="max-h-64 overflow-y-auto text-[11px]">
+        <template x-for="(m, i) in (suspectedMisses || [])" :key="i">
+          <div class="flex items-center gap-2 py-1 border-t border-line/30">
+            <span class="font-mono px-1.5 py-0.5 rounded bg-warn/15 text-warn" x-text="m.type"></span>
+            <span class="font-mono text-text-hi truncate" x-text="m.snippet"></span>
+            <span class="ml-auto text-text-lo whitespace-nowrap" x-text="fmtConvId(m.conversation_id)"></span>
+          </div>
+        </template>
+        <template x-if="!(suspectedMisses || []).length">
+          <div class="py-3 text-center text-em">✓ no suspected unredacted PII in window</div>
+        </template>
+      </div>
+    </div>
+  </section>
+
   <!-- ─── ROW: PROMPT CACHE (window-scoped) ───────────────────────────── -->
   <section class="grid grid-cols-1 lg:grid-cols-3 gap-5 mb-5">
 
@@ -897,6 +950,8 @@ function dashboard() {
     redact: {},
     cache: {},
     recent: [],
+    recentBlocks: [],
+    suspectedMisses: [],
     users: { summary: {}, users: [] },
     messagesPerUser: [],
 
@@ -974,7 +1029,7 @@ function dashboard() {
     async refreshAll() {
       try {
         const qs = this._qs();
-        const [h, r, ho, nl, l, ro, rr, mpu, us, ca] = await Promise.all([
+        const [h, r, ho, nl, l, ro, rr, mpu, us, ca, bl, pm] = await Promise.all([
           this._j('api/health'),
           this._j('api/recall-perf'),
           this._j('api/host'),
@@ -985,12 +1040,16 @@ function dashboard() {
           this._j('api/messages/per-user?' + qs),
           this._j('api/users?' + this._windowOnlyQs()),
           this._j('api/cache/overview?' + qs),
+          this._j('api/blocks/recent?limit=40'),
+          this._j('api/redactions/suspected-misses?limit=40&' + qs),
         ]);
         this.health = h; this.recall = r; this.host = ho; this.nlp = nl; this.lance = l;
         this.redact = ro; this.recent = rr;
         this.messagesPerUser = mpu.rows || [];
         this.users = us;
         this.cache = ca;
+        this.recentBlocks = bl || [];
+        this.suspectedMisses = pm || [];
         this.lastUpdate = new Date().toLocaleTimeString();
         this._renderCharts();
       } catch (e) { console.error(e); }

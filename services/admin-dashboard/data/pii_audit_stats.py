@@ -659,6 +659,96 @@ def request_detail(aid: int) -> dict[str, Any]:
     }
 
 
+# ── [SPOT_CHECK_2026-06-09] block-class view + redaction-gap scanner ──
+# UNAMBIGUOUS PII shapes only (no name guessing) so false positives stay
+# low. A match in POST-redaction audit content means the redactor missed it.
+_MISS_PATTERNS = [
+    ("EMAIL",       re.compile(r"[\w.+-]+@[\w-]+\.[\w][\w.-]*")),
+    ("SA_PHONE",    re.compile(r"(?<!\d)(?:\+27|0)\d{9}(?!\d)")),
+    ("SA_ID",       re.compile(r"(?<!\d)\d{13}(?!\d)")),
+    ("CREDIT_CARD", re.compile(r"(?<!\d)(?:\d[ -]?){15,16}\d(?!\d)")),
+]
+
+
+def recent_blocks(limit: int = 40) -> list[dict[str, Any]]:
+    """Recent TCMM archive blocks + block_class, for spot-checking how each
+    turn was classified. Reads v_archive on the SAME Postgres as pii_audit.
+    Fully-shaped [] on the Lance backend or any error."""
+    if not _PG:
+        return []
+    import psycopg2
+    out: list[dict[str, Any]] = []
+    try:
+        conn = psycopg2.connect(_AUDIT_DSN)
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT aid, namespace, user_id, block_class, recallable, "
+                    "left(text, 200) AS preview, created_ts FROM v_archive "
+                    "ORDER BY created_ts DESC NULLS LAST LIMIT %s",
+                    [int(limit)],
+                )
+                for aid, ns, uid, bc, rec, prev, ts in cur.fetchall():
+                    out.append({
+                        "aid": aid,
+                        "conversation_id": ns,
+                        "user_id": uid,
+                        "block_class": bc or "(unclassified)",
+                        "recallable": bool(rec),
+                        "preview": " ".join((prev or "").split())[:140],
+                        "created_ts": float(ts) if ts is not None else None,
+                    })
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("recent_blocks failed: %s", e)
+    return out
+
+
+def suspected_pii_misses(
+    limit: int = 40,
+    *,
+    start_ts: Optional[float] = None,
+    end_ts: Optional[float] = None,
+    user_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Scan recent TO_LLM audit content for raw PII the redactor MISSED.
+
+    Content is POST-redaction (real PII -> REF_* tokens), so any unambiguous
+    PII shape still present as plain text is a redaction gap. One row per
+    (turn, suspected token). REF_* tokens never match these patterns."""
+    s, e, sub = _windowed_rows(start_ts, end_ts, None, user_id)
+    if sub is None:
+        return []
+    dirs = sub.column("direction").to_pylist()
+    contents = sub.column("content").to_pylist()
+    convs = sub.column("conversation_id").to_pylist()
+    users = sub.column("user_id").to_pylist()
+    tss = sub.column("created_at").to_pylist()
+    out: list[dict[str, Any]] = []
+    for d, c, conv, uid, ts in zip(dirs, contents, convs, users, tss):
+        if d != "TO_LLM" or not c:
+            continue
+        seen: set = set()
+        for kind, pat in _MISS_PATTERNS:
+            for m in pat.finditer(c):
+                tok = m.group(0).strip()
+                if not tok or tok in seen:
+                    continue
+                seen.add(tok)
+                out.append({
+                    "type": kind,
+                    "snippet": tok[:80],
+                    "conversation_id": conv,
+                    "user_id": uid,
+                    "created_ts": float(ts) if ts is not None else None,
+                })
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
 def messages_per_user(
     window_hours: Optional[int] = 24,
     top_n: int = 50,
