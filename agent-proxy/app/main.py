@@ -5421,26 +5421,45 @@ async def gateway(request: Request, path: str):
                     full_rehydrated = full_raw
                 full_content = full_rehydrated  # for audit/TCMM below
 
-                # Detect trailing heatmap JSON: scan backwards for the
-                # last "{" that opens a valid dict with knowledge_class
-                # or used.
+                # [GROK_HEATMAP_FENCE_STRIP_2026-06-09] Detect trailing
+                # tcmm_record_turn JSON the model narrated into content. Grok
+                # emits it as a ```json fenced block at the END with NO tool
+                # name, so neither the tool_call extractor nor the name-based
+                # narration stripper catches it. Scan backwards for the last
+                # "{" that BEGINS a dict with knowledge_class/emit_class/used.
+                # Use raw_decode (NOT json.loads) so a trailing code fence
+                # ("```") or any text after the object doesn't defeat the parse
+                # — that trailing "```" was exactly what made json.loads throw
+                # and let the JSON leak into the answer.
                 heatmap_start = -1
+                _dec = json.JSONDecoder()
                 search_from = len(full_rehydrated)
                 while search_from > 0:
                     pos = full_rehydrated.rfind("{", 0, search_from)
                     if pos < 0:
                         break
-                    candidate_str = full_rehydrated[pos:].strip()
                     try:
-                        candidate = json.loads(candidate_str)
+                        candidate, _ = _dec.raw_decode(full_rehydrated[pos:].lstrip())
                         if isinstance(candidate, dict) and (
-                            "knowledge_class" in candidate or "used" in candidate
+                            "knowledge_class" in candidate
+                            or "emit_class" in candidate
+                            or "used" in candidate
                         ):
                             heatmap_start = pos
                             break
                     except (json.JSONDecodeError, ValueError):
                         pass
                     search_from = pos  # try an earlier {
+
+                # Back up over an opening code fence (```json / ```) +
+                # whitespace right before the JSON, so the client never sees a
+                # dangling fence opener either.
+                if heatmap_start > 0:
+                    _pre = full_rehydrated[:heatmap_start].rstrip()
+                    for _fence in ("```json", "```"):
+                        if _pre.endswith(_fence):
+                            heatmap_start = len(_pre) - len(_fence)
+                            break
 
                 # Decide what visible-answer text the client should see.
                 if heatmap_start >= 0:
