@@ -1061,6 +1061,40 @@ def _extract_client_tools(data: dict) -> list:
     return list(t) if isinstance(t, list) else []
 
 
+def _tools_audit_section(tools) -> str:
+    """Render native tool definitions as a LEAN, audit-only ``[TOOLS]`` block.
+
+    The MODEL receives tools via the native ``tools`` API field, untouched —
+    this text is ONLY for the admin dashboard's TOOLS section + token
+    accounting. The dashboard parses the audit ``content``, which stopped
+    carrying tool schemas when they moved to the native field (so the TOOLS
+    section read empty and the per-section token math lost them). We show each
+    tool's name + 1-line description, headed by the REAL token cost of the full
+    schemas so the section reconciles with the API's total ``input_tokens``.
+    Returns "" when there are no tools.
+    """
+    if not tools:
+        return ""
+    try:
+        _full = json.dumps(tools, separators=(",", ":"), ensure_ascii=False)
+        _tok = max(1, len(_full) // 4)  # ~4 chars/token (no tokenizer in-proc)
+    except Exception:
+        _tok = 0
+    _lines = [
+        f"[TOOLS]  ({len(tools)} tools · ~{_tok} tokens · sent via the native "
+        f"function-calling field, NOT prompt text)"
+    ]
+    for _t in tools:
+        if not isinstance(_t, dict):
+            continue
+        _fn = _t.get("function") if isinstance(_t.get("function"), dict) else _t
+        _name = _fn.get("name") or _t.get("name") or "?"
+        _desc = _fn.get("description") or _t.get("description") or ""
+        _desc = " ".join(str(_desc).split())[:100]
+        _lines.append(f"  • {_name}: {_desc}")
+    return "\n".join(_lines)
+
+
 def _trim_to_current_turn(messages: list) -> list:
     """Drop every message before the latest user turn — they're already in
     TCMM memory blocks and re-sending them doubles the prompt.
@@ -3078,8 +3112,10 @@ async def _handle_sso_request(
     # memory wasn't being injected, which was misleading.
     try:
         _sys_text = j.get("sys_prompt_text") or ""
+        _tools_sec = _tools_audit_section(_sso_tools)
         _to_llm_full = (
             (f"[SYSTEM]\n{_sys_text}\n\n" if _sys_text else "")
+            + (f"{_tools_sec}\n\n" if _tools_sec else "")
             + f"[USER]\n{_redacted_msg}"
         )
         _sso_audit_record(
@@ -4703,6 +4739,14 @@ async def gateway(request: Request, path: str):
                     else:
                         _sys_rendered = str(_redacted_system)
                     _audit_text_parts.append(f"[SYSTEM]\n{_sys_rendered}")
+                # [TOOLS_AUDIT_SECTION_2026-06-09] Re-attach the native tools to
+                # the audit copy (the model still gets them via the native
+                # ``tools`` field, untouched). Lets the admin dashboard show the
+                # TOOLS section + account their tokens, which broke when tool
+                # schemas left the prompt text for the native field.
+                _tools_sec = _tools_audit_section(redacted.get("tools"))
+                if _tools_sec:
+                    _audit_text_parts.append(_tools_sec)
                 for _m in _redacted_messages:  # ALL messages, not last 3
                     _role = _m.get("role", "?")
                     _content = _m.get("content", "")

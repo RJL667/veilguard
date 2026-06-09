@@ -1357,7 +1357,13 @@ function dashboard() {
       if (!c) return [];
       const sysI   = c.indexOf('[SYSTEM]');
       const toolsI = c.indexOf('[TOOLS]');
-      const msgI   = c.indexOf('[MESSAGES]');
+      let   msgI   = c.indexOf('[MESSAGES]');
+      // [USER_BOUNDARY_2026-06-09] The SSO + streaming audits delimit the
+      // prompt body with [USER] (not [MESSAGES]); treat the first [USER] as
+      // the messages boundary so the injected [TOOLS] section ends correctly
+      // and a MESSAGES section appears instead of everything collapsing into
+      // SYSTEM.
+      if (msgI < 0) msgI = c.indexOf('[USER]');
       const sysStart = sysI >= 0 ? sysI : 0;
       const sysEnd   = toolsI >= 0 ? toolsI : (msgI >= 0 ? msgI : c.length);
       const sys = c.slice(sysStart, sysEnd);
