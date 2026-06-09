@@ -3183,6 +3183,24 @@ async def _handle_sso_request(
     except Exception as _e:
         logger.debug("[SSO] post_response schedule failed: %s", _e)
 
+    # [SSO_BLOCK_REHYDRATE_2026-06-09] The scalar `text` is rehydrated above
+    # (~line 3098), but BOTH branches below forward the CONTENT BLOCKS
+    # (_gen_cleaned_content) — and on the streaming branch the blocks' text is
+    # what the user actually sees. Those blocks were only heatmap-stripped,
+    # never rehydrated, so REF_PERSON_N leaked into replies ("Noted,
+    # REF_PERSON_1."). Rehydrate the text blocks here, once, with the SAME
+    # _pii_sid used for redaction, so both stream + non-stream paths show real
+    # names.
+    try:
+        if _gen_cleaned_content:
+            _gen_cleaned_content = [
+                ({**b, "text": _redactor.rehydrate_text(b.get("text", "") or "", _pii_sid)}
+                 if isinstance(b, dict) and b.get("type") == "text" else b)
+                for b in _gen_cleaned_content
+            ]
+    except Exception as _re:
+        logger.warning("[SSO] content-block rehydrate failed: %s", _re)
+
     if is_stream:
         # [STREAM_TOOL_USE_2026_05_20] forward full content blocks
         # (text + tool_use) and stop_reason so the SSE stream carries
