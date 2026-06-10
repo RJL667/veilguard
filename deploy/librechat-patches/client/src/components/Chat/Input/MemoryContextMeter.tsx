@@ -41,6 +41,10 @@ interface MemoryStatus {
   context_window?: number;
   budget_tokens?: number;
   total_tokens: number;
+  // Exact provider-billed input tokens for the last turn (new +
+  // cache_read + cache_create) — the same figure the admin dashboard
+  // shows. Preferred as the headline; tier bars stay estimates.
+  last_turn_input_tokens?: number;
   tiers: Record<string, TierStat>;
 }
 
@@ -275,7 +279,7 @@ export default function MemoryContextMeter({
     volatile: volatile_,
   };
 
-  const total = data.total_tokens;
+  const total = data.last_turn_input_tokens || data.total_tokens;
   const pct = Math.min(100, (total / window_) * 100);
   const pctLabel = pct < 1 ? '<1' : Math.round(pct);
 

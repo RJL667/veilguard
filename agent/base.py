@@ -1009,6 +1009,10 @@ class Agent(ABC):
             _cid, _uid, _mdl = ctx.conversation_id, ctx.user_id, result.model
             _fobj = flag_obj or None
             _um, _at = raw_user_msg, raw_text
+            # Exact billed usage for this turn — TCMM stamps it on the
+            # session so the context meter reports provider-truth input
+            # tokens instead of chars/CPT estimates.
+            _usage = result.usage if isinstance(getattr(result, "usage", None), dict) else None
             _rk_inval = (_cid, _uid, self.persona.agent_id)
             async def _deferred_ingest():
                 if _um:
@@ -1038,7 +1042,10 @@ class Agent(ABC):
                             f"flush errors. Storing as-is."
                         )
                 if _at_final:
-                    await ingest_assistant(_cid, _uid, _at_final, model=_mdl, flag_obj=_fobj)
+                    await ingest_assistant(
+                        _cid, _uid, _at_final,
+                        model=_mdl, flag_obj=_fobj, usage=_usage,
+                    )
                 # [RENDER_CACHE_FRESH_2026_06_01] This turn's prompt + reply
                 # just landed in TCMM live memory. Drop the cached render for
                 # this (conv,user,agent) so the NEXT turn RE-RENDERS and the

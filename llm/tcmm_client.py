@@ -290,6 +290,7 @@ async def ingest_assistant(
     *,
     model: str = "",
     flag_obj: Optional[dict] = None,
+    usage: Optional[dict] = None,
 ) -> None:
     """Ingest the assistant reply into TCMM memory.  Best-effort.
 
@@ -297,6 +298,9 @@ async def ingest_assistant(
     flag_obj carries shadow-tool metadata if the model emitted a
     `tcmm_record_turn` tool_use this turn (see
     architecture_universal_shadow_tool memory).
+    usage is the provider-billed token usage for this turn
+    ({input_tokens, cache_read_input_tokens, ...}) — TCMM stamps it on
+    the session so the context meter can show exact input tokens.
     """
     if not conv_id or not assistant_text:
         return
@@ -310,6 +314,8 @@ async def ingest_assistant(
         body["model"] = model
     if flag_obj and isinstance(flag_obj, dict):
         body["flag_obj"] = flag_obj
+    if usage and isinstance(usage, dict):
+        body["usage"] = usage
     if _tcmm_unreachable():
         return
     try:

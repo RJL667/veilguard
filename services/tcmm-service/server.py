@@ -887,6 +887,12 @@ class PostResponseBody(BaseModel):
     # nothing). Shape: {used, knowledge_class, epoch_complete,
     # emit_class}. Empty dict = legacy path (parse from raw_output).
     flag_obj: dict = {}
+    # [METER_EXACT_USAGE_2026-06-11] Provider-billed usage for the turn
+    # ({input_tokens, cache_read_input_tokens, cache_creation_input_tokens,
+    # output_tokens}), shipped by the agent path's ingest_assistant.
+    # Stamped on the session so /memory_status reports exact input
+    # tokens instead of chars/CPT estimates.
+    usage: dict = {}
 
 
 class IngestTurnBody(BaseModel):
@@ -1155,8 +1161,19 @@ def _live_tier_of(block) -> str:
     return "working"
 
 
+# Chars-per-token divisor for the context meter's real-token estimates.
+# Calibrated against Anthropic count_tokens on the live prompt shape
+# (prose + compact-JSON tool schemas); override per-deploy if the mix
+# changes. NOT used by TCMM's internal budget economy (word-based).
+_METER_CPT = float(os.environ.get("TCMM_METER_CHARS_PER_TOKEN", "3.7") or 3.7)
+
+
+def _est_tokens(chars: int) -> int:
+    return int(chars / _METER_CPT) if chars > 0 else 0
+
+
 def _display_tokens(b) -> int:
-    """Real-token ESTIMATE for the context meter (chars/4).
+    """Real-token ESTIMATE for the context meter (chars/CPT).
 
     TCMM's ``block.token_count`` is ``len(text.split())`` — WORDS — which
     is what the internal budget economy is calibrated on, but the meter
@@ -1164,15 +1181,35 @@ def _display_tokens(b) -> int:
     Word counts understate ~1.3x on prose and ~5x on the compact-JSON
     tool-definition pin (no whitespace), which made the meter read 10.5k
     while the dashboard showed 28.8k input for the same turn (2026-06-11).
-    chars/4 is the standard Anthropic heuristic and tracks both shapes.
     """
     try:
         t = getattr(b, "text", "") or ""
         if t:
-            return max(1, len(t) // 4)
+            return max(1, _est_tokens(len(t)))
     except Exception:
         pass
     return int(getattr(b, "token_count", 0) or 0)
+
+
+def _stash_meter_snapshot(tcmm, prompt_chars: int, tier_chars: dict, tools_chars: int) -> None:
+    """Record the LAST RENDER's true composition for /memory_status.
+
+    Raw block-text sums miss everything the renderer adds around the
+    blocks — per-block labels, date stamps, section headers, recall
+    group headers, dream-anchor/principles boot blocks — which left the
+    meter ~13k under the dashboard's billed input (2026-06-11). The
+    rendered per-tier byte sizes ARE the prompt, so the meter serves
+    this snapshot when one exists. Best-effort: never breaks a render.
+    """
+    try:
+        tcmm._vg_meter_snapshot = {
+            "ts": time.time(),
+            "prompt_chars": int(prompt_chars or 0),
+            "tier_chars": dict(tier_chars or {}),
+            "tools_chars": int(tools_chars or 0),
+        }
+    except Exception:
+        pass
 
 
 @app.get("/memory_status")
@@ -1242,13 +1279,55 @@ async def memory_status(conversation_id: str, user_id: str = ""):
         tiers["volatile"]["max_blocks"] = int(getattr(_C2, "VOLATILE_MAX_BLOCKS", 50))
         tiers["shadow"]["max_blocks"] = int(getattr(_C2, "RECALL_SHADOW_MAX_BLOCKS", 15))
 
-        total = sum(d["tokens"] for d in tiers.values())
+        # Overlay the last render's TRUE composition when available: the
+        # rendered tier sizes include labels/headers/anchors/framing that
+        # raw block-text sums miss (see _stash_meter_snapshot). Block
+        # counts + heat stay live; only token figures come from the
+        # snapshot. Native tools ride outside the prompt text, so they
+        # are added to immutable explicitly.
+        snap = getattr(tcmm, "_vg_meter_snapshot", None)
+        basis = "live_blocks"
+        if isinstance(snap, dict) and snap.get("prompt_chars"):
+            tc = snap.get("tier_chars") or {}
+            tools_est = _est_tokens(int(snap.get("tools_chars") or 0))
+            if tc:
+                tiers["immutable"]["tokens"] = (
+                    _est_tokens(int(tc.get("immutable", 0))) + tools_est
+                )
+                tiers["stable"]["tokens"] = _est_tokens(
+                    int(tc.get("stable", 0)) + int(tc.get("stable_frozen", 0))
+                )
+                for k in ("working", "transient", "volatile", "shadow"):
+                    tiers[k]["tokens"] = _est_tokens(int(tc.get(k, 0)))
+            else:
+                # legacy render path: tools were injected INTO the prompt,
+                # no per-tier split — leave per-tier block sums in place.
+                tools_est = 0
+            total = _est_tokens(int(snap["prompt_chars"])) + tools_est
+            basis = "last_render"
+        else:
+            total = sum(d["tokens"] for d in tiers.values())
+
+        # Exact provider-billed input for the LAST turn (stamped by
+        # /post_response). total input = new + cache_read + cache_create
+        # per the token-accounting convention. When present the UI shows
+        # THIS as the headline — it is the dashboard's own number.
+        last_input = 0
+        u = getattr(tcmm, "_vg_last_usage", None)
+        if isinstance(u, dict):
+            last_input = (
+                int(u.get("input_tokens") or 0)
+                + int(u.get("cache_read_input_tokens") or 0)
+                + int(u.get("cache_creation_input_tokens") or 0)
+            )
         return {
             **base,
             "cold": False,
             "context_window": int(getattr(tcmm, "MODEL_CONTEXT_WINDOW", 200_000)),
             "budget_tokens": int(getattr(tcmm, "max_live_tokens", 190_000)),
             "total_tokens": total,
+            "last_turn_input_tokens": last_input,
+            "estimate_basis": basis,
             "current_step": _step,
             "tiers": tiers,
         }
@@ -2424,6 +2503,17 @@ async def render_structured(body: RenderBody):
     logger.info(f"[RENDER-PERF] scope={_scope} pool={_ph_pool:.0f}ms render={(_rrpt.perf_counter()-_rr0)*1000:.0f}ms "
                 f"blocks={len(result.get('blocks', []))} chars={result.get('stats',{}).get('prompt_chars',0)} "
                 f"native_tools={len(native_tools)}")
+    _r_stats = result.get("stats") or {}
+    _stash_meter_snapshot(
+        tcmm,
+        prompt_chars=int(_r_stats.get("prompt_chars") or len(result.get("prompt") or "")),
+        tier_chars=_r_stats.get("tier_chars") or {},
+        tools_chars=sum(
+            len(getattr(_pb, "text", "") or "")
+            for _pb in ((_pinned_fn() if callable(_pinned_fn) else []))
+            if getattr(_pb, "source", "") == "tool_def"
+        ),
+    )
     return {
         "status": "ok",
         "format": "anthropic-structured" if model in ("anthropic", "claude") else f"{model}-structured",
@@ -2493,6 +2583,15 @@ async def render(body: RenderBody):
         for _k in ("tier_chars", "ir_empty"):
             if _k in _extra_stats:
                 _stats[_k] = _extra_stats[_k]
+        # Meter snapshot — legacy path injected tools INTO the prompt, so
+        # tools_chars=0 (prompt_chars already covers them); the structured
+        # sub-path here has no tools at all.
+        _stash_meter_snapshot(
+            tcmm,
+            prompt_chars=len(prompt),
+            tier_chars=_extra_stats.get("tier_chars") or {},
+            tools_chars=0,
+        )
         # [WORKING_AUTOCACHE_2026_05_20] Anthropic server-managed
         # cache breakpoint. Placed at request-root by the proxy via
         # ``data["cache_control"] = render.cache_control``. The server
@@ -2612,6 +2711,19 @@ async def post_response(body: PostResponseBody):
         answer = (body.raw_output or "").strip()
 
     _sid = pool._normalize_id(body.conversation_id)
+
+    # [METER_EXACT_USAGE_2026-06-11] Stamp the provider-billed usage on
+    # the (already-resident) session so /memory_status reports exact
+    # input tokens for the meter. Peek-only on the pool — never create.
+    if body.usage:
+        try:
+            _key = f"{body.user_id or 'default'}::{_sid}"
+            with pool._lock:
+                _inst = pool._instances.get(_key)
+            if _inst is not None:
+                _inst.tcmm._vg_last_usage = {"ts": time.time(), **body.usage}
+        except Exception:
+            pass
 
     # Fire the heavy ingest in the background. Do NOT await.
     # The task runs in the current event loop and will acquire the
