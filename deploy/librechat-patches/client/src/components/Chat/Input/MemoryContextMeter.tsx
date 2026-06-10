@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { Flame, BrainCircuit } from 'lucide-react';
 import { Constants } from 'librechat-data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
@@ -11,6 +12,11 @@ import { useAuthContext } from '~/hooks/AuthContext';
  * context window. Expanded (click): a popover with one progress bar per
  * memory tier — immutable / stable / working / volatile — plus effective
  * heat for the stable and working tiers.
+ *
+ * The popover renders through a PORTAL to document.body with fixed
+ * positioning: the chat-input container clips overflowing children
+ * (rounded corners + overflow-hidden ancestors), which cut the popover
+ * to its bottom slice — only the Volatile row was visible in-place.
  *
  * Data: GET /api/veilguard-client/memory-status?conversationId=…
  * (JWT-authenticated LibreChat proxy → TCMM /memory_status, which is
@@ -102,45 +108,92 @@ function HeatBadge({ tier }: { tier: TierStat }) {
   const hot = tier.heat_avg >= 1.0;
   return (
     <span
-      className={`flex items-center gap-0.5 tabular-nums ${hot ? 'text-orange-400' : 'text-text-tertiary'}`}
+      className={`flex items-center justify-end gap-0.5 tabular-nums ${hot ? 'text-orange-400' : 'text-text-tertiary'}`}
       title={`effective heat — avg ${tier.heat_avg}, max ${tier.heat_max ?? '–'}`}
     >
-      <Flame size={9} />
+      <Flame size={10} className={hot ? 'drop-shadow-[0_0_3px_rgba(251,146,60,0.6)]' : ''} />
       {tier.heat_avg.toFixed(1)}
     </span>
   );
 }
 
+interface TierSpec {
+  key: string;
+  label: string;
+  hint: string;
+  dot: string;
+  bar: string;
+}
+
+// One visual identity per tier, used by the chip, the overview bar and
+// the per-tier rows so colors always correspond.
+const TIER_SPECS: TierSpec[] = [
+  {
+    key: 'immutable',
+    label: 'Immutable',
+    hint: 'pinned preamble, persona & tool definitions — 24h cache tier',
+    dot: 'bg-cyan-400',
+    bar: 'bg-gradient-to-r from-cyan-400 to-cyan-600',
+  },
+  {
+    key: 'stable',
+    label: 'Stable',
+    hint: 'promoted, cache-stable conversation memory',
+    dot: 'bg-blue-400',
+    bar: 'bg-gradient-to-r from-blue-400 to-blue-600',
+  },
+  {
+    key: 'working',
+    label: 'Working',
+    hint: 'recent turns & fresh tool output (incl. transient)',
+    dot: 'bg-amber-400',
+    bar: 'bg-gradient-to-r from-amber-400 to-amber-600',
+  },
+  {
+    key: 'volatile',
+    label: 'Volatile',
+    hint: 'recalled memory staged for this turn (incl. shadow)',
+    dot: 'bg-purple-400',
+    bar: 'bg-gradient-to-r from-purple-400 to-purple-600',
+  },
+];
+
 function TierRow({
-  label,
+  spec,
   tier,
   max,
-  color,
 }: {
-  label: string;
+  spec: TierSpec;
   tier: TierStat;
   max: number;
-  color: string;
 }) {
   const pct = max > 0 ? Math.min(100, (tier.tokens / max) * 100) : 0;
+  // Tiny-but-nonzero tiers still get a visible sliver.
+  const width = tier.tokens > 0 ? Math.max(2, pct) : 0;
   return (
-    <div className="flex items-center gap-2 text-[10px]">
-      <span className="w-16 shrink-0 text-right text-text-secondary">{label}</span>
-      <div className="h-2 flex-1 overflow-hidden rounded-full bg-surface-tertiary">
+    <div className="flex items-center gap-2.5 text-[11px]" title={spec.hint}>
+      <span className={`h-2 w-2 shrink-0 rounded-full ${spec.dot}`} />
+      <span className="w-[4.4rem] shrink-0 text-text-secondary">{spec.label}</span>
+      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-surface-tertiary">
         <div
-          className={`h-full rounded-full transition-all duration-700 ${color}`}
-          style={{ width: `${pct}%` }}
+          className={`h-full rounded-full transition-all duration-700 ${spec.bar}`}
+          style={{ width: `${width}%` }}
         />
       </div>
-      <span className="w-10 shrink-0 text-right tabular-nums text-text-secondary">
+      <span className="w-11 shrink-0 text-right tabular-nums text-text-primary">
         {formatK(tier.tokens)}
       </span>
-      <span className="w-9 shrink-0">
+      <span className="w-7 shrink-0 text-right tabular-nums text-text-tertiary">
+        {tier.blocks}
+      </span>
+      <span className="w-10 shrink-0">
         <HeatBadge tier={tier} />
       </span>
     </div>
   );
 }
+
+const POPOVER_WIDTH = 352;
 
 export default function MemoryContextMeter({
   conversationId,
@@ -150,20 +203,48 @@ export default function MemoryContextMeter({
   isSubmitting: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<{ left: number; bottom: number } | null>(null);
   const data = useMemoryStatus(conversationId, isSubmitting);
-  const rootRef = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const popRef = useRef<HTMLDivElement>(null);
 
-  // Close on outside click.
+  const toggle = useCallback(() => {
+    if (btnRef.current) {
+      const r = btnRef.current.getBoundingClientRect();
+      setPos({
+        left: Math.max(8, Math.min(r.left, window.innerWidth - POPOVER_WIDTH - 8)),
+        bottom: window.innerHeight - r.top + 8,
+      });
+    }
+    setOpen((o) => !o);
+  }, []);
+
+  // Close on outside click / Escape. The popover lives in a portal, so
+  // check both the button and the portal node.
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
-        setOpen(false);
+      const t = e.target as Node;
+      if (btnRef.current?.contains(t) || popRef.current?.contains(t)) {
+        return;
       }
+      setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
     };
     document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
   }, [open]);
+
+  // Conversation switched: stale popover would show the old session.
+  useEffect(() => {
+    setOpen(false);
+  }, [conversationId]);
 
   if (!data || data.cold || !data.total_tokens) {
     return null;
@@ -187,22 +268,23 @@ export default function MemoryContextMeter({
     blocks: (tiers.volatile?.blocks ?? 0) + shadow.blocks,
   };
 
+  const byKey: Record<string, TierStat> = {
+    immutable,
+    stable,
+    working,
+    volatile: volatile_,
+  };
+
   const total = data.total_tokens;
   const pct = Math.min(100, (total / window_) * 100);
   const pctLabel = pct < 1 ? '<1' : Math.round(pct);
 
-  const segments: Array<[TierStat, string]> = [
-    [immutable, 'bg-cyan-500'],
-    [stable, 'bg-blue-500'],
-    [working, 'bg-amber-500'],
-    [volatile_, 'bg-purple-500'],
-  ];
-
   return (
-    <div ref={rootRef} className="relative flex items-center">
+    <>
       <button
+        ref={btnRef}
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={toggle}
         aria-label="Memory context"
         title={`Memory context — ${formatK(total)} / ${formatK(window_)} tokens`}
         className="flex items-center gap-1.5 rounded-full border border-border-light px-2 py-1 text-[10px] text-text-secondary transition-colors hover:bg-surface-tertiary"
@@ -210,48 +292,66 @@ export default function MemoryContextMeter({
         <BrainCircuit size={12} />
         {/* mini stacked bar */}
         <span className="flex h-1.5 w-12 overflow-hidden rounded-full bg-surface-tertiary">
-          {segments.map(([t, color], i) => (
+          {TIER_SPECS.map((s) => (
             <span
-              key={i}
-              className={`h-full ${color}`}
-              style={{ width: `${Math.min(100, (t.tokens / window_) * 100)}%` }}
+              key={s.key}
+              className={`h-full ${s.bar}`}
+              style={{ width: `${Math.min(100, (byKey[s.key].tokens / window_) * 100)}%` }}
             />
           ))}
         </span>
         <span className="tabular-nums">{pctLabel}%</span>
       </button>
 
-      {open && (
-        <div className="absolute bottom-full left-0 z-50 mb-2 w-80 rounded-xl border border-border-medium bg-surface-primary p-3 shadow-lg">
-          <div className="mb-2 flex items-baseline justify-between">
-            <span className="text-xs font-semibold text-text-primary">Memory context</span>
-            <span className="text-[10px] tabular-nums text-text-secondary">
-              {formatK(total)} / {formatK(window_)} ({pctLabel}%)
-            </span>
-          </div>
-          {/* overall stacked bar */}
-          <div className="mb-3 flex h-2 w-full overflow-hidden rounded-full bg-surface-tertiary">
-            {segments.map(([t, color], i) => (
-              <div
-                key={i}
-                className={`h-full ${color}`}
-                style={{ width: `${Math.min(100, (t.tokens / window_) * 100)}%` }}
-              />
-            ))}
-          </div>
-          <div className="space-y-1.5">
-            <TierRow label="Immutable" tier={immutable} max={window_} color="bg-cyan-500" />
-            <TierRow label="Stable" tier={stable} max={window_} color="bg-blue-500" />
-            <TierRow label="Working" tier={working} max={window_} color="bg-amber-500" />
-            <TierRow label="Volatile" tier={volatile_} max={window_} color="bg-purple-500" />
-          </div>
-          <div className="mt-2 border-t border-border-light pt-1.5 text-[9px] text-text-tertiary">
-            {immutable.blocks + stable.blocks + working.blocks} live blocks ·{' '}
-            {volatile_.blocks} recalled · <Flame size={8} className="inline" /> = effective heat
-            (stable/working)
-          </div>
-        </div>
-      )}
-    </div>
+      {open &&
+        pos &&
+        createPortal(
+          <div
+            ref={popRef}
+            style={{ position: 'fixed', left: pos.left, bottom: pos.bottom, width: POPOVER_WIDTH }}
+            className="z-[1000] rounded-2xl border border-border-medium bg-surface-primary p-4 shadow-2xl"
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <span className="flex items-center gap-1.5 text-sm font-semibold text-text-primary">
+                <BrainCircuit size={15} className="text-cyan-400" />
+                Memory
+              </span>
+              <span className="text-[11px] tabular-nums text-text-secondary">
+                {formatK(total)} / {formatK(window_)} · {pctLabel}%
+              </span>
+            </div>
+
+            {/* overview stacked bar */}
+            <div className="mb-3.5 flex h-2.5 w-full overflow-hidden rounded-full bg-surface-tertiary">
+              {TIER_SPECS.map((s) => (
+                <div
+                  key={s.key}
+                  className={`h-full ${s.bar} transition-all duration-700`}
+                  style={{ width: `${Math.min(100, (byKey[s.key].tokens / window_) * 100)}%` }}
+                />
+              ))}
+            </div>
+
+            {/* per-tier rows — always all four, even at zero */}
+            <div className="space-y-2">
+              {TIER_SPECS.map((s) => (
+                <TierRow key={s.key} spec={s} tier={byKey[s.key]} max={window_} />
+              ))}
+            </div>
+
+            {/* column key + footer */}
+            <div className="mt-3 flex items-center justify-between border-t border-border-light pt-2 text-[9px] text-text-tertiary">
+              <span>
+                {immutable.blocks + stable.blocks + working.blocks} live ·{' '}
+                {volatile_.blocks} recalled
+              </span>
+              <span className="flex items-center gap-1">
+                tokens · blocks · <Flame size={8} className="inline" /> heat
+              </span>
+            </div>
+          </div>,
+          document.body,
+        )}
+    </>
   );
 }
