@@ -1,5 +1,18 @@
 # PII Redaction — Render-Layer Activation (2026-05-30)
 
+> **⚠️ SEMANTICS CHANGED 2026-06-10 (incident follow-up).** The
+> `VEILGUARD_REDACT_IN_RENDER=1` boundary-skip used to pass EVERY rendered
+> block through verbatim, trusting that TCMM's render hook was on. The hook
+> defaults OFF, compose defaulted the flag ON → the raw live-memory tail
+> shipped to Anthropic for weeks (caught by the dashboard missed-PII panel).
+> The flag is now **evidence-based**: only blocks tagged `_vg_pii: "redacted"`
+> by the render layer skip the boundary scan; untagged blocks are always
+> redacted. Since TCMM's renderer does not emit that tag yet, the flag is
+> currently inert-by-safety and compose defaults it to 0. To activate the
+> render-layer fast path described below, the renderer must also tag the
+> blocks it redacted. The legacy proxy SSO path (`/generate`, which bypassed
+> the boundary entirely) is retired: prod now runs `VEILGUARD_USE_CHAT_AGENT=1`.
+
 Everything below is **implemented + locally tested**. The redaction redesign is
 **off by default** (`VEILGUARD_REDACT_IN_RENDER` unset → current boundary
 behavior, byte-for-byte). Flipping it on moves redaction into TCMM's render
