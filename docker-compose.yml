@@ -187,9 +187,13 @@ services:
       - TCMM_VECTOR=${TCMM_VECTOR:-postgres}
       - TCMM_SPARSE=${TCMM_SPARSE:-postgres}
       - TCMM_DATABASE_URL=${TCMM_DATABASE_URL:-postgresql://tcmm:tcmm@host.docker.internal:5433/tcmm}
-      # [PII_RENDER_REDACT_2026_05_30] memory redacted at render → boundary
-      # skips re-scanning system blocks (only redacts the latest prompt).
-      - VEILGUARD_REDACT_IN_RENDER=${VEILGUARD_REDACT_IN_RENDER:-1}
+      # [PII_BOUNDARY_FAILSAFE_2026-06-10] Default 0: the boundary redacts the
+      # rendered memory blocks itself. The old :-1 default trusted TCMM's
+      # render hook (VEILGUARD_RENDER_PII_HOOK), which defaults OFF — that
+      # skew shipped the RAW live-memory tail to Anthropic. Set 1 only with
+      # the hook verified on; even then the boundary now passes through only
+      # blocks tagged _vg_pii=redacted (evidence, not trust).
+      - VEILGUARD_REDACT_IN_RENDER=${VEILGUARD_REDACT_IN_RENDER:-0}
       - SUB_AGENTS_URL=${SUB_AGENTS_URL:-http://host.docker.internal:8809}
       - VEILGUARD_INTERNAL_SECRET=${VEILGUARD_INTERNAL_SECRET:-}
       - AGENTS_DIR=/app/agents
@@ -349,8 +353,9 @@ services:
       - TCMM_VECTOR=${TCMM_VECTOR:-postgres}
       - TCMM_SPARSE=${TCMM_SPARSE:-postgres}
       - TCMM_DATABASE_URL=${TCMM_DATABASE_URL:-postgresql://tcmm:tcmm@host.docker.internal:5433/tcmm}
-      # [PII_RENDER_REDACT_2026_05_30] skip re-redacting pre-redacted memory.
-      - VEILGUARD_REDACT_IN_RENDER=${VEILGUARD_REDACT_IN_RENDER:-1}
+      # [PII_BOUNDARY_FAILSAFE_2026-06-10] Default 0 — see pii-proxy note above:
+      # the :-1 default trusted a render hook that defaults OFF → raw memory leak.
+      - VEILGUARD_REDACT_IN_RENDER=${VEILGUARD_REDACT_IN_RENDER:-0}
       # Where audit_db.py writes the pii_audit table.  Must be the
       # same Lance directory TCMM opens on the host so rows live next
       # to archive / sparse / dream data.

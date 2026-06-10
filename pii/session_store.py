@@ -78,6 +78,38 @@ CREATE TABLE IF NOT EXISTS pii_session_mapping (
 );
 CREATE INDEX IF NOT EXISTS ix_pii_sess_conv   ON pii_session_mapping (tenant_id, conv_id);
 CREATE INDEX IF NOT EXISTS ix_pii_sess_reftok ON pii_session_mapping (ref_token);
+
+-- [PII_LIST_TABLES_2026-06-10]  Allow/deny/suggestion tables, created
+-- idempotently by EVERY pii-bearing process at startup.  These existed
+-- only where they'd been hand-created (the 2026-06-07 overlay work), so
+-- fresh/other deployments logged UndefinedTable on every refresh cycle:
+-- allow_list stayed empty (over-redaction) and the LLM redaction-audit's
+-- deny-list inserts were silently dropped (shadow_tool catches all).
+CREATE TABLE IF NOT EXISTS pii_allow_list (
+    term        TEXT PRIMARY KEY,
+    entity_type TEXT,
+    source      TEXT,
+    added_by    TEXT,
+    added_at    TIMESTAMPTZ DEFAULT now(),
+    active      BOOLEAN DEFAULT true
+);
+CREATE TABLE IF NOT EXISTS pii_deny_list (
+    term        TEXT PRIMARY KEY,
+    entity_type TEXT,
+    source      TEXT,
+    added_by    TEXT,
+    added_at    TIMESTAMPTZ DEFAULT now(),
+    active      BOOLEAN DEFAULT true
+);
+CREATE TABLE IF NOT EXISTS redaction_suggestions (
+    term          TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    entity_type   TEXT,
+    support_count INTEGER DEFAULT 0,
+    status        TEXT DEFAULT 'staged',
+    last_seen     TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (term, kind)
+);
 """
 
 
@@ -102,11 +134,15 @@ _SCHEMA = pa.schema([
 # `\b` word boundaries on both sides — together they ensure
 # `REF_PERSON_1` and `REF_PERSON_15` are disjoint matches.  See the
 # 23-Apr-2026 incident captured in agent-proxy/app/session.py docstring.
-_REF_TOKEN_RE = re.compile(
-    r"\bREF_(?:PERSON|EMAIL|PHONE|IP|LOCATION|URL|CREDIT_CARD|"
-    r"ID|IBAN_CODE|IBAN|ORG|DATE|API_KEY|CARD|BANK_ACCOUNT|"
-    r"SA_ID|SA_PHONE)_\d+\b"
-)
+#
+# [REF_RE_GENERIC_2026-06-10]  GENERIC over token types, deliberately.
+# The old hardcoded type list silently drifted behind the recognizer set:
+# REF_PASSPORT_N (PassportRecognizer) and REF_DENY_PII_N (deny-list hits)
+# matched nothing, so they could NEVER rehydrate — responses and TCMM
+# ingest kept the literal tokens.  Substitution is lookup-driven
+# (mapping.get with identity fallback), so a generic match is safe: a
+# token-shaped string with no mapping passes through unchanged.
+_REF_TOKEN_RE = re.compile(r"\bREF_[A-Z][A-Z0-9_]*_\d+\b")
 
 
 # ── Session id helper ───────────────────────────────────────────────────
@@ -182,6 +218,12 @@ class PIISessionStore:
         self._pending_rows: list[dict] = []
         self._counters: dict[tuple, int] = {}
         self._warmed_sids: set = set()   # (tenant,conv) whose full map is memo-loaded
+        # [REV_MEMO_2026-06-10]  token → original per session root, recorded at
+        # MINT time.  Rehydration overlays this onto the DB map so a token
+        # whose flush() failed (DB blip, missing table, dead conn) still
+        # rehydrates within this process's lifetime instead of leaking REF_*
+        # tokens into the response and TCMM ingest.  DB rows win on conflict.
+        self._rev_memo: dict[tuple, dict[str, str]] = {}
         self._pg = _PG
         if self._pg:
             import psycopg2
@@ -431,29 +473,48 @@ class PIISessionStore:
         return max(counters) + 1
 
     def _rehydrate_map(self, sid: SessionId) -> dict[str, str]:
-        """All token→original mappings for this session."""
+        """All token→original mappings for this session.
+
+        [REV_MEMO_2026-06-10]  DB rows overlaid with the in-process reverse
+        memo (mint-time token→original).  The memo covers tokens whose
+        flush() failed AND keeps rehydration working when the DB read
+        itself fails — both previously returned the literal REF_* tokens
+        to the caller (and from there into TCMM ingest).  DB rows win.
+        """
         sid_root = sid.root()
-        if self._pg:
-            with self._conn.cursor() as c:
-                c.execute("SELECT ref_token, original FROM pii_session_mapping WHERE "
-                          "tenant_id=%s AND conv_id=%s", [sid_root.tenant_id, sid_root.conv_id])
-                return {tok: orig for tok, orig in c.fetchall()}
-        tbl = self._get_tbl()
-        if tbl is None:
-            return {}
-        arr = (
-            tbl.search()
-            .where(
-                f"tenant_id = '{sid_root.tenant_id}' "
-                f"AND conv_id = '{sid_root.conv_id}'"
+        mapping: dict[str, str] = {}
+        try:
+            if self._pg:
+                with self._conn.cursor() as c:
+                    c.execute("SELECT ref_token, original FROM pii_session_mapping WHERE "
+                              "tenant_id=%s AND conv_id=%s", [sid_root.tenant_id, sid_root.conv_id])
+                    mapping = {tok: orig for tok, orig in c.fetchall()}
+            else:
+                tbl = self._get_tbl()
+                if tbl is not None:
+                    arr = (
+                        tbl.search()
+                        .where(
+                            f"tenant_id = '{sid_root.tenant_id}' "
+                            f"AND conv_id = '{sid_root.conv_id}'"
+                        )
+                        .to_arrow()
+                    )
+                    if arr.num_rows:
+                        mapping = dict(zip(
+                            arr.column("ref_token").to_pylist(),
+                            arr.column("original").to_pylist(),
+                        ))
+        except Exception as e:
+            logger.error(
+                f"[pii] rehydrate map read failed (falling back to in-process "
+                f"reverse memo): {e}"
             )
-            .to_arrow()
-        )
-        if arr.num_rows == 0:
-            return {}
-        tokens = arr.column("ref_token").to_pylist()
-        originals = arr.column("original").to_pylist()
-        return dict(zip(tokens, originals))
+        mem = self._rev_memo.get((sid_root.tenant_id, sid_root.conv_id))
+        if mem:
+            for tok, orig in mem.items():
+                mapping.setdefault(tok, orig)
+        return mapping
 
     # ── Write path ────────────────────────────────────────────────────
 
@@ -552,6 +613,10 @@ class PIISessionStore:
                 "created_ts":  time.time(),
             })
             self._memo[memo_key] = ref_token
+            # [REV_MEMO_2026-06-10] rehydration fallback for flush failures.
+            self._rev_memo.setdefault(
+                (sid_root.tenant_id, sid_root.conv_id), {}
+            )[ref_token] = original
             return ref_token
 
     def flush(self) -> int:

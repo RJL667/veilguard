@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio as _asyncio
 import logging
 import os
+import re
 import time
 import uuid
 from abc import ABC
@@ -93,6 +94,19 @@ _PREPARED_SESSIONS: set = set()
 # TTL bounds staleness for long-lived (Director) conversations.
 _RENDER_CACHE: dict = {}
 _RENDER_CACHE_TTL_S: float = 90.0
+
+# [STREAM_TOKEN_SAFE_CUT_2026-06-10]  A partial REF token at the end of a
+# streaming emit slice ("...REF_PER" | "SON_1...", or "...REF_PERSON_1" |
+# "5...") would rehydrate wrongly or not at all.  Before emitting, the
+# stream rehydrator moves the cut LEFT of any suffix that could be the
+# start of a token.  False positives (a word ending in "R"/"RE") just
+# delay those characters one chunk — harmless.
+_PARTIAL_REF_RE = re.compile(r"(?:R|RE|REF|REF_[A-Z0-9_]*)$")
+
+# Full-token matcher (mirrors pii.session_store._REF_TOKEN_RE).  Used by the
+# ingest guard so prose ABOUT the token scheme ("REF_PERSON_N, REF_EMAIL_N")
+# doesn't false-alarm — only real, digit-suffixed tokens do.
+_FULL_REF_RE = re.compile(r"\bREF_[A-Z][A-Z0-9_]*_\d+\b")
 
 
 # ── Per-turn context ────────────────────────────────────────────────────
@@ -791,7 +805,13 @@ class Agent(ABC):
                     if flush:
                         out, _rbuf["s"] = _rbuf["s"], ""
                     elif len(_rbuf["s"]) > 48:
-                        out, _rbuf["s"] = _rbuf["s"][:-48], _rbuf["s"][-48:]
+                        cut = len(_rbuf["s"]) - 48
+                        # [STREAM_TOKEN_SAFE_CUT_2026-06-10] never bisect a
+                        # (possible) REF token at the emit boundary.
+                        m = _PARTIAL_REF_RE.search(_rbuf["s"], max(0, cut - 24), cut)
+                        if m:
+                            cut = m.start()
+                        out, _rbuf["s"] = _rbuf["s"][:cut], _rbuf["s"][cut:]
                     else:
                         out = ""
                     return redactor.rehydrate_text(out, sid) if out else ""
@@ -993,8 +1013,32 @@ class Agent(ABC):
             async def _deferred_ingest():
                 if _um:
                     await ingest_user(_cid, _uid, _um)
-                if _at:
-                    await ingest_assistant(_cid, _uid, _at, model=_mdl, flag_obj=_fobj)
+                _at_final = _at
+                if _at_final and _FULL_REF_RE.search(_at_final):
+                    # [INGEST_RAW_GUARD_2026-06-10]  TCMM stores REAL content
+                    # (post-rehydrate) — REF tokens reaching ingest mean STEP 4's
+                    # rehydrate missed (observed live: a session-store flush
+                    # failure left the PG map empty, so the artifact was stored
+                    # as "REF_PERSON_2 REF_PERSON_1 ...").  Re-rehydrate (the
+                    # store's reverse memo covers in-process mints even when the
+                    # DB is down); anything that still survives is an upstream
+                    # regression — log it loudly per the tcmm-service contract
+                    # (server.py "_strip_ref_tokens" removal note).
+                    try:
+                        _at_final = await _asyncio.to_thread(
+                            redactor.rehydrate_text, _at_final, sid,
+                        )
+                    except Exception as _e:
+                        logger.warning(f"[agent] pre-ingest rehydrate failed: {_e}")
+                    if _FULL_REF_RE.search(_at_final):
+                        logger.warning(
+                            f"[agent] REF_* tokens survived rehydration into "
+                            f"assistant ingest (conv={_cid[:14]}) — PII session "
+                            f"map is missing mappings; check session-store "
+                            f"flush errors. Storing as-is."
+                        )
+                if _at_final:
+                    await ingest_assistant(_cid, _uid, _at_final, model=_mdl, flag_obj=_fobj)
                 # [RENDER_CACHE_FRESH_2026_06_01] This turn's prompt + reply
                 # just landed in TCMM live memory. Drop the cached render for
                 # this (conv,user,agent) so the NEXT turn RE-RENDERS and the

@@ -314,6 +314,7 @@ class PIIRedactor:
         self._aid_misses = 0
         self._uncached_redactions = 0   # blocks with no aid + not clean
         self._clean_skipped = 0
+        self._render_redacted_skipped = 0  # _vg_pii=redacted evidence skips
         # CLEAN-skip is provenance-anchored, NOT heuristic: we only skip
         # blocks that EXACTLY match a known system-authored static template
         # (magic prefix, Veilguard preamble).  Anything user-derived is
@@ -322,13 +323,15 @@ class PIIRedactor:
             "PII_CLEAN_SKIP", "1"
         ).lower() in ("1", "true", "yes", "on")
         self._clean_fingerprints = self._load_clean_fingerprints()
-        # [REDACT_IN_RENDER_2026_05_30]  When TCMM's render-layer hook
-        # (policy.redact) is active, memory blocks arrive ALREADY redacted.
-        # The boundary then SKIPS re-scanning system/memory blocks (it would
-        # be duplicate work, and tier-blob blocks have no aid to cache on) —
-        # it only strips wire metadata and passes them through.  The latest
-        # user PROMPT is still redacted (redact_messages, always).  Operator
-        # enables this ONLY after wiring set_pii_hook server-side.
+        # [REDACT_IN_RENDER_2026_05_30 → PII_BOUNDARY_FAILSAFE_2026-06-10]
+        # When TCMM's render-layer hook (policy.redact) is active, memory
+        # blocks arrive already redacted AND tagged `_vg_pii: "redacted"`.
+        # With this flag on, the boundary skips re-scanning ONLY those
+        # tagged blocks (evidence, not trust — see redact_memory_blocks).
+        # Untagged blocks are always scanned, so a deployment where this
+        # flag is on but the hook is off degrades to duplicate-safe, not
+        # to a leak.  The latest user PROMPT is still redacted regardless
+        # (redact_messages, always).
         self._redact_in_render = os.environ.get(
             "VEILGUARD_REDACT_IN_RENDER", "0"
         ).lower() in ("1", "true", "yes", "on")
@@ -638,6 +641,9 @@ class PIIRedactor:
         origin_archive_id), NOT on rendered or cache-marked bytes:
 
           clean (preamble/tools/markers)  → emit verbatim, never scanned.
+          _vg_pii == "redacted" (+ flag)  → render hook already redacted it;
+                                            emit verbatim ONLY when
+                                            _redact_in_render is on.
           has _vg_aid                     → aid-cache by (sid, aid):
                                               HIT  → reuse redacted text
                                                      (zero Presidio/Lance);
@@ -655,11 +661,17 @@ class PIIRedactor:
         redact_text on a real analyzer failure.
         """
         sid = self._coerce_sid(sid)
-        # [REDACT_IN_RENDER_2026_05_30]  Memory already redacted at render →
-        # strip wire metadata + pass through; do NOT re-scan.  (The latest
-        # prompt is redacted separately via redact_messages.)
-        if self._redact_in_render:
-            return [self._emit_block(b) if isinstance(b, dict) else b for b in blocks]
+        # [PII_BOUNDARY_FAILSAFE_2026-06-10]  The old _redact_in_render
+        # fast path returned EVERY block verbatim, trusting that TCMM's
+        # render hook (VEILGUARD_RENDER_PII_HOOK, default OFF) had already
+        # redacted them.  Env skew — flag on here, hook off there — shipped
+        # the raw live-memory tail to Anthropic for weeks.  Trust is now
+        # per-block EVIDENCE: only blocks the render layer explicitly tagged
+        # `_vg_pii == "redacted"` skip the boundary scan, and only while the
+        # flag is on.  Untagged blocks (hook off, TCMM degraded, blocks
+        # appended after render like workspace/persona) are always redacted
+        # here.  A misconfigured deployment now costs duplicate work, never
+        # a leak.
         out: list[dict] = []
         for blk in blocks:
             if not isinstance(blk, dict) or blk.get("type") != "text":
@@ -671,6 +683,10 @@ class PIIRedactor:
                 continue
             if self._is_block_clean(blk):
                 self._clean_skipped += 1
+                out.append(self._emit_block(blk))
+                continue
+            if self._redact_in_render and blk.get("_vg_pii") == "redacted":
+                self._render_redacted_skipped += 1
                 out.append(self._emit_block(blk))
                 continue
             aid = blk.get("_vg_aid")
@@ -705,8 +721,9 @@ class PIIRedactor:
             pct = self._aid_hits / total * 100
             logger.info(
                 "[pii] aid_cache hits=%d misses=%d (%.0f%%)  clean_skipped=%d  "
-                "uncached=%d  size=%d/%d",
+                "render_redacted=%d  uncached=%d  size=%d/%d",
                 self._aid_hits, self._aid_misses, pct, self._clean_skipped,
+                self._render_redacted_skipped,
                 self._uncached_redactions, len(self._aid_cache), self._aid_cache_max,
             )
 
