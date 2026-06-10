@@ -1155,6 +1155,26 @@ def _live_tier_of(block) -> str:
     return "working"
 
 
+def _display_tokens(b) -> int:
+    """Real-token ESTIMATE for the context meter (chars/4).
+
+    TCMM's ``block.token_count`` is ``len(text.split())`` — WORDS — which
+    is what the internal budget economy is calibrated on, but the meter
+    reconciles against provider-billed token counts (pii_audit dashboard).
+    Word counts understate ~1.3x on prose and ~5x on the compact-JSON
+    tool-definition pin (no whitespace), which made the meter read 10.5k
+    while the dashboard showed 28.8k input for the same turn (2026-06-11).
+    chars/4 is the standard Anthropic heuristic and tracks both shapes.
+    """
+    try:
+        t = getattr(b, "text", "") or ""
+        if t:
+            return max(1, len(t) // 4)
+    except Exception:
+        pass
+    return int(getattr(b, "token_count", 0) or 0)
+
+
 @app.get("/memory_status")
 async def memory_status(conversation_id: str, user_id: str = ""):
     sid = SessionPool._normalize_id(conversation_id)
@@ -1195,21 +1215,21 @@ async def memory_status(conversation_id: str, user_id: str = ""):
         # Pinned prefix lane (preamble / persona / tool defs) → immutable.
         try:
             for b in (tcmm.pinned_prefix_blocks() or []):
-                tiers["immutable"]["tokens"] += int(getattr(b, "token_count", 0) or 0)
+                tiers["immutable"]["tokens"] += _display_tokens(b)
                 tiers["immutable"]["blocks"] += 1
         except Exception:
             pass
 
         for b in (getattr(tcmm, "live_blocks", []) or []):
             t = _live_tier_of(b)
-            tiers[t]["tokens"] += int(getattr(b, "token_count", 0) or 0)
+            tiers[t]["tokens"] += _display_tokens(b)
             tiers[t]["blocks"] += 1
             if t in ("stable", "working"):
                 tiers[t]["heats"].append(_heat(b))
 
         for tname, attr in (("volatile", "volatile_blocks"), ("shadow", "shadow_blocks")):
             for b in (getattr(tcmm, attr, []) or []):
-                tiers[tname]["tokens"] += int(getattr(b, "token_count", 0) or 0)
+                tiers[tname]["tokens"] += _display_tokens(b)
                 tiers[tname]["blocks"] += 1
 
         for t, d in tiers.items():
