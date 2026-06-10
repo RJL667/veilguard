@@ -1126,6 +1126,117 @@ async def health():
     }
 
 
+# ── /memory_status — per-conversation tier meter (2026-06-11) ─────────
+# Read-only, PEEK-only: feeds the LibreChat chat-input context meter
+# (immutable / stable / working / volatile bars + heat). It must be
+# CHEAP and side-effect-free — it never creates a pool instance, never
+# triggers recall/render, never touches the DB. If the conversation's
+# instance isn't resident (cold), it says so and returns zeros; the
+# widget renders a dimmed/empty meter until the first turn warms it.
+
+
+def _live_tier_of(block) -> str:
+    """Mirror of core.renderers.base_renderer._classify_tier for live
+    blocks (kept inline so this endpoint never constructs a renderer)."""
+    if (getattr(block, "cache_tier", "working") or "working") == "stable":
+        role = (getattr(block, "priority_class", "") or "").upper()
+        aid = getattr(block, "origin_archive_id", None)
+        is_kernel = False
+        try:
+            from core.node_kind import kind_of as _kind_of
+            is_kernel = isinstance(aid, int) and _kind_of(aid) == "entity_vec"
+        except Exception:
+            pass
+        if role == "SYSTEM" or is_kernel:
+            return "immutable"
+        return "stable"
+    if getattr(block, "is_transient", False):
+        return "transient"
+    return "working"
+
+
+@app.get("/memory_status")
+async def memory_status(conversation_id: str, user_id: str = ""):
+    sid = SessionPool._normalize_id(conversation_id)
+    key = f"{user_id or 'default'}::{sid}"
+    with pool._lock:
+        instance = pool._instances.get(key)
+    base = {
+        "status": "ok",
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+    }
+    if instance is None:
+        return {**base, "cold": True, "tiers": {}, "total_tokens": 0}
+
+    tcmm = instance.tcmm
+    try:
+        from core.lazy_heat import compute_effective_heat as _eff_heat
+        from core.config import CFG as _CFG
+        _decay = float(getattr(_CFG, "LIVE_DECAY_RATE", 0.85))
+        _step = int(getattr(tcmm, "current_step", 0) or 0)
+
+        def _heat(b) -> float:
+            try:
+                return float(_eff_heat(
+                    getattr(b, "heat", 0.0) or 0.0,
+                    int(getattr(b, "last_decay_step", _step) or _step),
+                    _step, _decay,
+                ))
+            except Exception:
+                return float(getattr(b, "heat", 0.0) or 0.0)
+
+        tiers: dict = {
+            t: {"tokens": 0, "blocks": 0, "heats": []}
+            for t in ("immutable", "stable", "working", "transient",
+                      "volatile", "shadow")
+        }
+
+        # Pinned prefix lane (preamble / persona / tool defs) → immutable.
+        try:
+            for b in (tcmm.pinned_prefix_blocks() or []):
+                tiers["immutable"]["tokens"] += int(getattr(b, "token_count", 0) or 0)
+                tiers["immutable"]["blocks"] += 1
+        except Exception:
+            pass
+
+        for b in (getattr(tcmm, "live_blocks", []) or []):
+            t = _live_tier_of(b)
+            tiers[t]["tokens"] += int(getattr(b, "token_count", 0) or 0)
+            tiers[t]["blocks"] += 1
+            if t in ("stable", "working"):
+                tiers[t]["heats"].append(_heat(b))
+
+        for tname, attr in (("volatile", "volatile_blocks"), ("shadow", "shadow_blocks")):
+            for b in (getattr(tcmm, attr, []) or []):
+                tiers[tname]["tokens"] += int(getattr(b, "token_count", 0) or 0)
+                tiers[tname]["blocks"] += 1
+
+        for t, d in tiers.items():
+            heats = d.pop("heats")
+            if heats:
+                d["heat_avg"] = round(sum(heats) / len(heats), 2)
+                d["heat_max"] = round(max(heats), 2)
+
+        from core.config import CFG as _C2
+        tiers["volatile"]["max_blocks"] = int(getattr(_C2, "VOLATILE_MAX_BLOCKS", 50))
+        tiers["shadow"]["max_blocks"] = int(getattr(_C2, "RECALL_SHADOW_MAX_BLOCKS", 15))
+
+        total = sum(d["tokens"] for d in tiers.values())
+        return {
+            **base,
+            "cold": False,
+            "context_window": int(getattr(tcmm, "MODEL_CONTEXT_WINDOW", 200_000)),
+            "budget_tokens": int(getattr(tcmm, "max_live_tokens", 190_000)),
+            "total_tokens": total,
+            "current_step": _step,
+            "tiers": tiers,
+        }
+    except Exception as e:
+        logger.warning(f"[memory_status] failed for {key}: {e}")
+        return {**base, "cold": True, "error": str(e), "tiers": {}, "total_tokens": 0}
+
+
 # ── /render tool_schemas cache (2026-05-19) ──────────────────────────
 # Per-conversation in-memory cache of the last tool_schemas list sent by
 # the proxy for that conv_id. LibreChat Agents only re-send tools on
