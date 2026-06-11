@@ -18,6 +18,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "_shared
 from tool_caching import cached_with_mtime  # noqa: E402
 from result_offload import auto_offload  # noqa: E402
 from error_hints import enrich_error  # noqa: E402
+from ocr_client import ocr_bytes  # noqa: E402
 
 mcp = FastMCP(
     "documents",
@@ -85,11 +86,41 @@ def _safe_path(path: str) -> Path:
 # ── PDF ──────────────────────────────────────────────────────────────────────
 
 
+def _parse_page_range(pages: str, total: int) -> range:
+    if pages.strip():
+        parts = pages.strip().split("-")
+        start = max(0, int(parts[0]) - 1)
+        end = int(parts[-1]) if len(parts) > 1 else start + 1
+        return range(start, min(end, total))
+    return range(total)
+
+
+def _ocr_pdf_pages(p: Path, page_range: range, total: int) -> str:
+    """OCR the selected pages of a PDF via the pii-proxy Gemini shim.
+    Builds a page-subset PDF when a range is given so we don't ship (and
+    pay for) pages the caller didn't ask for."""
+    import fitz
+
+    if len(page_range) >= total:
+        data = p.read_bytes()
+    else:
+        doc = fitz.open(str(p))
+        try:
+            sub = fitz.open()
+            sub.insert_pdf(doc, from_page=page_range[0], to_page=page_range[-1])
+            data = sub.tobytes()
+            sub.close()
+        finally:
+            doc.close()
+    return ocr_bytes(data, "application/pdf")
+
+
 @mcp.tool()
 @cached_with_mtime(path_arg="path", ttl_seconds=3600)
 @auto_offload(threshold=50_000)
 def read_pdf(path: str, pages: str = "") -> str:
-    """Extract text from a PDF file.
+    """Extract text from a PDF file. Scanned/image-based PDFs (no text
+    layer) are automatically OCR'd via Gemini vision.
 
     Args:
         path: PDF file path (absolute or relative to workspace)
@@ -104,27 +135,79 @@ def read_pdf(path: str, pages: str = "") -> str:
     try:
         doc = fitz.open(str(p))
         total = len(doc)
-
-        # Parse page range
-        if pages.strip():
-            parts = pages.strip().split("-")
-            start = max(0, int(parts[0]) - 1)
-            end = int(parts[-1]) if len(parts) > 1 else start + 1
-            end = min(end, total)
-            page_range = range(start, end)
-        else:
-            page_range = range(total)
+        page_range = _parse_page_range(pages, total)
 
         output = [f"# {p.name} ({total} pages, reading {len(page_range)})\n"]
+        text_chars = 0
         for i in page_range:
             page = doc[i]
             text = page.get_text().strip()
+            text_chars += len(text)
             output.append(f"--- Page {i + 1} ---\n{text}\n")
 
         doc.close()
+
+        # [OCR_GEMINI_2026-06-11] Scan signature: a real text layer averages
+        # hundreds of chars/page; image-only pages yield ~0. Below the
+        # threshold, fall through to OCR instead of returning empty pages.
+        if page_range and text_chars < 25 * len(page_range):
+            try:
+                md = _ocr_pdf_pages(p, page_range, total)
+                return (
+                    f"# {p.name} ({total} pages — no text layer on the "
+                    f"selected {len(page_range)} page(s); OCR'd via Gemini "
+                    f"vision)\n\n{md}"
+                )
+            except Exception as e:
+                output.append(
+                    f"\n[Note: these pages have no text layer (likely a "
+                    f"scan) and the OCR fallback failed: {e}]"
+                )
         return "\n".join(output)
     except Exception as e:
         return enrich_error("read_pdf", f"Error reading PDF: {e}",
+                              context={"path": path})
+
+
+@mcp.tool()
+@cached_with_mtime(path_arg="path", ttl_seconds=3600)
+@auto_offload(threshold=50_000)
+def ocr_document(path: str, pages: str = "") -> str:
+    """OCR a scanned PDF or an image (png/jpg/webp/gif/bmp/tiff) into
+    markdown text via Gemini vision. Use for screenshots, photos of
+    documents, and scans — or when read_pdf reports empty pages. Tables
+    come back as markdown tables; text is transcribed verbatim.
+
+    Args:
+        path: PDF or image file path (absolute or relative to workspace)
+        pages: PDF page range, e.g. "1-5" or "3". Empty = all. Ignored for images.
+    """
+    import mimetypes
+
+    p = _safe_path(path)
+    if not p.exists():
+        return f"Error: File not found: {p}"
+    mime = mimetypes.guess_type(p.name)[0] or ""
+
+    try:
+        if mime == "application/pdf" or p.suffix.lower() == ".pdf":
+            import fitz
+
+            doc = fitz.open(str(p))
+            total = len(doc)
+            doc.close()
+            page_range = _parse_page_range(pages, total)
+            md = _ocr_pdf_pages(p, page_range, total)
+            return f"# {p.name} (OCR, {len(page_range)}/{total} pages)\n\n{md}"
+        if mime.startswith("image/"):
+            md = ocr_bytes(p.read_bytes(), mime)
+            return f"# {p.name} (OCR)\n\n{md}"
+        return (
+            f"Error: unsupported type for OCR: {mime or p.suffix!r} — "
+            f"PDFs and images only. For docx/xlsx/pptx use their read_* tools."
+        )
+    except Exception as e:
+        return enrich_error("ocr_document", f"OCR failed: {e}",
                               context={"path": path})
 
 

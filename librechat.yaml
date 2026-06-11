@@ -168,6 +168,13 @@ mcpServers:
     command: python
     args:
       - "/app/mcp-tools/documents/server.py"
+    # [OCR_GEMINI_2026-06-11] stdio MCP subprocesses do NOT inherit the
+    # container env (same reason as web below) — pass the OCR shim creds
+    # explicitly so read_pdf's scan fallback + ocr_document can reach
+    # http://pii-proxy:4000/v1/ocr.
+    env:
+      OCR_API_KEY: "${OCR_API_KEY}"
+      OCR_BASEURL: "${OCR_BASEURL}"
 
   # Image: describe, resize, convert, charts (no overlap with sub-agents)
   image:

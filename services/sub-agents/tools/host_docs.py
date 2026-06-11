@@ -14,8 +14,16 @@ already expose comparable host access. Override the root with
 HOST_DOC_READ_ROOT. These are READ-ONLY parsers; no writes.
 """
 
+import asyncio
 import os
+import sys
 from pathlib import Path
+
+# [OCR_GEMINI_2026-06-11] shared OCR client (pii-proxy Gemini shim) — same
+# 2-line _shared import shim the container servers use; resolves to
+# services/_shared locally and mcp-tools/_shared on the VM.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "_shared"))
+from ocr_client import ocr_bytes  # noqa: E402
 
 _DOC_READ_ROOT = os.environ.get("HOST_DOC_READ_ROOT", os.path.expanduser("~"))
 
@@ -98,8 +106,35 @@ def register(mcp):
             else:
                 rng = range(total)
             out = [f"# {rp.name} ({total} pages, reading {len(rng)})\n"]
+            text_chars = 0
             for i in rng:
-                out.append(f"--- Page {i + 1} ---\n{doc[i].get_text().strip()}\n")
+                text = doc[i].get_text().strip()
+                text_chars += len(text)
+                out.append(f"--- Page {i + 1} ---\n{text}\n")
+            # [OCR_GEMINI_2026-06-11] No text layer => scanned/image PDF.
+            # OCR the selected pages via the pii-proxy Gemini shim instead
+            # of returning empty pages. to_thread keeps the blocking HTTP
+            # call off the server's event loop.
+            if rng and text_chars < 25 * len(rng):
+                if len(rng) >= total:
+                    data = rp.read_bytes()
+                else:
+                    sub = fitz.open()
+                    sub.insert_pdf(doc, from_page=rng[0], to_page=rng[-1])
+                    data = sub.tobytes()
+                    sub.close()
+                try:
+                    md = await asyncio.to_thread(ocr_bytes, data, "application/pdf")
+                    return (
+                        f"# {rp.name} ({total} pages — no text layer on the "
+                        f"selected {len(rng)} page(s); OCR'd via Gemini "
+                        f"vision)\n\n{md}"
+                    )
+                except Exception as e:
+                    out.append(
+                        f"\n[Note: these pages have no text layer (likely a "
+                        f"scan) and the OCR fallback failed: {e}]"
+                    )
             return "\n".join(out)
         except Exception as e:
             return f"Error reading PDF: {e}"
