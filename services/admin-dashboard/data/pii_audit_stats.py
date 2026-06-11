@@ -527,9 +527,20 @@ def recent_redactions(
     extras = sub.column("extra").to_pylist()
 
     # Pass 1 (asc): build TO_LLM aid → FROM_LLM idx mapping.
+    #
+    # [AID_NOT_GLOBALLY_ORDERED_2026-06-11] Order by created_at, NOT aid.
+    # Each writer process (pii-proxy, agent-runtime) seeds its in-memory
+    # aid counter from epoch-micros AT PROCESS START and increments from
+    # there, so rows from whichever process restarted most recently
+    # outrank every row the other process writes afterwards. Sorting by
+    # aid buried all agent-runtime IC calls below the proxy's chat rows
+    # — with limit=30 the dashboard never reached them. created_at is
+    # wall-clock at write time and comparable across writers; aid stays
+    # as the tiebreaker (same-writer rows share one clock tick under
+    # batch flush).
     pair: dict[int, int] = {}
     pending: dict[str, int] = {}
-    asc = sorted(range(n), key=lambda i: aids[i])
+    asc = sorted(range(n), key=lambda i: (times[i], aids[i]))
     for i in asc:
         conv = convs[i] or ""
         if dirs[i] == "TO_LLM":
@@ -541,7 +552,7 @@ def recent_redactions(
 
     # Pass 2 (desc): emit the latest N TO_LLM rows with paired stats
     out: list[dict[str, Any]] = []
-    desc = sorted(range(n), key=lambda i: -aids[i])
+    desc = sorted(range(n), key=lambda i: (times[i], aids[i]), reverse=True)
     for i in desc:
         if dirs[i] != "TO_LLM":
             continue
