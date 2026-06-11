@@ -2080,6 +2080,44 @@ async def health():
     }
 
 
+@app.post("/v1/ocr")
+@app.post("/ocr")
+async def ocr(request: Request):
+    """[OCR_GEMINI_2026-06-11] Mistral-OCR-shaped endpoint for LibreChat's
+    `azure_mistral_ocr` strategy, backed by AI-Studio Gemini vision
+    (app/ocr_gemini.py).  LibreChat uploads the file as a base64 data-URI,
+    we return {pages:[{markdown}]} — the extracted text then flows through
+    the normal context-file -> agent prompt -> redaction pipeline.
+
+    Must stay registered BEFORE the catch-all gateway route or the request
+    would be forwarded to an LLM backend instead.
+    """
+    expected = os.environ.get("OCR_API_KEY", "")
+    if expected:
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {expected}":
+            return JSONResponse({"detail": "invalid OCR api key"}, status_code=401)
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "invalid JSON body"}, status_code=400)
+
+    from app import ocr_gemini as _ocr
+
+    try:
+        result = await _ocr.gemini_ocr(
+            payload.get("document") or {}, payload.get("model")
+        )
+        return JSONResponse(result)
+    except _ocr.OCRUnsupportedType as e:
+        # 415 -> LibreChat logs the failure and falls back to its built-in
+        # document_parser, which handles office formats natively.
+        return JSONResponse({"detail": str(e)}, status_code=415)
+    except _ocr.OCRShimError as e:
+        logger.error("[OCR] %s", e)
+        return JSONResponse({"detail": str(e)}, status_code=502)
+
+
 @app.get("/cache/stats")
 async def cache_stats(
     tenant_id: str | None = None,

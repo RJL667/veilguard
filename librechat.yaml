@@ -243,3 +243,15 @@ mcpServers:
   #     client_id: "${SHAREPOINT_CLIENT_ID}"
   #     client_secret: "${SHAREPOINT_CLIENT_SECRET}"
   #     scope: "Sites.Read.All Files.Read.All offline_access"
+
+# [OCR_GEMINI_2026-06-11] Image/PDF OCR via the pii-proxy Gemini shim.
+# azure_mistral_ocr = single POST {baseURL}/ocr with a base64 data-URI
+# (no Mistral file-upload dance). Extracted text rides the normal
+# context-file -> redaction -> TCMM path. See agent-proxy/app/ocr_gemini.py.
+# Upload images via "Upload as Context/Text" on agents (ocr capability).
+ocr:
+  strategy: "azure_mistral_ocr"
+  mistralModel: "gemini-2.5-flash"
+  apiKey: "${OCR_API_KEY}"
+  baseURL: "${OCR_BASEURL}"
+
