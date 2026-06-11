@@ -183,4 +183,14 @@ async def gemini_ocr(document: dict, model: str | None = None) -> dict:
             "pages_processed": 1,
             "doc_size_bytes": (len(b64) * 3) // 4,
         },
+        # [OCR_AUDIT_2026-06-11] internal metadata for the pii_audit row —
+        # the /v1/ocr route pops this before returning to the caller.
+        "_veilguard": {
+            "mime": mime,
+            "approx_bytes": (len(b64) * 3) // 4,
+            "model": use_model,
+            "chars": len(text),
+            "prompt_tokens": usage.get("promptTokenCount"),
+            "output_tokens": usage.get("candidatesTokenCount"),
+        },
     }

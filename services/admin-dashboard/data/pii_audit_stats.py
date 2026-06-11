@@ -618,6 +618,11 @@ def _classify_turn(conv_id: str | None, content: str) -> str:
     cid = (conv_id or "")
     if cid.startswith("sub-"):
         return "sub"
+    # [OCR_AUDIT_2026-06-11] OCR boundary crossings (pii-proxy /v1/ocr ->
+    # AI Studio Gemini vision) write marker rows starting "[OCR]" with
+    # conv_id "ocr-<hex>". Distinct chip so raw-bytes egress is visible.
+    if cid.startswith("ocr-"):
+        return "ocr"
     head = content[:200] if content else ""
     if "--- MEMORY CONTEXT (from previous conversations) ---" in head:
         return "turn"

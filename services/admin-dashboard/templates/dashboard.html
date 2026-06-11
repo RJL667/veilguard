@@ -757,11 +757,13 @@
                         'bg-blue-500/20 text-blue-300':     r.turn_type === 'sub' &amp;&amp; !r.agent_id,
                         'bg-em/20 text-em':                 r.turn_type === 'turn',
                         'bg-text-lo/15 text-text-mid':      r.turn_type === 'tool',
+                        'bg-warn/15 text-warn':             r.turn_type === 'ocr',
                       }"
                       x-text="(r.turn_type === 'sub' &amp;&amp; r.agent_id) ? r.agent_id : (r.turn_type || 'turn')"
                       :title="(r.turn_type === 'sub' &amp;&amp; r.agent_id) ? ('background agent-runtime IC: ' + r.agent_id + (r.task_id ? ' · task ' + r.task_id : ''))
                             : r.turn_type === 'tool' ? 'Tool-result follow-up — model continuing after a tool execution. Shares conv_id with the parent user turn.'
                             : r.turn_type === 'sub'  ? 'Sub-agent LLM call — fresh conv_id, separate TCMM namespace.'
+                            : r.turn_type === 'ocr'  ? 'OCR call — raw document/image bytes sent to AI Studio Gemini for transcription. Bytes are not redacted; extracted text re-enters via the redaction path.'
                             : 'Main user turn (Director-handled) — full TCMM preamble.'"></span>
               </td>
               <!-- tokens_input is null until the FROM_LLM row is paired

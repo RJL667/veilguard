@@ -2108,14 +2108,68 @@ async def ocr(request: Request):
         result = await _ocr.gemini_ocr(
             payload.get("document") or {}, payload.get("model")
         )
+        _ocr_audit(result.pop("_veilguard", {}), ok=True)
         return JSONResponse(result)
     except _ocr.OCRUnsupportedType as e:
         # 415 -> LibreChat logs the failure and falls back to its built-in
-        # document_parser, which handles office formats natively.
+        # document_parser, which handles office formats natively. No audit
+        # row — nothing left the boundary.
         return JSONResponse({"detail": str(e)}, status_code=415)
     except _ocr.OCRShimError as e:
         logger.error("[OCR] %s", e)
+        _ocr_audit({}, ok=False, error=str(e))
         return JSONResponse({"detail": str(e)}, status_code=502)
+
+
+def _ocr_audit(meta: dict, ok: bool, error: str = "") -> None:
+    """[OCR_AUDIT_2026-06-11] pii_audit visibility for OCR calls. Every OCR
+    request ships RAW document/image bytes to AI Studio — that boundary
+    crossing must show on the dashboard like any other LLM call. Writes a
+    TO_LLM/FROM_LLM pair (the Recent Requests table reads tokens off the
+    paired FROM_LLM row). Content is a descriptive marker, NOT the
+    extracted text — the raw transcription may contain unredacted PII and
+    only enters storage via the normal redaction path downstream.
+    Best-effort: never raises into the OCR response."""
+    try:
+        import uuid as _uuid
+
+        from app import audit_db as _audit_db
+
+        conv = f"ocr-{_uuid.uuid4().hex[:8]}"
+        mime = meta.get("mime", "unknown")
+        size_kb = int((meta.get("approx_bytes") or 0) / 1024)
+        model = meta.get("model") or "gemini"
+        _audit_db.record(
+            direction="TO_LLM",
+            conversation_id=conv,
+            user_id="ocr-service",
+            model=model,
+            stream=False,
+            content=(
+                f"[OCR] {mime} ~{size_kb}KB sent RAW to AI Studio ({model}) "
+                f"for vision transcription. Document bytes are not redacted; "
+                f"the extracted text re-enters chat through the normal "
+                f"redaction path."
+            ),
+            extra={"path": "ocr", "mime": mime},
+        )
+        _audit_db.record(
+            direction="FROM_LLM",
+            conversation_id=conv,
+            user_id="ocr-service",
+            model=model,
+            stream=False,
+            content=(
+                f"[OCR] extracted {meta.get('chars', 0)} chars of markdown"
+                if ok
+                else f"[OCR] FAILED: {error[:200]}"
+            ),
+            tokens_input=meta.get("prompt_tokens"),
+            tokens_output=meta.get("output_tokens"),
+            extra={"path": "ocr", "ok": ok},
+        )
+    except Exception as e:
+        logger.warning("[OCR] audit record failed: %s", e)
 
 
 @app.get("/cache/stats")
