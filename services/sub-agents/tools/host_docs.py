@@ -94,96 +94,146 @@ def _daemon_available() -> bool:
         return False
 
 
-def _certutil_fetch_command(path: str, handoff: str) -> str | None:
-    """Build the run_command string that base64s `path` into `handoff`.
+_SHA256_LINE = re.compile(r"hash of", re.I)
 
-    Returns None if the path can't be passed safely (contains a space or a
-    double-quote — the daemon's `cmd /c` mangles embedded quotes). The
-    daemon runs certutil with cwd=workspace root, so a relative path
-    resolves there and an absolute Windows path is used as-is. Windows
-    certutil wants BACKSLASHES, so normalize any forward slashes.
+
+def _path_unsafe(path: str) -> bool:
+    """True if the path can't survive the daemon's `cmd /c` (space/quote)."""
+    return " " in path or '"' in path or "\n" in path
+
+
+def _certutil_fetch_command(path: str, handoff: str) -> str | None:
+    """run_command string: base64 `path` -> `handoff`, THEN print its SHA256.
+
+    The hash lets the server verify the reconstructed bytes end-to-end, so a
+    corrupt transfer becomes a detected+retried failure rather than silent
+    mojibake. Returns None for paths the daemon's `cmd /c` would mangle. The
+    daemon runs with cwd=workspace root (relative paths resolve there);
+    Windows certutil wants BACKSLASHES, so normalize forward slashes.
     """
     p = path.strip().replace("/", "\\")
-    if " " in p or '"' in p or "\n" in p:
+    if _path_unsafe(p):
         return None
-    return f"certutil -encode -f {p} {handoff}"
+    # `&` chains unconditionally under cmd /c (the daemon already prepends a
+    # `chcp ... &` prelude, so we're in shell mode regardless).
+    return f"certutil -encode -f {p} {handoff} & certutil -hashfile {p} SHA256"
+
+
+def _parse_certutil_sha256(out: str) -> str:
+    """Pull the 64-hex SHA256 from `certutil -hashfile` stdout (the value sits
+    on the line after 'SHA256 hash of <path>:'; some builds space-separate the
+    bytes). Returns '' if not found."""
+    lines = out.splitlines()
+    for i, line in enumerate(lines):
+        if _SHA256_LINE.search(line):
+            for nxt in lines[i + 1:]:
+                hexed = re.sub(r"[^0-9a-fA-F]", "", nxt)
+                if len(hexed) >= 64:
+                    return hexed[:64].lower()
+    return ""
 
 
 async def _fetch_bytes_via_daemon(path: str) -> tuple[bytes | None, str]:
-    """Pull a file from the user's machine via their client daemon.
+    """Pull a file from the user's machine via their client daemon, verifying
+    integrity against the file's real SHA256 (retries a corrupt transfer).
 
-    Returns (bytes, "") on success or (None, reason). Reasons are
-    LLM-facing — they state plainly what happened and what to do next.
+    Returns (bytes, "") on success or (None, reason). Reasons are LLM-facing.
     """
     import base64 as _b64
+    import hashlib as _hash
     import uuid as _uuid
     from core.agentic import handle_tool
 
-    handoff = f"vg_xfer_{_uuid.uuid4().hex[:8]}.b64"
-    cmd = _certutil_fetch_command(path, handoff)
-    if cmd is None:
+    if _path_unsafe(path.strip().replace("/", "\\")):
         return None, (
             f"{path!r} contains a space (or quote) that the client-daemon "
             "transfer can't carry. Ask the user to attach the file in chat "
             "via the '+' menu -> 'Upload as Text' instead."
         )
 
-    out = str(await handle_tool(
-        "run_command", {"command": cmd, "timeout": 120},
-    ) or "")
-    if "successfully" not in out.lower():
-        if "BLOCKED" in out:
-            return None, f"daemon refused the transfer command: {out[:200]}"
-        # certutil prints "cannot find the file" / "path not found" on a miss.
-        return None, (
-            f"the daemon could not read {path!r} from the user's machine "
-            f"(certutil: {out.strip().splitlines()[-1][:160] if out.strip() else 'no output'}). "
-            "Give the path exactly as the user stated it (e.g. "
-            "'Downloads/<name>.pdf'), or have them attach it via '+' -> "
-            "'Upload as Text'."
-        )
+    last_reason = "unknown error"
+    for attempt in range(3):
+        handoff = f"vg_xfer_{_uuid.uuid4().hex[:8]}.b64"
+        cmd = _certutil_fetch_command(path, handoff)
+        out = str(await handle_tool(
+            "run_command", {"command": cmd, "timeout": 120},
+        ) or "")
+        if "successfully" not in out.lower():
+            if "BLOCKED" in out:
+                return None, f"daemon refused the transfer command: {out[:200]}"
+            # certutil prints "cannot find the file"/"path not found" on a miss.
+            tail = out.strip().splitlines()[-1][:160] if out.strip() else "no output"
+            return None, (
+                f"the daemon could not read {path!r} from the user's machine "
+                f"(certutil: {tail}). Give the path exactly as the user stated "
+                "it (e.g. 'Downloads/<name>.pdf'), or have them attach it via "
+                "'+' -> 'Upload as Text'."
+            )
+        expected_sha = _parse_certutil_sha256(out)
 
-    chunks: list[str] = []
-    offset = 0
-    try:
-        while True:
-            body = str(await handle_tool(
-                "read_file",
-                {"path": handoff, "offset": offset, "limit": _READ_CHUNK_LINES},
-            ) or "")
-            if body.startswith("Error:") or "BLOCKED" in body[:200]:
-                return None, f"daemon read-back failed: {body[:300]}"
-            consumed = 0
-            for line in body.splitlines():
-                m = _LINE_NUM.match(line)
-                if not m:
-                    continue
-                consumed += 1  # advance offset by every numbered line
-                content = m.group(1).strip()
-                if content and not content.startswith("-----"):
-                    chunks.append(content)  # skip BEGIN/END CERTIFICATE markers
-            if "[end of file" in body:
-                break
-            if consumed == 0:
-                return None, "daemon read-back returned no data lines."
-            offset += consumed
-    finally:
-        # Best-effort cleanup; plain `del` passes the daemon's command filter.
+        chunks: list[str] = []
+        offset = 0
+        read_err = ""
         try:
-            await handle_tool("run_command", {"command": f"del {handoff}", "timeout": 30})
-        except Exception:
-            pass
+            while True:
+                body = str(await handle_tool(
+                    "read_file",
+                    {"path": handoff, "offset": offset, "limit": _READ_CHUNK_LINES},
+                ) or "")
+                if body.startswith("Error:") or "BLOCKED" in body[:200]:
+                    read_err = f"daemon read-back failed: {body[:300]}"
+                    break
+                consumed = 0
+                for line in body.splitlines():
+                    m = _LINE_NUM.match(line)
+                    if not m:
+                        continue
+                    consumed += 1  # advance offset by every numbered line
+                    content = m.group(1).strip()
+                    if content and not content.startswith("-----"):
+                        chunks.append(content)  # skip BEGIN/END CERTIFICATE markers
+                if "[end of file" in body:
+                    break
+                if consumed == 0:
+                    read_err = "daemon read-back returned no data lines."
+                    break
+                offset += consumed
+        finally:
+            # Best-effort cleanup; plain `del` passes the daemon's filter.
+            try:
+                await handle_tool("run_command", {"command": f"del {handoff}", "timeout": 30})
+            except Exception:
+                pass
 
-    try:
-        data = _b64.b64decode("".join(chunks))
-    except Exception as e:
-        return None, f"transfer corrupted (base64 decode failed: {e})"
-    if len(data) > _DAEMON_FETCH_MAX:
-        return None, (
-            f"the file is {len(data) // (1024 * 1024)}MB, over the "
-            f"{_DAEMON_FETCH_MAX // (1024 * 1024)}MB transfer limit."
-        )
-    return data, ""
+        if read_err:
+            last_reason = read_err
+            continue
+        try:
+            data = _b64.b64decode("".join(chunks))
+        except Exception as e:
+            last_reason = f"base64 decode failed: {e}"
+            continue
+        if len(data) > _DAEMON_FETCH_MAX:
+            return None, (
+                f"the file is {len(data) // (1024 * 1024)}MB, over the "
+                f"{_DAEMON_FETCH_MAX // (1024 * 1024)}MB transfer limit."
+            )
+        # End-to-end integrity gate: only trust bytes whose hash matches the
+        # source on the user's machine. Mismatch => corrupt transfer => retry.
+        got_sha = _hash.sha256(data).hexdigest()
+        if expected_sha and got_sha != expected_sha:
+            last_reason = (
+                f"integrity check failed (got {got_sha[:12]}, expected "
+                f"{expected_sha[:12]}) on attempt {attempt + 1}"
+            )
+            continue
+        return data, ""
+
+    return None, (
+        f"the file transfer from the user's machine kept failing "
+        f"({last_reason}). Ask the user to attach the file via '+' -> "
+        "'Upload as Text' instead."
+    )
 
 
 def _resolve_read(path: str):
@@ -267,15 +317,30 @@ async def _parse_pdf_file(rp: Path, pages: str, display_name: str = "") -> str:
             rng = range(total)
         out = [f"# {name} ({total} pages, reading {len(rng)})\n"]
         text_chars = 0
+        full_text = []
         for i in rng:
             text = doc[i].get_text().strip()
             text_chars += len(text)
+            full_text.append(text)
             out.append(f"--- Page {i + 1} ---\n{text}\n")
-        # [OCR_GEMINI_2026-06-11] No text layer => scanned/image PDF.
-        # OCR the selected pages via the pii-proxy Gemini shim instead
-        # of returning empty pages. to_thread keeps the blocking HTTP
-        # call off the server's event loop.
-        if rng and text_chars < 25 * len(rng):
+        # Decide whether the text layer is USABLE. Two failure modes both
+        # mean "fall back to image OCR" rather than returning the text:
+        #   (a) empty/near-empty  -> scanned image PDF, no text layer.
+        #   (b) GARBAGE           -> broken font encoding (no/!bad ToUnicode
+        #       CMap), so get_text() returns glyph-id codepoints that render
+        #       as mojibake. Detect via a low printable-ASCII ratio over a
+        #       non-trivial amount of text. Readable English/Latin docs sit
+        #       ~0.95; mojibake sits ~0.2-0.4. 0.55 cleanly separates them
+        #       without tripping on normal accented text.
+        joined = "".join(full_text)
+        printable = sum(1 for c in joined if 32 <= ord(c) < 127)
+        ascii_ratio = printable / len(joined) if joined else 1.0
+        empty = rng and text_chars < 25 * len(rng)
+        garbage = text_chars >= 100 and ascii_ratio < 0.55
+        # [OCR_GEMINI_2026-06-11] No usable text layer => OCR the selected
+        # pages via the pii-proxy Gemini shim. to_thread keeps the blocking
+        # HTTP call off the server's event loop.
+        if rng and (empty or garbage):
             if len(rng) >= total:
                 data = rp.read_bytes()
             else:
@@ -283,17 +348,18 @@ async def _parse_pdf_file(rp: Path, pages: str, display_name: str = "") -> str:
                 sub.insert_pdf(doc, from_page=rng[0], to_page=rng[-1])
                 data = sub.tobytes()
                 sub.close()
+            reason = ("garbled text layer (broken font encoding)" if garbage
+                      else "no text layer")
             try:
                 md = await asyncio.to_thread(ocr_bytes, data, "application/pdf")
                 return (
-                    f"# {name} ({total} pages — no text layer on the "
-                    f"selected {len(rng)} page(s); OCR'd via Gemini "
-                    f"vision)\n\n{md}"
+                    f"# {name} ({total} pages — {reason} on the selected "
+                    f"{len(rng)} page(s); OCR'd via Gemini vision)\n\n{md}"
                 )
             except Exception as e:
                 out.append(
-                    f"\n[Note: these pages have no text layer (likely a "
-                    f"scan) and the OCR fallback failed: {e}]"
+                    f"\n[Note: these pages have {reason} and the OCR "
+                    f"fallback failed: {e}]"
                 )
         return "\n".join(out)
     except Exception as e:
