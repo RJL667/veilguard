@@ -53,6 +53,139 @@ def _reject_foreign_windows_path(path: str, _posix: bool = (os.name != "nt")):
     return ""
 
 
+# [DAEMON_PDF_FETCH_2026-06-12] When this service runs on the cloud VM and
+# the requested file lives on the USER's Windows machine, we can still get
+# it — through the user's connected client daemon — using only tool
+# primitives EVERY DEPLOYED daemon already has (no daemon release needed):
+#
+#   1. run_command: `certutil -encode -f <path> <handoff>` base64-encodes
+#      the file into a handoff file in the daemon's workspace root
+#      (run_command's cwd). certutil is built into Windows; no PowerShell
+#      (which mangles through the daemon's `cmd /c` quoting), no pipes
+#      (those flip the daemon into shell=True + trip its has_pipe path).
+#   2. read_file: the handoff is pure ASCII, so the daemon's text reader
+#      is lossless. Read in <=500-line chunks (the daemon's per-call cap);
+#      strip the daemon's "<n>\t" line-number prefix and certutil's
+#      -----BEGIN/END CERTIFICATE----- markers, then base64-decode.
+#   3. run_command `del`: remove the handoff (plain `del` passes the
+#      daemon's dangerous-command filter; `/s`-style switches would not).
+#
+# Bytes are then parsed server-side (PyMuPDF + the OCR shim). Routed via
+# core.agentic.handle_tool so per-user bridge selection + the approval
+# gate apply exactly as for any other client tool call. Limitation: paths
+# containing SPACES can't survive the daemon's `cmd /c` unquoting, so they
+# fall through to the "ask the user to attach" message — correct fallback.
+_DAEMON_FETCH_MAX = 15 * 1024 * 1024  # bytes; aligned with the OCR cap
+_READ_CHUNK_LINES = 500   # lines per read_file call (daemon's hard cap)
+
+_LINE_NUM = re.compile(r"^\s*\d+\t(.*)$")  # daemon read_file prefixes "<n>\t"
+
+
+def _daemon_available() -> bool:
+    """True if the current request's user has a connected client daemon."""
+    if os.name == "nt":
+        return False  # local stack: direct filesystem access already works
+    try:
+        from core.client_bridge import get_bridge
+        from core.request_ctx import get_user_id
+        bridge = get_bridge(get_user_id() or "")
+        return bool(bridge and bridge.connected)
+    except Exception:
+        return False
+
+
+def _certutil_fetch_command(path: str, handoff: str) -> str | None:
+    """Build the run_command string that base64s `path` into `handoff`.
+
+    Returns None if the path can't be passed safely (contains a space or a
+    double-quote — the daemon's `cmd /c` mangles embedded quotes). The
+    daemon runs certutil with cwd=workspace root, so a relative path
+    resolves there and an absolute Windows path is used as-is. Windows
+    certutil wants BACKSLASHES, so normalize any forward slashes.
+    """
+    p = path.strip().replace("/", "\\")
+    if " " in p or '"' in p or "\n" in p:
+        return None
+    return f"certutil -encode -f {p} {handoff}"
+
+
+async def _fetch_bytes_via_daemon(path: str) -> tuple[bytes | None, str]:
+    """Pull a file from the user's machine via their client daemon.
+
+    Returns (bytes, "") on success or (None, reason). Reasons are
+    LLM-facing — they state plainly what happened and what to do next.
+    """
+    import base64 as _b64
+    import uuid as _uuid
+    from core.agentic import handle_tool
+
+    handoff = f"vg_xfer_{_uuid.uuid4().hex[:8]}.b64"
+    cmd = _certutil_fetch_command(path, handoff)
+    if cmd is None:
+        return None, (
+            f"{path!r} contains a space (or quote) that the client-daemon "
+            "transfer can't carry. Ask the user to attach the file in chat "
+            "via the '+' menu -> 'Upload as Text' instead."
+        )
+
+    out = str(await handle_tool(
+        "run_command", {"command": cmd, "timeout": 120},
+    ) or "")
+    if "successfully" not in out.lower():
+        if "BLOCKED" in out:
+            return None, f"daemon refused the transfer command: {out[:200]}"
+        # certutil prints "cannot find the file" / "path not found" on a miss.
+        return None, (
+            f"the daemon could not read {path!r} from the user's machine "
+            f"(certutil: {out.strip().splitlines()[-1][:160] if out.strip() else 'no output'}). "
+            "Give the path exactly as the user stated it (e.g. "
+            "'Downloads/<name>.pdf'), or have them attach it via '+' -> "
+            "'Upload as Text'."
+        )
+
+    chunks: list[str] = []
+    offset = 0
+    try:
+        while True:
+            body = str(await handle_tool(
+                "read_file",
+                {"path": handoff, "offset": offset, "limit": _READ_CHUNK_LINES},
+            ) or "")
+            if body.startswith("Error:") or "BLOCKED" in body[:200]:
+                return None, f"daemon read-back failed: {body[:300]}"
+            consumed = 0
+            for line in body.splitlines():
+                m = _LINE_NUM.match(line)
+                if not m:
+                    continue
+                consumed += 1  # advance offset by every numbered line
+                content = m.group(1).strip()
+                if content and not content.startswith("-----"):
+                    chunks.append(content)  # skip BEGIN/END CERTIFICATE markers
+            if "[end of file" in body:
+                break
+            if consumed == 0:
+                return None, "daemon read-back returned no data lines."
+            offset += consumed
+    finally:
+        # Best-effort cleanup; plain `del` passes the daemon's command filter.
+        try:
+            await handle_tool("run_command", {"command": f"del {handoff}", "timeout": 30})
+        except Exception:
+            pass
+
+    try:
+        data = _b64.b64decode("".join(chunks))
+    except Exception as e:
+        return None, f"transfer corrupted (base64 decode failed: {e})"
+    if len(data) > _DAEMON_FETCH_MAX:
+        return None, (
+            f"the file is {len(data) // (1024 * 1024)}MB, over the "
+            f"{_DAEMON_FETCH_MAX // (1024 * 1024)}MB transfer limit."
+        )
+    return data, ""
+
+
 def _resolve_read(path: str):
     """Return (resolved_path, "") or (None, error_str)."""
     if not isinstance(path, str) or not path.strip():
@@ -70,7 +203,17 @@ def _resolve_read(path: str):
             f"({root}). Set HOST_DOC_READ_ROOT to widen."
         )
     if not rp.exists():
-        return None, f"Error: File not found: {rp}"
+        msg = f"Error: File not found: {rp}"
+        if os.name != "nt":
+            # [VM_PATH_GUARD_2026-06-12] Relative paths ("Downloads/x.pdf")
+            # resolve under the SERVER's home on the VM and miss too — same
+            # redirect as the drive-letter guard so the model stops probing.
+            msg += (
+                " (This server is NOT the user's machine. If the file is on "
+                "the user's machine, do not try other paths — ask the user "
+                "to attach it in chat via '+' -> 'Upload as Text'.)"
+            )
+        return None, msg
     if not rp.is_file():
         return None, f"Error: Not a file: {rp}"
     return rp, ""
@@ -100,108 +243,166 @@ def _resolve_write(path: str):
     return rp, ""
 
 
+async def _parse_pdf_file(rp: Path, pages: str, display_name: str = "") -> str:
+    """Extract text from the PDF at `rp` (server-local path), with the
+    Gemini-OCR fallback for scanned pages. Shared by the direct-path and
+    daemon-fetched branches of read_pdf."""
+    name = display_name or rp.name
+    try:
+        import fitz  # PyMuPDF
+    except Exception as e:
+        return f"Error: PDF parser (PyMuPDF) unavailable on host: {e}"
+    try:
+        doc = fitz.open(str(rp))
+    except Exception as e:
+        return f"Error opening PDF: {e}"
+    try:
+        total = len(doc)
+        if pages.strip():
+            parts = pages.strip().split("-")
+            start = max(0, int(parts[0]) - 1)
+            end = int(parts[-1]) if len(parts) > 1 else start + 1
+            rng = range(start, min(end, total))
+        else:
+            rng = range(total)
+        out = [f"# {name} ({total} pages, reading {len(rng)})\n"]
+        text_chars = 0
+        for i in rng:
+            text = doc[i].get_text().strip()
+            text_chars += len(text)
+            out.append(f"--- Page {i + 1} ---\n{text}\n")
+        # [OCR_GEMINI_2026-06-11] No text layer => scanned/image PDF.
+        # OCR the selected pages via the pii-proxy Gemini shim instead
+        # of returning empty pages. to_thread keeps the blocking HTTP
+        # call off the server's event loop.
+        if rng and text_chars < 25 * len(rng):
+            if len(rng) >= total:
+                data = rp.read_bytes()
+            else:
+                sub = fitz.open()
+                sub.insert_pdf(doc, from_page=rng[0], to_page=rng[-1])
+                data = sub.tobytes()
+                sub.close()
+            try:
+                md = await asyncio.to_thread(ocr_bytes, data, "application/pdf")
+                return (
+                    f"# {name} ({total} pages — no text layer on the "
+                    f"selected {len(rng)} page(s); OCR'd via Gemini "
+                    f"vision)\n\n{md}"
+                )
+            except Exception as e:
+                out.append(
+                    f"\n[Note: these pages have no text layer (likely a "
+                    f"scan) and the OCR fallback failed: {e}]"
+                )
+        return "\n".join(out)
+    except Exception as e:
+        return f"Error reading PDF: {e}"
+    finally:
+        doc.close()
+
+
+async def _read_pdf_via_daemon(path: str, pages: str) -> str:
+    """Fetch a PDF from the user's machine via their client daemon and
+    parse it server-side."""
+    import tempfile
+
+    data, why = await _fetch_bytes_via_daemon(path)
+    if data is None:
+        return f"Error: {why}"
+    if not data.startswith(b"%PDF"):
+        return (
+            f"Error: {path!r} was transferred from the user's machine "
+            f"({len(data)} bytes) but is not a PDF (no %PDF header)."
+        )
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    try:
+        tmp.write(data)
+        tmp.close()
+        text = await _parse_pdf_file(
+            Path(tmp.name), pages,
+            display_name=Path(path.replace("\\", "/")).name,
+        )
+        return text + "\n\n[fetched from the user's machine via the Veilguard client daemon]"
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 def register(mcp):
     @mcp.tool()
     async def read_pdf(path: str, pages: str = "") -> str:
-        """Read and extract text from a PDF on the machine RUNNING this
-        sub-agents service.
+        """Read and extract text from a PDF — on the machine running this
+        service, or on the USER's machine via their Veilguard client daemon.
 
-        LOCAL install: that is the user's Windows machine, so real Windows
-        paths work (e.g. 'C:/Users/<name>/Downloads/report.pdf'); forward or
-        back slashes both work. CLOUD/VM deployment: that is the Veilguard
-        server — the user's local files are NOT reachable by any path. If the
-        user mentions a file on THEIR machine, do not guess paths; ask them to
-        attach it in chat ('+' menu -> 'Upload as Text') and the text will be
-        OCR'd into the conversation.
+        LOCAL install: this service runs on the user's Windows machine, so
+        real Windows paths work directly (e.g.
+        'C:/Users/<name>/Downloads/report.pdf'); forward or back slashes both
+        work. CLOUD/VM deployment: paths resolve on the Veilguard server —
+        but if the file isn't found there and the user has their Veilguard
+        client daemon connected, the file is fetched from THEIR machine
+        automatically (give the path as the user stated it, e.g.
+        'Downloads/report.pdf' or 'C:/Users/<name>/Downloads/report.pdf').
+        If no daemon is connected, ask the user to attach the file in chat
+        ('+' menu -> 'Upload as Text') instead of guessing paths.
 
         Args:
-            path: PDF path (absolute, or relative to the service home dir).
+            path: PDF path (absolute, or relative to home/workspace).
             pages: Page range like "1-5" or "3". Empty = all pages.
         """
         rp, err = _resolve_read(path)
         if err:
+            # Server-side miss (Windows path, or not found under the server
+            # home). If this user has a connected client daemon, fetch the
+            # file from their machine instead of bouncing the error.
+            if _daemon_available():
+                return await _read_pdf_via_daemon(path, pages)
             return err
-        try:
-            import fitz  # PyMuPDF
-        except Exception as e:
-            return f"Error: PDF parser (PyMuPDF) unavailable on host: {e}"
-        try:
-            doc = fitz.open(str(rp))
-        except Exception as e:
-            return f"Error opening PDF: {e}"
-        try:
-            total = len(doc)
-            if pages.strip():
-                parts = pages.strip().split("-")
-                start = max(0, int(parts[0]) - 1)
-                end = int(parts[-1]) if len(parts) > 1 else start + 1
-                rng = range(start, min(end, total))
-            else:
-                rng = range(total)
-            out = [f"# {rp.name} ({total} pages, reading {len(rng)})\n"]
-            text_chars = 0
-            for i in rng:
-                text = doc[i].get_text().strip()
-                text_chars += len(text)
-                out.append(f"--- Page {i + 1} ---\n{text}\n")
-            # [OCR_GEMINI_2026-06-11] No text layer => scanned/image PDF.
-            # OCR the selected pages via the pii-proxy Gemini shim instead
-            # of returning empty pages. to_thread keeps the blocking HTTP
-            # call off the server's event loop.
-            if rng and text_chars < 25 * len(rng):
-                if len(rng) >= total:
-                    data = rp.read_bytes()
-                else:
-                    sub = fitz.open()
-                    sub.insert_pdf(doc, from_page=rng[0], to_page=rng[-1])
-                    data = sub.tobytes()
-                    sub.close()
-                try:
-                    md = await asyncio.to_thread(ocr_bytes, data, "application/pdf")
-                    return (
-                        f"# {rp.name} ({total} pages — no text layer on the "
-                        f"selected {len(rng)} page(s); OCR'd via Gemini "
-                        f"vision)\n\n{md}"
-                    )
-                except Exception as e:
-                    out.append(
-                        f"\n[Note: these pages have no text layer (likely a "
-                        f"scan) and the OCR fallback failed: {e}]"
-                    )
-            return "\n".join(out)
-        except Exception as e:
-            return f"Error reading PDF: {e}"
-        finally:
-            doc.close()
+        return await _parse_pdf_file(rp, pages)
 
     @mcp.tool()
     async def read_xlsx(path: str, sheet: str = "", max_rows: int = 500) -> str:
-        """Read an Excel spreadsheet on the machine RUNNING this sub-agents
-        service, as text.
+        """Read an Excel spreadsheet as text — from this machine, or from
+        the USER's machine via their Veilguard client daemon.
 
         LOCAL install: the user's Windows machine (real Windows paths work).
-        CLOUD/VM deployment: the Veilguard server — the user's local files
-        are NOT reachable; ask the user to attach the file in chat instead
-        of guessing paths.
+        CLOUD/VM deployment: paths resolve on the Veilguard server, but if
+        the file isn't found there and the user's client daemon is
+        connected, it is fetched from THEIR machine automatically. If no
+        daemon is connected, ask the user to attach the file in chat.
 
         Args:
-            path: XLSX path (absolute, or relative to the service home dir).
+            path: XLSX path (absolute, or relative to home/workspace).
             sheet: Sheet name. Empty = first/active sheet.
             max_rows: Max rows to return (default 500).
         """
+        import io as _io
+
+        src = None
+        fetched = False
         rp, err = _resolve_read(path)
         if err:
-            return err
+            if _daemon_available():
+                data, why = await _fetch_bytes_via_daemon(path)
+                if data is None:
+                    return f"Error: {why}"
+                src = _io.BytesIO(data)
+                fetched = True
+            else:
+                return err
         try:
             from openpyxl import load_workbook
         except Exception as e:
             return f"Error: Excel parser (openpyxl) unavailable on host: {e}"
         try:
-            wb = load_workbook(str(rp), read_only=True, data_only=True)
+            wb = load_workbook(src if fetched else str(rp), read_only=True, data_only=True)
             ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
             if sheet and sheet not in wb.sheetnames:
                 return f"Error: Sheet {sheet!r} not found. Available: {wb.sheetnames}"
-            out = [f"# {rp.name} — Sheet: {ws.title}", f"# Sheets: {wb.sheetnames}\n"]
+            disp = Path(path.replace("\\", "/")).name if fetched else rp.name
+            out = [f"# {disp} — Sheet: {ws.title}", f"# Sheets: {wb.sheetnames}\n"]
             n = 0
             for row in ws.iter_rows(values_only=True):
                 if n >= max_rows:
