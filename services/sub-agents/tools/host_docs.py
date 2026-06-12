@@ -16,6 +16,7 @@ HOST_DOC_READ_ROOT. These are READ-ONLY parsers; no writes.
 
 import asyncio
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -27,11 +28,37 @@ from ocr_client import ocr_bytes  # noqa: E402
 
 _DOC_READ_ROOT = os.environ.get("HOST_DOC_READ_ROOT", os.path.expanduser("~"))
 
+# [VM_PATH_GUARD_2026-06-12] On the cloud VM this service runs on Linux, but
+# the model — seeing files like 'C:\Users\...\x.pdf' mentioned in chat —
+# calls these tools with Windows paths. Path("C:/...") is NOT absolute on
+# POSIX, so it used to get joined onto $HOME and produce nonsense like
+# /home/rudol/C:/Users/... The guard converts that into an instruction the
+# model can act on instead of retrying path spellings forever.
+_WIN_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _reject_foreign_windows_path(path: str, _posix: bool = (os.name != "nt")):
+    """Non-empty error string if `path` is a Windows drive path on Linux."""
+    if _posix and _WIN_DRIVE.match(path.strip()):
+        return (
+            f"Error: {path!r} is a Windows path, but this tool runs on the "
+            "Veilguard SERVER (Linux) and cannot see the user's local drive. "
+            "Do NOT retry other path spellings — no path will work. To READ "
+            "a file from the user's machine, ask the user to attach it in "
+            "chat via the '+' menu -> 'Upload as Text' (it is OCR'd and its "
+            "full text arrives in the conversation). To WRITE a file, use a "
+            "server-side path (relative to home) and tell the user where it "
+            "was saved."
+        )
+    return ""
+
 
 def _resolve_read(path: str):
     """Return (resolved_path, "") or (None, error_str)."""
     if not isinstance(path, str) or not path.strip():
         return None, "Error: path is required"
+    if err := _reject_foreign_windows_path(path):
+        return None, err
     p = Path(path.replace("\\", "/"))
     if not p.is_absolute():
         p = Path(_DOC_READ_ROOT) / p
@@ -54,6 +81,8 @@ def _resolve_write(path: str):
     reads, but the file need not exist; parent dirs are created."""
     if not isinstance(path, str) or not path.strip():
         return None, "Error: path is required"
+    if err := _reject_foreign_windows_path(path):
+        return None, err
     p = Path(path.replace("\\", "/"))
     if not p.is_absolute():
         p = Path(_DOC_READ_ROOT) / p
@@ -74,15 +103,19 @@ def _resolve_write(path: str):
 def register(mcp):
     @mcp.tool()
     async def read_pdf(path: str, pages: str = "") -> str:
-        """Read and extract text from a PDF on the user's Windows machine.
+        """Read and extract text from a PDF on the machine RUNNING this
+        sub-agents service.
 
-        USE THIS for PDFs at real Windows paths, e.g.
-        'C:/Users/rudol/Downloads/report.pdf'. The container 'documents'
-        read_pdf cannot see Windows paths — this runs on the host and parses
-        with PyMuPDF. Forward or back slashes both work.
+        LOCAL install: that is the user's Windows machine, so real Windows
+        paths work (e.g. 'C:/Users/<name>/Downloads/report.pdf'); forward or
+        back slashes both work. CLOUD/VM deployment: that is the Veilguard
+        server — the user's local files are NOT reachable by any path. If the
+        user mentions a file on THEIR machine, do not guess paths; ask them to
+        attach it in chat ('+' menu -> 'Upload as Text') and the text will be
+        OCR'd into the conversation.
 
         Args:
-            path: PDF path (absolute Windows path, or relative to the user's home dir).
+            path: PDF path (absolute, or relative to the service home dir).
             pages: Page range like "1-5" or "3". Empty = all pages.
         """
         rp, err = _resolve_read(path)
@@ -143,14 +176,16 @@ def register(mcp):
 
     @mcp.tool()
     async def read_xlsx(path: str, sheet: str = "", max_rows: int = 500) -> str:
-        """Read an Excel spreadsheet on the user's WINDOWS machine as text.
+        """Read an Excel spreadsheet on the machine RUNNING this sub-agents
+        service, as text.
 
-        USE THIS for .xlsx at real Windows paths (e.g.
-        'C:/Users/rudol/test_excel.xlsx'). The container 'documents' read_xlsx
-        cannot see Windows paths; this runs on the host.
+        LOCAL install: the user's Windows machine (real Windows paths work).
+        CLOUD/VM deployment: the Veilguard server — the user's local files
+        are NOT reachable; ask the user to attach the file in chat instead
+        of guessing paths.
 
         Args:
-            path: XLSX path (absolute Windows path or relative to the user's home).
+            path: XLSX path (absolute, or relative to the service home dir).
             sheet: Sheet name. Empty = first/active sheet.
             max_rows: Max rows to return (default 500).
         """
@@ -181,15 +216,17 @@ def register(mcp):
 
     @mcp.tool()
     async def create_xlsx(path: str, data: str, sheet_name: str = "Sheet1") -> str:
-        """Create an Excel spreadsheet ON the user's WINDOWS machine.
+        """Create an Excel spreadsheet on the machine RUNNING this
+        sub-agents service.
 
-        USE THIS (not the container 'documents' create_xlsx) to create .xlsx
-        files on the user's actual machine, e.g.
-        'C:/Users/rudol/Downloads/report.xlsx'. The container tool only writes
-        inside its own /workspace and never touches the user's filesystem.
+        LOCAL install: writes to the user's Windows machine (e.g.
+        'C:/Users/<name>/Downloads/report.xlsx'). CLOUD/VM deployment: writes
+        land on the Veilguard SERVER, not the user's machine — use a path
+        relative to home and tell the user where the file was saved. The
+        container 'documents' create_xlsx only writes inside its /workspace.
 
         Args:
-            path: Output XLSX path (absolute Windows path or relative to the user's home).
+            path: Output XLSX path (absolute, or relative to the service home dir).
             data: JSON string — a list of dicts [{"col":"val",...}] OR a list of
                   lists [["h1","h2"],["v1","v2"]] (first row = header).
             sheet_name: Worksheet name.
@@ -237,15 +274,17 @@ def register(mcp):
 
     @mcp.tool()
     async def create_pdf(path: str, content: str, title: str = "") -> str:
-        """Create a PDF document ON the user's WINDOWS machine.
+        """Create a PDF document on the machine RUNNING this sub-agents
+        service.
 
-        USE THIS — not the container 'documents' tools, and WITHOUT any
-        Host-Exec dependency — to write a .pdf straight onto the user's
-        filesystem, e.g. 'C:/Users/rudol/Downloads/report.pdf'. Runs on the
-        host with reportlab. This is the PDF counterpart to create_xlsx.
+        LOCAL install: writes to the user's Windows machine (e.g.
+        'C:/Users/<name>/Downloads/report.pdf'). CLOUD/VM deployment: writes
+        land on the Veilguard SERVER, not the user's machine — use a path
+        relative to home and tell the user where the file was saved. Runs
+        with reportlab; PDF counterpart to create_xlsx.
 
         Args:
-            path: Output PDF path (absolute Windows path or relative to the user's home).
+            path: Output PDF path (absolute, or relative to the service home dir).
             content: Body as light markdown, parsed per line: '# '/'## '/'### '
                      headings, '- ' or '* ' bullets, blank line = spacer,
                      '**bold**' inline; anything else = a paragraph.

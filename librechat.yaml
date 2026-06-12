@@ -137,6 +137,15 @@ endpoints:
       - "actions"
       - "tools"
       - "artifacts"
+      # [DOC_OCR_FIX_2026-06-12] "context" gates the "Upload as Text" attach
+      # menu item (client useAgentCapabilities.contextEnabled). Without it the
+      # ONLY UI path that routes a doc through the OCR Gemini shim ->
+      # redaction -> prompt injection is hidden, so plain PDF uploads never
+      # reach the model and the agent asks for a local path. "ocr" alone only
+      # lets the SERVER run OCR for tool_resource=context uploads the UI can no
+      # longer produce. Supplying this list REPLACES defaultAgentCapabilities
+      # (Zod .default = replace, not merge), which is how "context" got dropped.
+      - "context"
       - "ocr"
       - "chain"
 
