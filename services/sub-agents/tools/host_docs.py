@@ -76,9 +76,31 @@ def _reject_foreign_windows_path(path: str, _posix: bool = (os.name != "nt")):
 # containing SPACES can't survive the daemon's `cmd /c` unquoting, so they
 # fall through to the "ask the user to attach" message — correct fallback.
 _DAEMON_FETCH_MAX = 15 * 1024 * 1024  # bytes; aligned with the OCR cap
-_READ_CHUNK_LINES = 500   # lines per read_file call (daemon's hard cap)
+
+# The read-back is sent DIRECT to the daemon bridge (not via handle_tool),
+# which bypasses two things that broke earlier attempts:
+#   * the task dispatcher truncates every result to 8000 chars
+#     (core/tasks/executors/daemon.py) — that sliced base64 lines in half
+#     and silently corrupted multi-chunk files;
+#   * the per-call approval gate — going through it would prompt the user
+#     once PER chunk (dozens of times) for one read.
+# Direct execute_remote returns the FULL result, so we can use big chunks
+# (~355KB each, far under uvicorn's 16MB WS frame cap) and keep round-trips
+# low. The footer-presence check below is still a backstop against any
+# residual truncation.
+_READ_CHUNK_LINES = 10000
+# A transfer must finish inside the MCP tool-call timeout (~60s). certutil
+# base64 is ~64 chars/line ≈ 48 source bytes/line, so cap the relay at a size
+# that comfortably completes; anything bigger is told to use Upload as Text
+# (which streams server-side and has no per-call timeout). The 15MB hard cap
+# (_DAEMON_FETCH_MAX) still guards the decode, but we bail BEFORE transferring.
+_FAST_XFER_MAX_BYTES = 8 * 1024 * 1024
+_FOOTER_TOTAL = re.compile(r"\bof (\d+)")  # "...showed lines X-Y of TOTAL..."
 
 _LINE_NUM = re.compile(r"^\s*\d+\t(.*)$")  # daemon read_file prefixes "<n>\t"
+# Daemon read_file always appends one of these footers; its ABSENCE means
+# the 8000-char dispatcher cap truncated the response mid-line.
+_READ_FOOTER = ("[end of file", "[partial read")
 
 
 def _daemon_available() -> bool:
@@ -143,6 +165,8 @@ async def _fetch_bytes_via_daemon(path: str) -> tuple[bytes | None, str]:
     import hashlib as _hash
     import uuid as _uuid
     from core.agentic import handle_tool
+    from core.client_bridge import get_bridge
+    from core.request_ctx import get_user_id
 
     if _path_unsafe(path.strip().replace("/", "\\")):
         return None, (
@@ -151,10 +175,21 @@ async def _fetch_bytes_via_daemon(path: str) -> tuple[bytes | None, str]:
             "via the '+' menu -> 'Upload as Text' instead."
         )
 
+    bridge = get_bridge(get_user_id() or "")
+    if not bridge or not bridge.connected:
+        return None, (
+            "no client daemon is connected for this user, so the file can't "
+            "be fetched from their machine. Ask the user to start the "
+            "Veilguard client, or attach the file via '+' -> 'Upload as Text'."
+        )
+
     last_reason = "unknown error"
     for attempt in range(3):
         handoff = f"vg_xfer_{_uuid.uuid4().hex[:8]}.b64"
         cmd = _certutil_fetch_command(path, handoff)
+        # certutil goes through handle_tool so the approval gate applies once
+        # ("run a command on the user's machine"); its result is small so the
+        # dispatcher's 8000-char cap never bites.
         out = str(await handle_tool(
             "run_command", {"command": cmd, "timeout": 120},
         ) or "")
@@ -176,36 +211,65 @@ async def _fetch_bytes_via_daemon(path: str) -> tuple[bytes | None, str]:
         read_err = ""
         try:
             while True:
-                body = str(await handle_tool(
+                # DIRECT bridge call: full untruncated result, no per-chunk
+                # approval prompt.
+                body = str(await bridge.execute_remote(
                     "read_file",
                     {"path": handoff, "offset": offset, "limit": _READ_CHUNK_LINES},
+                    timeout=60.0,
                 ) or "")
                 if body.startswith("Error:") or "BLOCKED" in body[:200]:
                     read_err = f"daemon read-back failed: {body[:300]}"
                     break
-                consumed = 0
-                for line in body.splitlines():
-                    m = _LINE_NUM.match(line)
-                    if not m:
-                        continue
-                    consumed += 1  # advance offset by every numbered line
-                    content = m.group(1).strip()
-                    if content and not content.startswith("-----"):
-                        chunks.append(content)  # skip BEGIN/END CERTIFICATE markers
-                if "[end of file" in body:
+                # Early size-bail: the first chunk's footer reports the total
+                # line count; if that implies a file too big to relay inside
+                # the MCP timeout, stop now and send the user to Upload as Text.
+                if offset == 0:
+                    mt = _FOOTER_TOTAL.search(body)
+                    if mt and int(mt.group(1)) * 48 > _FAST_XFER_MAX_BYTES:
+                        approx_mb = (int(mt.group(1)) * 48) // (1024 * 1024)
+                        read_err = (
+                            f"TOOBIG:{approx_mb}"  # handled below, no retry
+                        )
+                        break
+                has_footer = any(f in body for f in _READ_FOOTER)
+                data_lines = [
+                    m.group(1) for m in (
+                        _LINE_NUM.match(ln) for ln in body.splitlines()
+                    ) if m
+                ]
+                # No footer => the response was truncated mid-line, so the
+                # LAST data line is partial — drop it and re-read from there.
+                # (Direct bridge isn't capped, so this is just a backstop.)
+                if not has_footer and data_lines:
+                    data_lines = data_lines[:-1]
+                if not data_lines:
+                    read_err = "daemon read-back returned no usable data lines."
                     break
-                if consumed == 0:
-                    read_err = "daemon read-back returned no data lines."
+                for content in data_lines:
+                    c = content.strip()
+                    if c and not c.startswith("-----"):
+                        chunks.append(c)  # skip BEGIN/END CERTIFICATE markers
+                offset += len(data_lines)  # advance by lines actually consumed
+                if has_footer and "[end of file" in body:
                     break
-                offset += consumed
         finally:
             # Best-effort cleanup; plain `del` passes the daemon's filter.
             try:
-                await handle_tool("run_command", {"command": f"del {handoff}", "timeout": 30})
+                await bridge.execute_remote(
+                    "run_command", {"command": f"del {handoff}"}, timeout=30.0)
             except Exception:
                 pass
 
         if read_err:
+            if read_err.startswith("TOOBIG:"):
+                mb = read_err.split(":", 1)[1]
+                return None, (
+                    f"the file is ~{mb}MB — too large to fetch through the "
+                    "client-daemon relay within the request timeout. Ask the "
+                    "user to attach it in chat via '+' -> 'Upload as Text' "
+                    "instead (no size/timeout limit there)."
+                )
             last_reason = read_err
             continue
         try:
