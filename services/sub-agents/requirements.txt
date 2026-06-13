@@ -5,3 +5,7 @@ httpx>=0.28.0
 reportlab>=4.0
 openpyxl>=3.1
 PyMuPDF>=1.24
+# Document ingest (tools/ingest_files.py via host_docs): Word + PowerPoint
+# extraction. Same versions the documents MCP server already ships.
+python-docx>=1.1.0
+python-pptx>=1.0.0

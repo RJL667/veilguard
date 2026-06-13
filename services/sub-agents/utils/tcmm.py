@@ -40,3 +40,42 @@ async def tcmm_recall(query: str, conversation_id: str = "") -> str:
             return ""
     except Exception:
         return ""
+
+
+async def ingest_text(
+    *,
+    chunks: list,
+    conversation_id: str,
+    user_id: str = "",
+    title: str = "",
+    source: str = "",
+    channel: str = "team_knowledge",
+    doc_id: str = "",
+    provenance: dict | None = None,
+) -> dict:
+    """POST a pre-chunked document to TCMM ``/ingest_text`` (ingest
+    architecture Phase 1 endpoint). Bulk-writes the chunks into the archive
+    as a cohesive, recall-only knowledge unit — NOT a conversation turn.
+
+    Returns the service response dict (``{"doc_id", "chunks_added", ...}``)
+    or ``{"chunks_added": 0, "error": ...}`` on failure. Never raises.
+    """
+    if not chunks or not conversation_id:
+        return {"chunks_added": 0, "error": "missing chunks or conversation_id"}
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(f"{TCMM_URL}/ingest_text", json={
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "doc_id": doc_id,
+                "title": title,
+                "source": source,
+                "channel": channel,
+                "chunks": chunks,
+                "provenance": provenance or {},
+            })
+            if resp.status_code == 200:
+                return resp.json()
+            return {"chunks_added": 0, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+    except Exception as e:
+        return {"chunks_added": 0, "error": str(e)}

@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GitHub Actions vs GitLab CI — Free Tier Comparison</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f4f6f9;
+      color: #1a1a2e;
+      padding: 2rem 1rem;
+    }
+
+    h1 {
+      text-align: center;
+      font-size: 1.6rem;
+      font-weight: 700;
+      margin-bottom: 0.4rem;
+      color: #0d1117;
+    }
+
+    .subtitle {
+      text-align: center;
+      font-size: 0.85rem;
+      color: #555;
+      margin-bottom: 2rem;
+    }
+
+    .table-wrapper {
+      max-width: 900px;
+      margin: 0 auto;
+      overflow-x: auto;
+      border-radius: 8px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.10);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+    }
+
+    thead tr {
+      background: #0d1117;
+      color: #fff;
+    }
+
+    thead th {
+      padding: 1rem 1.2rem;
+      text-align: left;
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    thead th:first-child {
+      width: 28%;
+      color: #adb5bd;
+    }
+
+    thead th.gh {
+      background: #161b22;
+      border-left: 3px solid #238636;
+    }
+
+    thead th.gl {
+      background: #1a1a2e;
+      border-left: 3px solid #fc6d26;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid #e8ecf0;
+      transition: background 0.15s;
+    }
+
+    tbody tr:last-child { border-bottom: none; }
+
+    tbody tr:hover { background: #f0f4ff; }
+
+    tbody tr:nth-child(even) { background: #f8f9fb; }
+    tbody tr:nth-child(even):hover { background: #eef2ff; }
+
+    td {
+      padding: 0.85rem 1.2rem;
+      font-size: 0.88rem;
+      vertical-align: top;
+      line-height: 1.5;
+    }
+
+    td:first-child {
+      font-weight: 600;
+      color: #444;
+      background: #fafbfc;
+      border-right: 1px solid #e8ecf0;
+    }
+
+    td.gh { border-left: 3px solid #238636; }
+    td.gl { border-left: 3px solid #fc6d26; }
+
+    .badge {
+      display: inline-block;
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+
+    .badge-green  { background: #d4edda; color: #155724; }
+    .badge-orange { background: #ffe5d0; color: #7d3a00; }
+    .badge-blue   { background: #d0e8ff; color: #003d7a; }
+    .badge-grey   { background: #e9ecef; color: #495057; }
+    .badge-red    { background: #fde8e8; color: #7a0000; }
+
+    .note {
+      margin-top: 1.5rem;
+      max-width: 900px;
+      margin-left: auto;
+      margin-right: auto;
+      font-size: 0.78rem;
+      color: #777;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>GitHub Actions vs GitLab CI — Free Tier Comparison</h1>
+  <p class="subtitle">As of mid-2025 &nbsp;|&nbsp; Public &amp; private repositories &nbsp;|&nbsp; Hosted runners</p>
+
+  <div class="table-wrapper">
+    <table>
+      <thead>
+        <tr>
+          <th>Feature</th>
+          <th class="gh">GitHub Actions</th>
+          <th class="gl">GitLab CI/CD</th>
+        </tr>
+      </thead>
+      <tbody>
+
+        <tr>
+          <td>Free CI minutes (private repos)</td>
+          <td class="gh">2,000 min / month (Linux)<br>500 min macOS · 1× Windows</td>
+          <td class="gl">400 min / month (shared runners)<br>Verification required</td>
+        </tr>
+
+        <tr>
+          <td>Free CI minutes (public repos)</td>
+          <td class="gh"><span class="badge badge-green">Unlimited</span></td>
+          <td class="gl"><span class="badge badge-green">Unlimited</span></td>
+        </tr>
+
+        <tr>
+          <td>Concurrent jobs (free)</td>
+          <td class="gh">20 concurrent (public)<br>1 concurrent (private)</td>
+          <td class="gl">Up to 4 concurrent (shared)<br>Varies by verification tier</td>
+        </tr>
+
+        <tr>
+          <td>Hosted runner OS</td>
+          <td class="gh">Linux (Ubuntu), Windows, macOS</td>
+          <td class="gl">Linux (Ubuntu) — primary<br>Windows &amp; macOS via SaaS runners (beta / paid)</td>
+        </tr>
+
+        <tr>
+          <td>Self-hosted runners</td>
+          <td class="gh"><span class="badge badge-green">Free, unlimited</span></td>
+          <td class="gl"><span class="badge badge-green">Free, unlimited</span> (called Runners)</td>
+        </tr>
+
+        <tr>
+          <td>Pipeline config file</td>
+          <td class="gh"><code>.github/workflows/*.yml</code><br>Multiple workflow files</td>
+          <td class="gl"><code>.gitlab-ci.yml</code><br>Single root file (includes supported)</td>
+        </tr>
+
+        <tr>
+          <td>Trigger events</td>
+          <td class="gh">push, PR, schedule, webhook, manual, release, issue, …</td>
+          <td class="gl">push, MR, schedule, API, manual, pipeline, …</td>
+        </tr>
+
+        <tr>
+          <td>Reusable pipeline components</td>
+          <td class="gh">Reusable Workflows, Composite Actions, Actions Marketplace</td>
+          <td class="gl">CI/CD Components (catalog), <code>include:</code> templates, extends</td>
+        </tr>
+
+        <tr>
+          <td>Secrets management</td>
+          <td class="gh">Repository &amp; org secrets; environment protection rules</td>
+          <td class="gl">Project, group &amp; instance variables; protected &amp; masked</td>
+        </tr>
+
+        <tr>
+          <td>Artifact storage (free)</td>
+          <td class="gh">500 MB (private repos)<br>Unlimited (public repos)</td>
+          <td class="gl">10 GB per namespace (shared across projects)</td>
+        </tr>
+
+        <tr>
+          <td>Caching</td>
+          <td class="gh">10 GB cache per repo; <code>actions/cache</code></td>
+          <td class="gl">Distributed cache per runner; <code>cache:</code> keyword</td>
+        </tr>
+
+        <tr>
+          <td>Container / Docker support</td>
+          <td class="gh">Service containers; Docker-in-Docker via privileged mode</td>
+          <td class="gl">Native Docker executor; DinD; Kubernetes executor</td>
+        </tr>
+
+        <tr>
+          <td>Matrix builds</td>
+          <td class="gh"><span class="badge badge-green">Native</span> — <code>strategy.matrix</code></td>
+          <td class="gl"><span class="badge badge-green">Native</span> — <code>parallel: matrix</code></td>
+        </tr>
+
+        <tr>
+          <td>Environments &amp; deployments</td>
+          <td class="gh">Environments with approval gates (free for public; Teams+ for private)</td>
+          <td class="gl">Environments with manual approval; protected environments (free)</td>
+        </tr>
+
+        <tr>
+          <td>OIDC / keyless auth</td>
+          <td class="gh"><span class="badge badge-green">Supported</span> — OIDC tokens for cloud providers</td>
+          <td class="gl"><span class="badge badge-green">Supported</span> — ID tokens for OIDC</td>
+        </tr>
+
+        <tr>
+          <td>Built-in security scanning</td>
+          <td class="gh">CodeQL (SAST) free for public repos; Dependabot alerts</td>
+          <td class="gl">SAST, DAST, secret detection, dependency scanning — free tier limited; full on Ultimate</td>
+        </tr>
+
+        <tr>
+          <td>Marketplace / integrations</td>
+          <td class="gh"><span class="badge badge-green">20,000+ Actions</span> in Marketplace</td>
+          <td class="gl">CI/CD Component Catalog (growing); integrations via scripts</td>
+        </tr>
+
+        <tr>
+          <td>Pipeline visualisation</td>
+          <td class="gh">Workflow graph (basic)</td>
+          <td class="gl"><span class="badge badge-green">Rich DAG pipeline graph</span> built-in</td>
+        </tr>
+
+        <tr>
+          <td>Review apps / dynamic envs</td>
+          <td class="gh">Via third-party actions or manual scripting</td>
+          <td class="gl"><span class="badge badge-green">Native Review Apps</span> (free)</td>
+        </tr>
+
+        <tr>
+          <td>Pages / static hosting</td>
+          <td class="gh">GitHub Pages (free, public repos unlimited; private limited)</td>
+          <td class="gl">GitLab Pages (free, all repos)</td>
+        </tr>
+
+        <tr>
+          <td>Pricing page</td>
+          <td class="gh"><a href="https://github.com/pricing" target="_blank" rel="noopener">github.com/pricing</a></td>
+          <td class="gl"><a href="https://about.gitlab.com/pricing/" target="_blank" rel="noopener">about.gitlab.com/pricing</a></td>
+        </tr>
+
+      </tbody>
+    </table>
+  </div>
+
+  <p class="note">
+    Limits are subject to change. Always verify against the official pricing pages before making architectural decisions.<br>
+    Produced by Phishield AI &mdash; Veilguard &nbsp;|&nbsp; For internal team use.
+  </p>
+
+</body>
+</html>

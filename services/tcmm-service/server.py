@@ -910,6 +910,33 @@ class IngestTurnBody(BaseModel):
     lineage_parent_conv: str = ""
 
 
+class IngestTextBody(BaseModel):
+    """Document / file ingestion — bulk-write pre-chunked text straight into
+    the archive as a cohesive, recall-only unit (ingest architecture Phase 1;
+    see INGEST_ARCHITECTURE.md).
+
+    Distinct from /ingest_turn (turn-shaped, truncates items to 8000 chars):
+    documents are chunked by the caller (the Veilguard file-ingest layer uses
+    a sentence-aware splitter), share one document-level lineage root, never
+    enter the live prompt, and surface only via recall / traverse.
+
+    Provide ``chunks`` (PREFERRED — pre-split by the Veilguard layer) OR a raw
+    ``text`` blob (split here with the core word-budget chunker as a fallback).
+    ``channel`` defaults to ``team_knowledge`` so ingested documents are
+    durable, cross-session, digest-eligible knowledge — tenant isolation still
+    applies via namespace + user_id.
+    """
+    conversation_id: str = ""
+    user_id: str = ""
+    doc_id: str = ""
+    title: str = ""
+    source: str = ""
+    channel: str = "team_knowledge"
+    chunks: list = []
+    text: str = ""
+    provenance: dict = {}
+
+
 class SearchMemoryBody(BaseModel):
     """LLM-facing memory search — wraps adapters.memory_search.search_memory.
 
@@ -2906,6 +2933,81 @@ async def ingest_turn(body: IngestTurnBody):
         except Exception as e:
             logger.error(f"[INGEST-TURN] Error: {e}", exc_info=True)
             return {"error": str(e), "added": 0}
+
+
+@app.post("/ingest_text")
+async def ingest_text(body: IngestTextBody):
+    """Bulk-ingest a document (pre-chunked text) into the per-user archive as
+    a cohesive, recall-only unit. See IngestTextBody / INGEST_ARCHITECTURE.md.
+
+    Unlike /ingest_turn this does NOT truncate, does NOT create live blocks,
+    and groups all chunks under one document lineage root. Enrichment
+    (embedding + NLP) is owned by the background workers (archive-first).
+
+    Returns: {"doc_id", "lineage_root", "chunks_added", "requested", "session_id"}
+    """
+    if _shared_nlp is None:
+        return {"error": "TCMM not initialized", "chunks_added": 0}
+
+    # Resolve chunks: prefer caller-supplied (pre-chunked); else fall back to
+    # the core word-budget splitter on a raw text blob.
+    chunks = [c for c in (body.chunks or []) if isinstance(c, str) and c.strip()]
+    raw_text = (body.text or "").strip()
+    if not chunks and not raw_text:
+        return {"chunks_added": 0, "requested": 0}
+
+    _sid = pool._normalize_id(body.conversation_id)
+    async with _get_session_lock(_sid):
+        try:
+            instance = pool.get(body.conversation_id, user_id=body.user_id)
+
+            if not chunks and raw_text:
+                # Caller should pre-chunk with the sentence-aware splitter;
+                # this keeps the endpoint usable for plain callers.
+                chunks = [c for c in instance.tcmm._chunk_text(raw_text) if c.strip()]
+
+            if not chunks:
+                return {"chunks_added": 0, "requested": 0, "session_id": _sid}
+
+            # doc_id: caller-supplied idempotency / grouping key, else derived
+            # from content so re-uploads share a stable id. (Doc-level dedup is
+            # a follow-up; the id is stamped now for provenance + grouping.)
+            doc_id = (body.doc_id or "").strip()
+            if not doc_id:
+                import hashlib as _hl
+                doc_id = "sha256:" + _hl.sha256(
+                    ("\n".join(chunks)).encode("utf-8", "ignore")
+                ).hexdigest()[:32]
+
+            source = (body.source or f"document:{doc_id}").strip()
+            provenance = dict(body.provenance or {})
+            provenance.setdefault("doc_id", doc_id)
+            if body.title:
+                provenance.setdefault("title", body.title)
+
+            result = instance.ingest_document(
+                chunks,
+                source=source,
+                channel=(body.channel or None),
+                provenance=provenance,
+                session_id=body.conversation_id,
+            )
+
+            logger.info(
+                f"[INGEST-TEXT] session={_sid} doc={doc_id[:24]} "
+                f"chunks={result.get('chunks_added')}/{len(chunks)} "
+                f"channel={body.channel or 'NULL'} root={result.get('lineage_root')}"
+            )
+            return {
+                "doc_id": doc_id,
+                "lineage_root": result.get("lineage_root"),
+                "chunks_added": result.get("chunks_added", 0),
+                "requested": len(chunks),
+                "session_id": _sid,
+            }
+        except Exception as e:
+            logger.error(f"[INGEST-TEXT] Error: {e}", exc_info=True)
+            return {"error": str(e), "chunks_added": 0}
 
 
 # ── LLM-facing search + traverse (used by veilguard-mcp tools) ───────────────

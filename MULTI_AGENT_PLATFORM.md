@@ -1,7 +1,8 @@
 # Veilguard Multi-Agent Platform — Design
 
-**Status:** Draft. Architectural plan, not an implementation spec.
+**Status:** Design + phase-plan + decision log (forward-looking). Originally drafted 2026-05-21.
 **Date:** 2026-05-21
+**⚠️ As-built reference:** Phases 0–7.5 are now largely implemented. For the engineering reference that describes **what actually runs** (current API, turn loop, ledger schemas, state machine, workers, tools, approval gate — with `file:line` anchors), see **[`AGENTIC_FRAMEWORK_SPEC.md`](AGENTIC_FRAMEWORK_SPEC.md)** (deep-code-analysis as-built, 2026-06-08). This document remains the source for the *design rationale, the phase plan, the worked example, the edge-case catalog, and the decision log* — but its "what Phase X will ship" framing is historical; trust the as-built spec for current behavior.
 **Scope:** Extend Veilguard from "single assistant + ephemeral sub-agent calls" into a small **corporate-structured organization of agents**: a Director coordinating Researcher / Builder / Critic ICs, with on-demand domain consultants (existing security personas). Agents have org-chart relationships, persistent private memory, an inbox for async messages, first-class Task records, shared documents in workspace, and a safety gate on dangerous tool calls.
 
 This document was distilled from a multi-round research panel (state-of-the-art survey, workspace patterns, codebase mapping, critic pass, edge-case audit, adversarial security review, latency/cost modeling, onboarding review) and reshaped per the design intent of a corporate structure with inter-agent communication and shared work. Open questions and risks are kept explicit at the bottom rather than papered over.

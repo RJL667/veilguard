@@ -461,6 +461,170 @@ async def _read_pdf_via_daemon(path: str, pages: str) -> str:
             pass
 
 
+# ── Bytes → text extraction (shared by the ingest_files tool) ────────────
+# Same parsers read_pdf / read_xlsx use, but driven from in-memory bytes so
+# they work for files pulled out of a zip without touching disk per entry.
+
+def _decode_text_bytes(data: bytes) -> str:
+    """UTF-8 first, lossless latin-1 fallback (no U+FFFD)."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
+def _img_mime(ext: str) -> str:
+    e = ext.lower()
+    if e in ("jpg", "jpeg"):
+        return "image/jpeg"
+    if e == "tif":
+        return "image/tiff"
+    return f"image/{e}"
+
+
+def _extract_xlsx_bytes(data: bytes):
+    """(text, "text") | (None, reason). Flattens every sheet to TSV-ish text."""
+    try:
+        from openpyxl import load_workbook
+    except Exception as e:
+        return None, f"error: openpyxl unavailable: {e}"
+    import io as _io
+    try:
+        wb = load_workbook(_io.BytesIO(data), read_only=True, data_only=True)
+    except Exception as e:
+        return None, f"error: xlsx open failed: {e}"
+    out = []
+    try:
+        for ws in wb.worksheets:
+            out.append(f"## Sheet: {ws.title}")
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c) for c in row if c is not None]
+                if cells:
+                    out.append(" | ".join(cells))
+    finally:
+        wb.close()
+    text = "\n".join(out).strip()
+    return (text, "text") if text else (None, "empty")
+
+
+def _extract_docx_bytes(data: bytes):
+    """(text, "text") | (None, reason). Mirrors the documents server's
+    read_docx (paragraphs with heading levels + tables), from bytes."""
+    try:
+        from docx import Document
+    except Exception as e:
+        return None, f"error: python-docx unavailable: {e}"
+    import io as _io
+    try:
+        doc = Document(_io.BytesIO(data))
+    except Exception as e:
+        return None, f"error: docx open failed: {e}"
+    out = []
+    for para in doc.paragraphs:
+        t = para.text.strip()
+        if not t:
+            continue
+        style = para.style.name if para.style else ""
+        if "Heading 1" in style:
+            out.append(f"# {t}")
+        elif "Heading 2" in style:
+            out.append(f"## {t}")
+        elif "Heading 3" in style:
+            out.append(f"### {t}")
+        else:
+            out.append(t)
+    for i, table in enumerate(doc.tables):
+        out.append(f"\n--- Table {i + 1} ---")
+        for row in table.rows:
+            out.append(" | ".join(cell.text.strip() for cell in row.cells))
+    text = "\n".join(out).strip()
+    return (text, "text") if text else (None, "empty")
+
+
+def _extract_pptx_bytes(data: bytes):
+    """(text, "text") | (None, reason). Mirrors the documents server's
+    read_pptx (per-slide title + text-frame paragraphs), from bytes."""
+    try:
+        from pptx import Presentation
+    except Exception as e:
+        return None, f"error: python-pptx unavailable: {e}"
+    import io as _io
+    try:
+        prs = Presentation(_io.BytesIO(data))
+    except Exception as e:
+        return None, f"error: pptx open failed: {e}"
+    out = []
+    for i, slide in enumerate(prs.slides, 1):
+        out.append(f"--- Slide {i} ---")
+        try:
+            if slide.shapes.title and slide.shapes.title.text:
+                out.append(f"Title: {slide.shapes.title.text}")
+        except Exception:
+            pass
+        for shape in slide.shapes:
+            if getattr(shape, "has_text_frame", False):
+                for para in shape.text_frame.paragraphs:
+                    t = para.text.strip()
+                    if t:
+                        out.append(t)
+        out.append("")
+    text = "\n".join(out).strip()
+    return (text, "text") if text else (None, "empty")
+
+
+async def _extract_text_from_bytes(name: str, data: bytes):
+    """Turn one file's bytes into text for ingestion.
+
+    Returns ``(text, method)`` on success — ``method`` in ``{"text","ocr"}`` —
+    or ``(None, reason)`` where reason is ``"unsupported"`` / ``"empty"`` /
+    ``"error: …"``. Reuses _parse_pdf_file (fitz + OCR fallback), openpyxl,
+    and the OCR shim — no new dependencies.
+    """
+    from tools import ingest_core
+    import tempfile
+
+    kind = ingest_core.kind_of(name)
+    if kind == "pdf" or data[:5] == b"%PDF-":
+        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        try:
+            tmp.write(data)
+            tmp.close()
+            disp = name.replace("\\", "/").rsplit("/", 1)[-1]
+            txt = await _parse_pdf_file(Path(tmp.name), "", display_name=disp)
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+        if txt.startswith("Error"):
+            return None, f"error: {txt.splitlines()[0][:160]}"
+        method = "ocr" if "OCR'd via Gemini" in txt else "text"
+        return txt, method
+
+    if kind == "xlsx":
+        return _extract_xlsx_bytes(data)
+
+    if kind == "docx":
+        return _extract_docx_bytes(data)
+
+    if kind == "pptx":
+        return _extract_pptx_bytes(data)
+
+    if kind == "image":
+        mime = _img_mime(ingest_core.ext_of(name))
+        try:
+            md = await asyncio.to_thread(ocr_bytes, data, mime)
+        except Exception as e:
+            return None, f"error: OCR failed: {e}"
+        return (md, "ocr") if md.strip() else (None, "empty")
+
+    if kind == "text":
+        t = _decode_text_bytes(data)
+        return (t, "text") if t.strip() else (None, "empty")
+
+    return None, "unsupported"
+
+
 def register(mcp):
     @mcp.tool()
     async def read_pdf(path: str, pages: str = "") -> str:
@@ -491,6 +655,120 @@ def register(mcp):
                 return await _read_pdf_via_daemon(path, pages)
             return err
         return await _parse_pdf_file(rp, pages)
+
+    @mcp.tool()
+    async def ingest_files(path: str, scope: str = "knowledge") -> str:
+        """Ingest a file — or a ZIP/TAR of files, recursively — into durable
+        memory so its content becomes searchable knowledge in later turns
+        (not just this one).
+
+        Handles PDFs, Excel (.xlsx), images (OCR'd), and text/CSV/Markdown/
+        code. For a .zip/.tar, every supported file inside is ingested,
+        nested archives included; unsupported formats (.docx/.pptx — export
+        to PDF first) are listed as skipped. Reads from THIS machine, or from
+        the USER's machine via their Veilguard client daemon (same path
+        resolution as read_pdf). Content is chunked and stored; semantic
+        enrichment then continues in the background.
+
+        Use this when the user wants a document REMEMBERED / added to the
+        knowledge base. To just read a file's text into the current reply,
+        use read_pdf / read_xlsx instead.
+
+        Args:
+            path: file or archive path (absolute, or relative to home/workspace).
+            scope: "knowledge" (default) — durable, cross-session knowledge
+                   base; or "conversation" — only recalled in this chat.
+        """
+        from core import request_ctx
+        from tools import ingest_core
+        from utils.tcmm import ingest_text as _tcmm_ingest_text
+
+        conv_id = request_ctx.get_conversation_id() or ""
+        user_id = request_ctx.get_user_id() or ""
+        if not conv_id:
+            return "Error: no active conversation context; cannot ingest."
+        channel = "conv" if scope.strip().lower().startswith("conv") else "team_knowledge"
+
+        # 1. Resolve top-level bytes — server-local, else the user's machine
+        #    via their client daemon (same fallback as read_pdf).
+        rp, err = _resolve_read(path)
+        if err:
+            if _daemon_available():
+                data, why = await _fetch_bytes_via_daemon(path)
+                if data is None:
+                    return f"Error: {why}"
+                name = Path(path.replace("\\", "/")).name
+            else:
+                return err
+        else:
+            data = rp.read_bytes()
+            name = rp.name
+
+        # 2. Expand archives → leaf files (zip-bomb guards inside).
+        entries, skips = ingest_core.expand(name, data)
+        if not entries:
+            if skips:
+                lines = "\n".join(f"  - {p}: {r}" for p, r in skips[:20])
+                return f"Nothing ingestable in {name!r}. Skipped:\n{lines}"
+            return f"Nothing ingestable in {name!r}."
+
+        # 3. Stable batch id grouping this upload (no Date/random available
+        #    in this runtime — derive from name + size).
+        import hashlib as _hl
+        batch_id = "batch:" + _hl.sha256(f"{name}:{len(data)}".encode()).hexdigest()[:12]
+
+        # 4. Extract → chunk → POST /ingest_text for each leaf.
+        rows = []
+        total_chunks = 0
+        for leaf_path, leaf_bytes in entries:
+            text, info = await _extract_text_from_bytes(leaf_path, leaf_bytes)
+            if text is None:
+                rows.append((leaf_path, info, 0))
+                continue
+            chunks = ingest_core.chunk_text(text)
+            if not chunks:
+                rows.append((leaf_path, "empty", 0))
+                continue
+            res = await _tcmm_ingest_text(
+                chunks=chunks,
+                conversation_id=conv_id,
+                user_id=user_id,
+                title=Path(leaf_path.replace("\\", "/")).name,
+                source=f"file:{leaf_path}",
+                channel=channel,
+                provenance={
+                    "path_in_archive": leaf_path,
+                    "ingest_batch_id": batch_id,
+                    "extracted_via": info,
+                },
+            )
+            if res.get("error"):
+                rows.append((leaf_path, f"error: {res['error'][:80]}", 0))
+            else:
+                added = res.get("chunks_added", 0)
+                total_chunks += added
+                rows.append((leaf_path, "ocr" if info == "ocr" else "ingested", added))
+
+        # 5. Render a manifest.
+        ok = sum(1 for _p, st, _n in rows if st in ("ingested", "ocr"))
+        scope_label = ("knowledge base (durable, cross-session)"
+                       if channel == "team_knowledge" else "this conversation only")
+        head = (f"Ingested {ok}/{len(rows)} file(s) — {total_chunks} chunk(s) "
+                f"into the {scope_label}.")
+        body_lines = []
+        for p, st, n in rows:
+            mark = "[ok]" if st in ("ingested", "ocr") else "[--]"
+            extra = ""
+            if n:
+                extra = f" ({n} chunks{', OCR' if st == 'ocr' else ''})"
+            elif st not in ("ingested", "ocr"):
+                extra = f" — {st}"
+            body_lines.append(f"  {mark} {p}{extra}")
+        out = head + "\n" + "\n".join(body_lines)
+        if skips:
+            out += "\n\nSkipped (guards):\n" + "\n".join(
+                f"  - {p}: {r}" for p, r in skips[:20])
+        return out
 
     @mcp.tool()
     async def read_xlsx(path: str, sheet: str = "", max_rows: int = 500) -> str:
